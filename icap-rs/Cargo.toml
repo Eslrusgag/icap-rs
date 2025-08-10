@@ -4,6 +4,7 @@ version = "0.0.1"
 edition = "2024"
 description = "ICAP client and server crate"
 repository = "https://github.com/Eslrusgag/icap-rs"
+license = "MIT"
 
 [dependencies]
 tokio = { version = "1.0", features = ["full"] }
