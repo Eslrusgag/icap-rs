@@ -1,0 +1,12 @@
+[package]
+name = "rs-icap-client"
+version = "0.1.0"
+edition = "2024"
+description = "ICAP client on Rust"
+[dependencies]
+clap = { version = "4.0", features = ["derive"] }
+tokio = { version = "1.0", features = ["full"] }
+icap-rs = { path = "../icap-rs" }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+anyhow = "1.0"
