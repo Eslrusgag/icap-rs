@@ -1,0 +1,8 @@
+services:
+  rs-icap-builder:
+    container_name: Centos
+    build:
+      context: ../
+      dockerfile: deployment/Dockerfile-build
+    stdin_open: true
+    tty: true

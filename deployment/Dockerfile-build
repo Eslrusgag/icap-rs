@@ -1,0 +1,26 @@
+FROM centos:7 as builder
+
+RUN sed -i 's|^mirrorlist=|#mirrorlist=|g' /etc/yum.repos.d/CentOS-* && \
+    sed -i 's|^#baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|g' /etc/yum.repos.d/CentOS-*
+
+RUN yum -y install epel-release && \
+    yum -y update && \
+    yum -y install gcc gcc-c++ make openssl-devel clang clang-devel llvm llvm-devel llvm-private
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+RUN echo "export LD_LIBRARY_PATH=/usr/lib64/clang-private:$LD_LIBRARY_PATH" >> /root/.bashrc && \
+    echo "export LIBCLANG_PATH=/usr/lib64/clang-private" >> /root/.bashrc && \
+    source /root/.bashrc
+
+WORKDIR /workspace
+
+COPY ../. .
+
+# Сборка проекта
+RUN cargo build --release
+
+FROM centos:7
+RUN mkdir -p /builded/
+COPY --from=builder /workspace/target/release/rs-icap-client* /builded/

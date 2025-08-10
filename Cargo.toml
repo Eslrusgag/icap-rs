@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "icap-rs",
+    "rs-icap-client"
+]
+resolver = "3"
