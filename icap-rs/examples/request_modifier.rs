@@ -1,6 +1,6 @@
 use icap_rs::{
-    HttpMessage, HttpMessageTrait, IcapMethod, IcapOptionsBuilder, IcapRequest, IcapResponse,
-    IcapServer, IcapStatusCode, TransferBehavior, error::IcapError,
+    HttpMessage, HttpMessageTrait, IcapMethod, IcapOptionsBuilder, Request, Response, Server,
+    StatusCode, TransferBehavior, error::IcapError,
 };
 use tracing::{info, warn};
 
@@ -43,7 +43,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .build()?;
 
     // Создаем сервер с модификаторами
-    let server = IcapServer::builder()
+    let server = Server::builder()
         .bind("127.0.0.1:1344")
         .add_service("request-modifier", request_modifier_handler)
         .add_options_config("request-modifier", request_modifier_options)
@@ -73,7 +73,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Обработчик для модификации HTTP запросов (REQMOD)
-async fn request_modifier_handler(request: IcapRequest) -> Result<IcapResponse, IcapError> {
+async fn request_modifier_handler(request: Request) -> Result<Response, IcapError> {
     info!("Request modifier processing: {}", request.method);
 
     match request.method.as_str() {
@@ -91,7 +91,7 @@ async fn request_modifier_handler(request: IcapRequest) -> Result<IcapResponse, 
                         // Создаем 403 Forbidden ответ
                         let block_response = create_403_response(&reason);
 
-                        return Ok(IcapResponse::new(IcapStatusCode::Ok200, "OK")
+                        return Ok(Response::new(StatusCode::Ok200, "OK")
                             .add_header("ISTag", "\"request-modifier-v1.0\"")
                             .add_header("Encapsulated", "res-hdr=0, res-body=200")
                             .with_body(&block_response));
@@ -102,7 +102,7 @@ async fn request_modifier_handler(request: IcapRequest) -> Result<IcapResponse, 
                         // Модифицируем запрос
                         let modified_request = modify_request(http_request);
 
-                        return Ok(IcapResponse::new(IcapStatusCode::Ok200, "OK")
+                        return Ok(Response::new(StatusCode::Ok200, "OK")
                             .add_header("ISTag", "\"request-modifier-v1.0\"")
                             .add_header("Encapsulated", "req-hdr=0, req-body=300")
                             .with_body(&modified_request.to_raw()));
@@ -111,29 +111,25 @@ async fn request_modifier_handler(request: IcapRequest) -> Result<IcapResponse, 
                         info!("Request allowed without modification");
 
                         // Пропускаем без изменений
-                        return Ok(
-                            IcapResponse::new(IcapStatusCode::NoContent204, "No Content")
-                                .add_header("ISTag", "\"request-modifier-v1.0\""),
-                        );
+                        return Ok(Response::new(StatusCode::NoContent204, "No Content")
+                            .add_header("ISTag", "\"request-modifier-v1.0\""));
                     }
                 }
             }
 
             // Если нет HTTP запроса, возвращаем ошибку
-            Ok(
-                IcapResponse::new(IcapStatusCode::BadRequest400, "Bad Request")
-                    .add_header("ISTag", "\"request-modifier-v1.0\""),
-            )
+            Ok(Response::new(StatusCode::BadRequest400, "Bad Request")
+                .add_header("ISTag", "\"request-modifier-v1.0\""))
         }
-        _ => Ok(IcapResponse::new(
-            IcapStatusCode::MethodNotAllowed405,
+        _ => Ok(Response::new(
+            StatusCode::MethodNotAllowed405,
             "Method Not Allowed",
         )),
     }
 }
 
 /// Обработчик для модификации HTTP ответов (RESPMOD)
-async fn response_modifier_handler(request: IcapRequest) -> Result<IcapResponse, IcapError> {
+async fn response_modifier_handler(request: Request) -> Result<Response, IcapError> {
     info!("Response modifier processing: {}", request.method);
 
     match request.method.as_str() {
@@ -151,7 +147,7 @@ async fn response_modifier_handler(request: IcapRequest) -> Result<IcapResponse,
                         // Создаем блокирующий ответ
                         let block_response = create_blocked_content_response(&reason);
 
-                        return Ok(IcapResponse::new(IcapStatusCode::Ok200, "OK")
+                        return Ok(Response::new(StatusCode::Ok200, "OK")
                             .add_header("ISTag", "\"response-modifier-v1.0\"")
                             .add_header("Encapsulated", "res-hdr=0, res-body=250")
                             .with_body(&block_response));
@@ -162,7 +158,7 @@ async fn response_modifier_handler(request: IcapRequest) -> Result<IcapResponse,
                         // Модифицируем ответ
                         let modified_response = modify_response(http_response);
 
-                        return Ok(IcapResponse::new(IcapStatusCode::Ok200, "OK")
+                        return Ok(Response::new(StatusCode::Ok200, "OK")
                             .add_header("ISTag", "\"response-modifier-v1.0\"")
                             .add_header("Encapsulated", "res-hdr=0, res-body=400")
                             .with_body(&modified_response.to_raw()));
@@ -170,21 +166,17 @@ async fn response_modifier_handler(request: IcapRequest) -> Result<IcapResponse,
                     ResponseAction::Allow => {
                         info!("Response allowed without modification");
 
-                        return Ok(
-                            IcapResponse::new(IcapStatusCode::NoContent204, "No Content")
-                                .add_header("ISTag", "\"response-modifier-v1.0\""),
-                        );
+                        return Ok(Response::new(StatusCode::NoContent204, "No Content")
+                            .add_header("ISTag", "\"response-modifier-v1.0\""));
                     }
                 }
             }
 
-            Ok(
-                IcapResponse::new(IcapStatusCode::BadRequest400, "Bad Request")
-                    .add_header("ISTag", "\"response-modifier-v1.0\""),
-            )
+            Ok(Response::new(StatusCode::BadRequest400, "Bad Request")
+                .add_header("ISTag", "\"response-modifier-v1.0\""))
         }
-        _ => Ok(IcapResponse::new(
-            IcapStatusCode::MethodNotAllowed405,
+        _ => Ok(Response::new(
+            StatusCode::MethodNotAllowed405,
             "Method Not Allowed",
         )),
     }

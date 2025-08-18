@@ -7,31 +7,30 @@ use tokio::sync::RwLock;
 use tracing::{error, trace, warn};
 
 use crate::error::IcapResult;
-use crate::icap_request::IcapRequest;
-use crate::icap_response::{IcapResponse, IcapStatusCode};
-use crate::options::IcapOptionsConfig;
+use crate::options::OptionsConfig;
+use crate::request::Request;
+use crate::response::{Response, StatusCode};
 
 /// Тип для обработчиков ICAP запросов
-pub type IcapRequestHandler = Box<
+pub type RequestHandler = Box<
     dyn Fn(
-            IcapRequest,
+            Request,
         ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = IcapResult<IcapResponse>> + Send + Sync>,
+            Box<dyn std::future::Future<Output = IcapResult<Response>> + Send + Sync>,
         > + Send
         + Sync,
 >;
 
-/// Основная структура ICAP сервера
-pub struct IcapServer {
+pub struct Server {
     listener: TcpListener,
-    services: Arc<RwLock<HashMap<String, IcapRequestHandler>>>,
-    options_configs: Arc<RwLock<HashMap<String, IcapOptionsConfig>>>,
+    services: Arc<RwLock<HashMap<String, RequestHandler>>>,
+    options_configs: Arc<RwLock<HashMap<String, OptionsConfig>>>,
 }
 
-impl IcapServer {
+impl Server {
     /// Создает новый строитель сервера
-    pub fn builder() -> IcapServerBuilder {
-        IcapServerBuilder::new()
+    pub fn builder() -> ServerBuilder {
+        ServerBuilder::new()
     }
 
     /// Запускает сервер
@@ -59,8 +58,8 @@ impl IcapServer {
     async fn handle_connection(
         mut socket: TcpStream,
         addr: SocketAddr,
-        services: Arc<RwLock<HashMap<String, IcapRequestHandler>>>,
-        options_configs: Arc<RwLock<HashMap<String, IcapOptionsConfig>>>,
+        services: Arc<RwLock<HashMap<String, RequestHandler>>>,
+        options_configs: Arc<RwLock<HashMap<String, OptionsConfig>>>,
     ) -> IcapResult<()> {
         let mut buffer = Vec::new();
         let mut temp_buffer = [0; 1024];
@@ -116,7 +115,7 @@ impl IcapServer {
                 handler(request).await?
             } else {
                 warn!("Service '{}' not found", service_name);
-                IcapResponse::new(IcapStatusCode::NotFound404, "Service Not Found")
+                Response::new(StatusCode::NotFound404, "Service Not Found")
                     .add_header("Content-Length", "0")
             }
         };
@@ -132,10 +131,10 @@ impl IcapServer {
     }
 
     /// Создает базовый OPTIONS ответ для сервиса
-    fn build_default_options_response(service_name: &str) -> IcapResponse {
-        use crate::options::{IcapMethod, IcapOptionsConfig};
+    fn build_default_options_response(service_name: &str) -> Response {
+        use crate::options::{IcapMethod, OptionsConfig};
 
-        let config = IcapOptionsConfig::new(
+        let config = OptionsConfig::new(
             vec![IcapMethod::RespMod],
             &format!("{}-default-1.0", service_name),
         )
@@ -149,13 +148,13 @@ impl IcapServer {
 }
 
 /// Строитель для ICAP сервера
-pub struct IcapServerBuilder {
+pub struct ServerBuilder {
     bind_addr: Option<String>,
-    services: HashMap<String, IcapRequestHandler>,
-    options_configs: HashMap<String, IcapOptionsConfig>,
+    services: HashMap<String, RequestHandler>,
+    options_configs: HashMap<String, OptionsConfig>,
 }
 
-impl IcapServerBuilder {
+impl ServerBuilder {
     /// Создает новый строитель сервера
     pub fn new() -> Self {
         Self {
@@ -174,10 +173,10 @@ impl IcapServerBuilder {
     /// Добавляет сервис
     pub fn add_service<F, Fut>(mut self, name: &str, handler: F) -> Self
     where
-        F: Fn(IcapRequest) -> Fut + Send + Sync + 'static,
-        Fut: std::future::Future<Output = IcapResult<IcapResponse>> + Send + Sync + 'static,
+        F: Fn(Request) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = IcapResult<Response>> + Send + Sync + 'static,
     {
-        let handler: IcapRequestHandler = Box::new(move |req| {
+        let handler: RequestHandler = Box::new(move |req| {
             let fut = handler(req);
             Box::pin(fut)
         });
@@ -186,13 +185,13 @@ impl IcapServerBuilder {
     }
 
     /// Добавляет OPTIONS конфигурацию для сервиса
-    pub fn add_options_config(mut self, name: &str, config: IcapOptionsConfig) -> Self {
+    pub fn add_options_config(mut self, name: &str, config: OptionsConfig) -> Self {
         self.options_configs.insert(name.to_string(), config);
         self
     }
 
     /// Строит ICAP сервер
-    pub async fn build(self) -> IcapResult<IcapServer> {
+    pub async fn build(self) -> IcapResult<Server> {
         let bind_addr = self
             .bind_addr
             .unwrap_or_else(|| "127.0.0.1:1344".to_string());
@@ -201,7 +200,7 @@ impl IcapServerBuilder {
         let services = Arc::new(RwLock::new(self.services));
         let options_configs = Arc::new(RwLock::new(self.options_configs));
 
-        Ok(IcapServer {
+        Ok(Server {
             listener,
             services,
             options_configs,
@@ -209,7 +208,7 @@ impl IcapServerBuilder {
     }
 }
 
-impl Default for IcapServerBuilder {
+impl Default for ServerBuilder {
     fn default() -> Self {
         Self::new()
     }

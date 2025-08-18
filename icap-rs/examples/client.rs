@@ -1,22 +1,15 @@
+use icap_rs::Client;
 use icap_rs::HttpSession;
-use icap_rs::{IcapClient, Result};
 
 #[tokio::main]
-async fn main() -> Result<()> {
-    println!("ICAP Client with HttpSession Example");
-    println!("====================================");
-
-    // Create HTTP session
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let http_session = HttpSession::new("POST", "/api/users")
         .add_header("Content-Type", "application/json")
         .add_header("User-Agent", "ICAP-Client/1.0")
         .with_body_string(r#"{"name": "John Doe", "email": "john@example.com"}"#);
 
-    // Create ICAP client with the session
-    let client = IcapClient::builder()
-        .set_host("localhost")
-        .set_port(1344)
-        .set_service("reqmod")
+    let client = Client::builder()
+        .set_uri("icap://localhost:1344/test")
         .set_icap_method("REQMOD")
         .with_http_session(http_session)
         .build();

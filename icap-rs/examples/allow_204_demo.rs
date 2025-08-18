@@ -1,4 +1,4 @@
-use icap_rs::{HttpMessage, HttpMessageTrait, IcapResponse, IcapServer, IcapStatusCode};
+use icap_rs::{HttpMessage, HttpMessageTrait, Response, Server, StatusCode};
 use tracing::{error, info};
 
 #[tokio::main]
@@ -9,7 +9,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .init();
 
     // Create server with Allow: 204 support
-    let server = IcapServer::builder()
+    let server = Server::builder()
         .bind("127.0.0.1:1344")
         .add_service("content-filter", |request| async move {
             info!(
@@ -19,9 +19,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
             // Check if this is a REQMOD or RESPMOD request
             if !request.is_reqmod() && !request.is_respmod() {
-                let response =
-                    IcapResponse::new(IcapStatusCode::MethodNotAllowed405, "Method Not Allowed")
-                        .add_header("Content-Length", "0");
+                let response = Response::new(StatusCode::MethodNotAllowed405, "Method Not Allowed")
+                    .add_header("Content-Length", "0");
                 return Ok(response);
             }
 
@@ -42,7 +41,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             // If client allows 204 and no modification is needed, return 204
             if request.can_return_204() && !needs_modification {
                 info!("No modification needed, returning 204 No Content");
-                return Ok(IcapResponse::no_content()
+                return Ok(Response::no_content()
                     .add_header("Server", "icap-rs/0.1.0")
                     .add_header("X-ICAP-Status", "no-modification-needed"));
             }
@@ -60,7 +59,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
 
             // Fallback: return 200 OK with no content
-            Ok(IcapResponse::new(IcapStatusCode::Ok200, "OK")
+            Ok(Response::new(StatusCode::Ok200, "OK")
                 .add_header("Content-Length", "0")
                 .add_header("Server", "icap-rs/0.1.0"))
         })
@@ -86,7 +85,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 }
 
 /// Simulate content analysis to determine if modification is needed
-fn analyze_content(request: &icap_rs::IcapRequest) -> bool {
+fn analyze_content(request: &icap_rs::Request) -> bool {
     // In a real implementation, this would analyze the HTTP message content
     // For demo purposes, we'll use a simple heuristic
 
@@ -127,10 +126,8 @@ fn analyze_content(request: &icap_rs::IcapRequest) -> bool {
 }
 
 /// Return the full unmodified message when 204 is not allowed
-fn return_full_message(
-    request: &icap_rs::IcapRequest,
-) -> Result<IcapResponse, icap_rs::error::IcapError> {
-    let mut response = IcapResponse::new(IcapStatusCode::Ok200, "OK");
+fn return_full_message(request: &icap_rs::Request) -> Result<Response, icap_rs::error::IcapError> {
+    let mut response = Response::new(StatusCode::Ok200, "OK");
 
     if let Some(http_request) = &request.http_request {
         // Return the original HTTP request
@@ -170,10 +167,8 @@ fn return_full_message(
 }
 
 /// Process and modify the message
-fn process_and_modify(
-    request: &icap_rs::IcapRequest,
-) -> Result<IcapResponse, icap_rs::error::IcapError> {
-    let mut response = IcapResponse::new(IcapStatusCode::Ok200, "OK");
+fn process_and_modify(request: &icap_rs::Request) -> Result<Response, icap_rs::error::IcapError> {
+    let mut response = Response::new(StatusCode::Ok200, "OK");
 
     if let Some(http_request) = &request.http_request {
         // Add security headers to the request

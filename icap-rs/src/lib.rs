@@ -2,20 +2,18 @@
 pub mod client;
 pub mod error;
 pub mod http;
-pub mod icap_request;
-pub mod icap_response;
 pub mod options;
-pub mod parser;
+mod parser;
+pub mod request;
+pub mod response;
 pub mod server;
 
-pub use client::{IcapClient, IcapClientBuilder};
+pub use client::Client;
 
-pub use server::{IcapRequestHandler, IcapServer, IcapServerBuilder};
+pub use server::{RequestHandler, Server, ServerBuilder};
 
 pub use http::{HttpMessage, HttpMessageBuilder, HttpMessageTrait, HttpSession};
-pub use icap_request::IcapRequest;
-pub use icap_response::{IcapResponse, IcapResponseBuilder, IcapStatusCode};
-pub use options::{IcapMethod, IcapOptionsBuilder, IcapOptionsConfig, TransferBehavior};
+pub use options::{IcapMethod, IcapOptionsBuilder, OptionsConfig, TransferBehavior};
 pub use parser::*;
-
-pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+pub use request::Request;
+pub use response::{Response, ResponseBuilder, StatusCode};

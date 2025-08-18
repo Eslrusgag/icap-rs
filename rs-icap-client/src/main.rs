@@ -1,60 +1,42 @@
 use clap::Parser;
+use icap_rs::Client;
+use icap_rs::client::Request;
 use icap_rs::error::IcapResult;
-use icap_rs::{HttpSession, IcapClient};
+use icap_rs::http::HttpMessage;
 use std::fs;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 #[derive(Parser, Debug)]
 #[command(
     name = "rs-icap-client",
     about = "Rust ICAP client implementation",
     disable_version_flag = true,
-    long_about = "A Rust implementation of ICAP client with similar interface to c-icap-client"
+    long_about = "A Rust implementation of ICAP client with a c-icap-client-like CLI"
 )]
 struct Args {
-    /// The ICAP server name
-    #[arg(short = 'i', long, default_value = "localhost")]
-    icap_servername: String,
+    /// Full ICAP URI like icap://host[:port]/service)
+    #[arg(short = 'u', long, default_value = "icap://127.0.0.1:1344/")]
+    uri: String,
 
-    /// The server port
-    #[arg(short = 'p', long, default_value = "1344")]
-    port: u16,
-
-    /// The service name
-    #[arg(short = 's', long, default_value = "options")]
-    service: String,
-    /*
-    /// Use TLS
-    #[arg(long = "tls", action = clap::ArgAction::SetTrue)]
-    tls: bool,
-
-    /// Use TLS method
-    #[arg(long = "tls-method")]
-    tls_method: Option<String>,
-
-    /// Disable server certificate verify
-    #[arg(long = "tls-no-verify", action = clap::ArgAction::SetTrue)]
-    tls_no_verify: bool,
-     */
-    /// Send this file to the ICAP server. Default is to send an options request
+    /// Send this file to the ICAP server (implies REQMOD if method not set)
     #[arg(short = 'f', long)]
     filename: Option<String>,
 
-    /// Save output to this file. Default is to send to stdout
+    /// Save ICAP response body to file (default: stdout)
     #[arg(short = 'o', long)]
     output: Option<String>,
 
-    /// Use 'method' as method of the request modification
+    /// ICAP method: OPTIONS|REQMOD|RESPMOD
     #[arg(long = "method")]
     method: Option<String>,
 
-    /// Send a request modification instead of response modification
+    /// Send REQMOD with given request URL
     #[arg(long = "req")]
     req_url: Option<String>,
 
-    /// Send a response modification request with request url the 'url'
+    /// Send RESPMOD with given request URL (we’ll encapsulate HTTP info)
     #[arg(long = "resp")]
     resp_url: Option<String>,
 
@@ -62,11 +44,11 @@ struct Args {
     #[arg(short = 'd', long)]
     debug_level: Option<u8>,
 
-    /// Do not send reshdr headers
+    /// Do not send HTTP response headers (compat; no-op here)
     #[arg(long = "noreshdr", action = clap::ArgAction::SetTrue)]
     noreshdr: bool,
 
-    /// Do not send preview data
+    /// Do not send Preview at all (overrides --preview-size and -x Preview)
     #[arg(long = "nopreview", action = clap::ArgAction::SetTrue)]
     nopreview: bool,
 
@@ -78,27 +60,27 @@ struct Args {
     #[arg(long = "206", action = clap::ArgAction::SetTrue)]
     allow_206: bool,
 
-    /// Include xheader in ICAP request headers
+    /// Extra ICAP headers (repeatable): -x "Header: Value"
     #[arg(short = 'x', long)]
     xheader: Vec<String>,
 
-    /// Include xheader in HTTP request headers
+    /// Extra HTTP request headers (repeatable): --hx "Header: Value"
     #[arg(long = "hx")]
     hx_header: Vec<String>,
 
-    /// Include xheader in HTTP response headers
+    /// Extra HTTP response headers (repeatable): --rhx "Header: Value"
     #[arg(long = "rhx")]
     rhx_header: Vec<String>,
 
-    /// Sets the maximum preview data size
+    /// Preview size (sets `Preview: N`) unless --nopreview
     #[arg(short = 'w', long)]
     preview_size: Option<usize>,
 
-    /// Print response headers
+    /// Print ICAP response headers
     #[arg(short = 'v', long, action = clap::ArgAction::SetTrue)]
     verbose: bool,
 
-    /// Print the generated ICAP request without sending it
+    /// Print the generated ICAP request summary without sending it
     #[arg(long = "print-request", action = clap::ArgAction::SetTrue)]
     print_request: bool,
 }
@@ -107,7 +89,7 @@ struct Args {
 async fn main() -> IcapResult<()> {
     let args = Args::parse();
 
-    // Initialize logging based on debug level
+    // logging
     let debug_level = args.debug_level.unwrap_or(0);
     if debug_level > 0 {
         tracing_subscriber::fmt()
@@ -124,104 +106,107 @@ async fn main() -> IcapResult<()> {
     info!("Starting rs-icap-client");
     debug!("Arguments: {:?}", args);
 
-    // Determine ICAP method
-    let icap_method = if let Some(method) = args.method {
-        method.to_uppercase()
+    let icap_method = if let Some(m) = args.method {
+        m.to_uppercase()
     } else if args.req_url.is_some() {
         "REQMOD".to_string()
     } else if args.resp_url.is_some() {
         "RESPMOD".to_string()
     } else if args.filename.is_some() {
-        // If file is specified but no method, default to REQMOD
         "REQMOD".to_string()
     } else {
         "OPTIONS".to_string()
     };
 
-    // Build ICAP headers
-    let mut icap_headers = Vec::new();
-    icap_headers.push("User-Agent: rs-icap-client/0.1.0".to_string());
+    // В новой архитектуре клиент НИЧЕГО сам не добавляет про Preview.
+    let client = Client::from_uri(&args.uri)?;
 
-    // Add preview size if specified and not disabled
-    if !args.nopreview {
-        if let Some(preview_size) = args.preview_size {
-            icap_headers.push(format!("Preview: {}", preview_size));
-        }
-    }
+    let service = service_from_uri(&args.uri).unwrap_or_else(|| "/options".to_string());
 
-    // Add allow headers
+    // Сборка Request
+    let mut req_parts = Request::new(&icap_method, &service);
+
     if !args.no204 {
-        icap_headers.push("Allow: 204".to_string());
+        req_parts = req_parts.allow_204(true);
     }
     if args.allow_206 {
-        icap_headers.push("Allow: 206".to_string());
+        req_parts = req_parts.allow_206(true);
     }
 
-    // Add custom ICAP headers
-    for header in &args.xheader {
-        icap_headers.push(header.clone());
-    }
-
-    let icap_headers_str = icap_headers.join("\r\n") + "\r\n";
-
-    // Build HTTP session if needed
-    let mut client_builder = IcapClient::builder()
-        .set_host(&args.icap_servername)
-        .set_port(args.port)
-        .set_service(&args.service)
-        .set_icap_method(&icap_method)
-        .set_icap_headers(&icap_headers_str)
-        .no_preview(args.nopreview);
-
-    // Handle different request types
-    if icap_method == "OPTIONS" {
-        // Simple OPTIONS request - no HTTP session needed
-        debug!("Sending OPTIONS request");
-    } else {
-        // REQMOD or RESPMOD request
-        let mut http_session = if let Some(req_url) = &args.req_url {
-            // REQMOD request
-            debug!("Sending REQMOD request for URL: {}", req_url);
-            HttpSession::new("GET", req_url)
-        } else if let Some(resp_url) = &args.resp_url {
-            // RESPMOD request
-            debug!("Sending RESPMOD request for URL: {}", resp_url);
-            HttpSession::new("GET", resp_url)
-        } else if args.filename.is_some() {
-            // Default HTTP session only if file is specified
-            HttpSession::new("GET", "/rs-icap-client")
+    // Сначала обработаем дополнительные ICAP-заголовки (-x).
+    // Если включён --nopreview, то принудительно игнорируем любые попытки задать Preview через -x.
+    for h in &args.xheader {
+        if let Some((k, v)) = h.split_once(':') {
+            let key = k.trim();
+            let val = v.trim();
+            if key.eq_ignore_ascii_case("Preview") {
+                if args.nopreview {
+                    warn!("--nopreview is set: skipping header '{}: {}'", key, val);
+                    continue;
+                }
+                // Request::header маппит Preview -> preview_size
+                req_parts = req_parts.header(key, val);
+            } else {
+                req_parts = req_parts.header(key, val);
+            }
         } else {
-            // No HTTP session for REQMOD/RESPMOD without file
-            debug!("Sending {} request without HTTP session", icap_method);
-            // Create empty session
-            HttpSession::new("POST", "/rs-icap-client")
+            warn!("Bad -x header format (use \"Name: Value\"): '{}'", h);
+        }
+    }
+
+    // Затем CLI-параметр превью. Если --nopreview, игнорируем.
+    if !args.nopreview {
+        if let Some(n) = args.preview_size {
+            req_parts = req_parts.preview(n);
+        }
+    } else if args.preview_size.is_some() {
+        warn!("--nopreview overrides --preview-size, Preview will not be sent");
+    }
+
+    // Вложенный HTTP только для REQMOD/RESPMOD
+    if icap_method == "REQMOD" || icap_method == "RESPMOD" {
+        let mut http = if let Some(req_url) = &args.req_url {
+            HttpMessage::builder(&format!("GET {} HTTP/1.1", req_url))
+                .header("Host", host_from_url(req_url).unwrap_or("example.com"))
+                .build()
+        } else if let Some(resp_url) = &args.resp_url {
+            // Упрощённая заглушка HTTP-ответа
+            HttpMessage::builder("HTTP/1.1 200 OK")
+                .header("Content-Type", "application/octet-stream")
+                .header("X-Resp-Source", resp_url)
+                .build()
+        } else if args.filename.is_some() {
+            HttpMessage::builder("GET /rs-icap-client HTTP/1.1")
+                .header("Host", "localhost")
+                .build()
+        } else {
+            HttpMessage::builder("POST /rs-icap-client HTTP/1.1")
+                .header("Host", "localhost")
+                .build()
         };
 
-        // Add HTTP headers
-        for header in &args.hx_header {
-            if let Some((name, value)) = header.split_once(':') {
-                http_session = http_session.add_header(name.trim(), value.trim());
+        for h in &args.hx_header {
+            if let Some((k, v)) = h.split_once(':') {
+                http = http.add_header(k.trim(), v.trim());
+            } else {
+                warn!("Bad --hx header format (use \"Name: Value\"): '{}'", h);
             }
         }
-
-        // Add response headers for RESPMOD
         if icap_method == "RESPMOD" {
-            for header in &args.rhx_header {
-                if let Some((name, value)) = header.split_once(':') {
-                    http_session = http_session.add_header(name.trim(), value.trim());
+            for h in &args.rhx_header {
+                if let Some((k, v)) = h.split_once(':') {
+                    http = http.add_header(k.trim(), v.trim());
+                } else {
+                    warn!("Bad --rhx header format (use \"Name: Value\"): '{}'", h);
                 }
             }
         }
 
-        // Add body from file if specified
         if let Some(filename) = &args.filename {
-            match fs::read_to_string(filename) {
-                Ok(content) => {
-                    http_session = http_session.with_body_string(&content);
-                    debug!(
-                        "Added file content to HTTP session: {} bytes",
-                        content.len()
-                    );
+            match fs::read(filename) {
+                Ok(bytes) => {
+                    http = http.with_body(&bytes);
+                    debug!("Added file content to HTTP: {} bytes", bytes.len());
                 }
                 Err(e) => {
                     error!("Failed to read file {}: {}", filename, e);
@@ -230,30 +215,19 @@ async fn main() -> IcapResult<()> {
             }
         }
 
-        // Only add HTTP session if it has content or headers
-        if !http_session.headers.is_empty()
-            || !http_session.body.is_empty()
-            || args.req_url.is_some()
-            || args.resp_url.is_some()
-            || args.filename.is_some()
-        {
-            client_builder = client_builder.with_http_session(http_session);
-        }
+        req_parts = req_parts.http(http);
+    } else {
+        debug!("Sending OPTIONS request");
     }
 
-    // Build the client
-    let client = client_builder.build();
-    info!(
-        "Sending {} request to {}:{}",
-        icap_method, args.icap_servername, args.port
-    );
+    info!("Sending {} to {}", icap_method, args.uri);
 
-    // Print request if requested
+    // Печать сформированного запроса (без отправки)
     if args.print_request {
-        return match client.get_request() {
-            Ok(request) => {
-                println!("Generated ICAP request:");
-                println!("{}", String::from_utf8_lossy(&request));
+        return match client.get_request(&req_parts) {
+            Ok(bytes) => {
+                // ВНИМАНИЕ: это может содержать бинарные данные тела — печать «как есть» только для отладки
+                println!("{}", String::from_utf8_lossy(&bytes));
                 Ok(())
             }
             Err(e) => {
@@ -263,23 +237,24 @@ async fn main() -> IcapResult<()> {
         };
     }
 
-    // Send the request
-    match client.send().await {
+    // Отправка
+    match client.send(&req_parts).await {
         Ok(response) => {
             println!("ICAP/1.0 {} {}", response.status_code, response.status_text);
-            for (name, value) in &response.headers {
-                println!("{}: {}", name, value);
+            if args.verbose {
+                for (name, value) in &response.headers {
+                    println!("{}: {}", name, value);
+                }
+                println!();
             }
-            println!();
 
             if let Some(output_file) = &args.output {
                 let mut file = File::create(output_file).await?;
                 file.write_all(&response.body).await?;
                 info!("Response body written to file: {}", output_file);
+            } else {
+                print!("{}", String::from_utf8_lossy(&response.body));
             }
-
-            // Печать тела в консоль всегда (даже если пустое)
-            print!("{}", String::from_utf8_lossy(&response.body));
 
             info!("Request completed successfully");
         }
@@ -290,4 +265,20 @@ async fn main() -> IcapResult<()> {
     }
 
     Ok(())
+}
+
+fn service_from_uri(uri: &str) -> Option<String> {
+    let rest = uri.strip_prefix("icap://")?;
+    let slash = rest.find('/')?;
+    Some(rest[slash..].to_string()) // включает ведущий '/'
+}
+
+fn host_from_url(url: &str) -> Option<&str> {
+    if let Some(rest) = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+    {
+        return rest.split('/').next();
+    }
+    None
 }

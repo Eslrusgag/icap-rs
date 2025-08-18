@@ -1,278 +1,520 @@
+use crate::HttpMessageTrait;
 use crate::error::IcapResult;
-use crate::http::HttpSession;
-use crate::icap_response::IcapResponse;
+use crate::http::HttpMessage;
+use crate::response::Response;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-#[derive(Debug)]
-pub struct IcapClient {
-    builder: IcapClientBuilder,
+#[derive(Debug, Clone)]
+pub struct Client {
+    host: String,
+    port: u16,
+    host_override: Option<String>,
+    default_headers: Vec<(String, String)>,
 }
 
-impl IcapClient {
-    pub fn builder() -> IcapClientBuilder {
-        IcapClientBuilder::new()
+impl Client {
+    /// Создать клиента по host/port
+    pub fn new(host: &str, port: u16) -> Self {
+        Self {
+            host: host.to_string(),
+            port,
+            host_override: None,
+            default_headers: vec![("User-Agent".into(), "rs-icap-client/0.1.0".into())],
+        }
     }
 
-    /// Send the ICAP request and return the response
-    pub async fn send(&self) -> IcapResult<IcapResponse> {
-        self.builder.send().await
+    /// Создать клиента из icap://host[:port] (без service)
+    pub fn from_uri(uri: &str) -> IcapResult<Self> {
+        let (host, port) = parse_authority(uri)?;
+        Ok(Self {
+            host,
+            port,
+            host_override: None,
+            default_headers: vec![("User-Agent".into(), "rs-icap-client/0.1.0".into())],
+        })
     }
 
-    /// Get the generated ICAP request without sending it
-    pub fn get_request(&self) -> IcapResult<Vec<u8>> {
-        self.builder.build_icap_request()
-    }
-}
-
-impl From<IcapClientBuilder> for IcapClient {
-    fn from(builder: IcapClientBuilder) -> Self {
-        IcapClient { builder }
-    }
-}
-
-#[derive(Default, Debug, Clone)]
-pub struct IcapClientBuilder {
-    pub(crate) host: String,
-    pub(crate) icap_port: Option<u16>,
-    service: Option<String>,
-    icap_headers: Option<String>,
-    http_headers: Option<String>,
-    icap_method: Option<String>,
-    http_session: Option<HttpSession>,
-    no_preview: bool,
-}
-
-impl IcapClientBuilder {
-    pub fn new() -> Self {
-        IcapClientBuilder::default()
-    }
-
-    pub fn set_host(mut self, host: &str) -> Self {
-        self.host = host.to_string();
+    /// Переопределить значение заголовка ICAP `Host` (TCP-адрес не меняем)
+    pub fn host_override(mut self, host: &str) -> Self {
+        self.host_override = Some(host.to_string());
         self
     }
 
-    pub fn set_port(mut self, port: u16) -> Self {
-        self.icap_port = Some(port);
+    /// Добавить дефолтный ICAP-заголовок (для всех запросов)
+    pub fn default_header(mut self, name: &str, value: &str) -> Self {
+        self.default_headers
+            .push((name.to_string(), value.to_string()));
         self
     }
 
-    pub fn set_service(mut self, service: &str) -> Self {
-        // Normalize service path
-        let normalized_service = if service.starts_with('/') {
-            service.to_string()
-        } else {
-            format!("/{service}")
-        };
-        self.service = Some(normalized_service);
-        self
+    /// Получить «сырые» байты ICAP-запроса с превью (без досылки остатка)
+    /// Полезно для отладки/дампа.
+    pub fn get_request(&self, req: &Request) -> IcapResult<Vec<u8>> {
+        let built = self.build_icap_request_bytes(req)?;
+        Ok(built.bytes)
     }
 
-    pub fn set_icap_headers(mut self, headers: &str) -> Self {
-        self.icap_headers = Some(headers.to_string());
-        self
-    }
+    /// Выполнить ICAP-запрос целиком (с обработкой 100 Continue и досылкой)
+    pub async fn send(&self, req: &Request) -> IcapResult<Response> {
+        // Сборка стартового ICAP-запроса (заголовки + encapsulated HTTP headers + превью-чанки)
+        let built = self.build_icap_request_bytes(req)?;
 
-    pub fn set_icap_method(mut self, method: &str) -> Self {
-        self.icap_method = Some(method.to_string());
-        self
-    }
-
-    /// Set HTTP session using HttpSession struct
-    pub fn with_http_session(mut self, session: HttpSession) -> Self {
-        self.http_session = Some(session);
-        self
-    }
-
-    /// Set no preview flag
-    pub fn no_preview(mut self, no_preview: bool) -> Self {
-        self.no_preview = no_preview;
-        self
-    }
-
-    /// Build IcapClient from current builder
-    pub fn build(self) -> IcapClient {
-        IcapClient::from(self)
-    }
-
-    fn build_http_session(&self) -> Vec<u8> {
-        // Use HttpSession if provided
-        if let Some(ref session) = self.http_session {
-            return session.to_raw();
-        }
-
-        // Fallback to headers-only approach
-        let mut effective_headers = String::new();
-        if let Some(ref hdrs) = self.http_headers {
-            let trimmed = hdrs.trim();
-            if !trimmed.is_empty() {
-                effective_headers.push_str(trimmed);
-                if !trimmed.ends_with("\r\n") {
-                    effective_headers.push_str("\r\n");
-                }
-            }
-        }
-
-        // If no headers provided, return empty session
-        if effective_headers.is_empty() {
-            return Vec::new();
-        }
-
-        let mut session: Vec<u8> = Vec::new();
-        session.extend_from_slice(effective_headers.as_bytes());
-
-        session
-    }
-
-    pub fn build_icap_request(&self) -> IcapResult<Vec<u8>> {
-        let mut request = Vec::new();
-
-        // ICAP request line
-        let method = self.icap_method.as_ref().ok_or("ICAP method not set")?;
-        let service = self.service.as_ref().ok_or("Service not set")?;
-
-        // Use full ICAP URI for REQMOD/RESPMOD requests
-        let uri = if (method == "REQMOD" || method == "RESPMOD") && !service.starts_with("icap://")
-        {
-            let port = self.icap_port.unwrap_or(1344);
-            format!("icap://{}:{}{}", self.host, port, service)
-        } else {
-            service.clone()
-        };
-
-        let request_line = format!("{} {} ICAP/1.0\r\n", method, uri);
-        request.extend_from_slice(request_line.as_bytes());
-
-        // ICAP headers
-        let mut icap_headers = String::new();
-        if let Some(ref headers) = self.icap_headers {
-            icap_headers.push_str(headers);
-            if !headers.ends_with("\r\n") {
-                icap_headers.push_str("\r\n");
-            }
-        }
-
-        // Ensure Host header is present
-        if !icap_headers.contains("Host:") {
-            let host_header = format!("Host: {}\r\n", self.host);
-            icap_headers = host_header + &icap_headers;
-        } else {
-            // Replace existing Host header with correct one
-            let lines: Vec<&str> = icap_headers.lines().collect();
-            let mut new_headers = Vec::new();
-            let mut host_replaced = false;
-
-            for line in lines {
-                if line.trim().starts_with("Host:") && !host_replaced {
-                    new_headers.push(format!("Host: {}", self.host));
-                    host_replaced = true;
-                } else {
-                    new_headers.push(line.to_string());
-                }
-            }
-
-            if !host_replaced {
-                new_headers.insert(0, format!("Host: {}", self.host));
-            }
-
-            icap_headers = new_headers.join("\r\n") + "\r\n";
-        }
-
-        // Add x-icap-url header for REQMOD/RESPMOD requests
-        if (method == "REQMOD" || method == "RESPMOD") && !icap_headers.contains("x-icap-url:") {
-            let port = self.icap_port.unwrap_or(1344);
-            let icap_url = format!("icap://{}:{}{}", self.host, port, service);
-            icap_headers.push_str(&format!("x-icap-url: {}\r\n", icap_url));
-        }
-
-        // Add required headers for REQMOD/RESPMOD requests
-        if method == "REQMOD" || method == "RESPMOD" {
-            // Only add Preview header if not already present and not explicitly disabled
-            if !icap_headers.contains("Preview:") && !self.no_preview {
-                icap_headers.push_str("Preview: 0\r\n");
-            }
-            if !icap_headers.contains("Allow:") {
-                icap_headers.push_str("Allow: 204\r\n");
-            }
-            if !icap_headers.contains("Connection:") {
-                icap_headers.push_str("Connection: close\r\n");
-            }
-        }
-
-        // HTTP session (if provided)
-        let http_session = self.build_http_session();
-
-        // Add Encapsulated header for REQMOD/RESPMOD requests
-        if (method == "REQMOD" || method == "RESPMOD") && !icap_headers.contains("Encapsulated:") {
-            if !http_session.is_empty() {
-                // Find the position where HTTP headers end (after double CRLF)
-                let http_headers_end = http_session
-                    .windows(4)
-                    .position(|window| window == b"\r\n\r\n")
-                    .unwrap_or(http_session.len());
-
-                icap_headers.push_str("Encapsulated: req-hdr=0, req-body=");
-                icap_headers.push_str(&(http_headers_end + 4).to_string());
-                icap_headers.push_str("\r\n");
-            } else {
-                // For REQMOD/RESPMOD without HTTP session, still need Encapsulated header
-                icap_headers.push_str("Encapsulated: req-hdr=0\r\n");
-            }
-        }
-
-        request.extend_from_slice(icap_headers.as_bytes());
-
-        // Add empty line after ICAP headers
-        request.extend_from_slice(b"\r\n");
-
-        // HTTP session (if provided)
-        if !http_session.is_empty() {
-            request.extend_from_slice(&http_session);
-        }
-
-        // End of request with proper termination
-        if method == "REQMOD" || method == "RESPMOD" {
-            request.extend_from_slice(b"0; ieof\r\n\r\n");
-        } else {
-            // For OPTIONS requests, just end with double CRLF
-            request.extend_from_slice(b"\r\n");
-        }
-
-        Ok(request)
-    }
-
-    pub async fn send(&self) -> IcapResult<IcapResponse> {
-        if self.host.is_empty() {
-            return Err("Host not set".into());
-        }
-        let host = &self.host;
-        let port = self.icap_port.unwrap_or(1344);
-        let addr = format!("{}:{}", host, port);
-
+        // Подключаемся
+        let addr = format!("{}:{}", self.host, self.port);
         let mut stream = TcpStream::connect(&addr).await?;
-        let request = self.build_icap_request()?;
 
-        // Отправляем запрос
-        stream.write_all(&request).await?;
+        // Отправляем стартовую часть
+        stream.write_all(&built.bytes).await?;
         stream.flush().await?;
 
-        // Читаем ответ до EOF (когда сервер закроет соединение)
-        let mut response = Vec::new();
-        loop {
-            let mut buffer = [0; 1024];
-            match stream.read(&mut buffer).await {
-                Ok(0) => break, // Сервер закрыл соединение — считаем, что ответ полный
-                Ok(n) => response.extend_from_slice(&buffer[..n]),
-                Err(e) => return Err(format!("Failed to read response: {}", e).into()),
+        // ─────────────────────────────────────────────────────────────────────────
+        // OPTIONS: читаем только заголовки и возвращаем ответ (без ожидания EOF),
+        // чтобы не зависать на keep-alive.
+        // ─────────────────────────────────────────────────────────────────────────
+        if req.method.eq_ignore_ascii_case("OPTIONS") {
+            let (_code, hdr_buf) = read_icap_headers(&mut stream).await?;
+            return crate::parser::parse_icap_response(&hdr_buf);
+        }
+
+        // ─────────────────────────────────────────────────────────────────────────
+        // REQMOD / RESPMOD:
+        // Если отправляли превью без IEoF — ждём промежуточный 100 Continue.
+        // Если вместо 100 пришёл финальный ответ (200/204/4xx/5xx) — дочитываем до EOF.
+        // Если пришёл 100 — досылаем остаток и затем читаем финальный ответ до EOF.
+        // ─────────────────────────────────────────────────────────────────────────
+        if built.expect_continue {
+            // Ждём промежуточные заголовки (обычно 100 Continue)
+            let (code, hdr_buf) = read_icap_headers(&mut stream).await?;
+            if code == 100 {
+                // Сервер просит остаток тела
+                if let Some(rest) = built.remaining_body {
+                    if !rest.is_empty() {
+                        // Досылаем остаток единым чанком
+                        write_chunk(&mut stream, &rest).await?;
+                    }
+                    // Закрываем поток чанков
+                    stream.write_all(b"0\r\n\r\n").await?;
+                    stream.flush().await?;
+                }
+                // Падаем ниже — читать финальный ответ целиком
+            } else {
+                // Это уже финальный ответ (например, 204/4xx). Добавляем уже прочитанные заголовки.
+                let mut response = hdr_buf;
+                // Дочитываем оставшееся (если сервер закроет соединение)
+                read_to_end(&mut stream, &mut response).await?;
+                return crate::parser::parse_icap_response(&response);
             }
         }
 
+        // Финальный ответ (после 100 Continue или когда превью было с IEoF/без превью)
+        let mut response = Vec::new();
+        read_to_end(&mut stream, &mut response).await?;
         if response.is_empty() {
             return Err("No response received from server".into());
         }
-
-        // Парсим ICAP ответ
         crate::parser::parse_icap_response(&response)
     }
+
+    /// Построить ICAP-запрос. Возвращает:
+    /// - bytes: стартовая часть + encapsulated HTTP headers + превью-чанки (+ закрытие превью)
+    /// - expect_continue: нужно ли ждать `100 Continue`
+    /// - remaining_body: остаток тела для досылки после `100 Continue`
+    fn build_icap_request_bytes(&self, req: &Request) -> IcapResult<BuiltIcap> {
+        let mut out = Vec::new();
+
+        let full_uri = format!(
+            "icap://{}:{}/{}",
+            self.host,
+            self.port,
+            trim_leading_slash(&req.service)
+        );
+        out.extend_from_slice(format!("{} {} ICAP/1.0\r\n", req.method, full_uri).as_bytes());
+
+        // Собираем заголовки
+        let mut headers = Vec::<(String, String)>::new();
+        headers.extend(self.default_headers.iter().cloned());
+        headers.extend(req.icap_headers.iter().cloned()); // см. Request::header — он не добавит дублирующий Preview
+
+        // Host
+        let host_header_value = self
+            .host_override
+            .clone()
+            .unwrap_or_else(|| self.host.clone());
+        upsert_header(&mut headers, "Host", &host_header_value);
+
+        // Полезный служебный (для трассировки)
+        if !contains_header(&headers, "x-icap-url") {
+            headers.push(("x-icap-url".into(), full_uri.clone()));
+        }
+
+        // Allow / Connection — только для REQMOD/RESPMOD
+        // Allow — только для REQMOD/RESPMOD
+        if req.is_mod() {
+            if req.allow_204 && !contains_header(&headers, "Allow") {
+                headers.push(("Allow".into(), "204".into()));
+            }
+            if req.allow_206 {
+                append_to_allow(&mut headers, "206");
+            }
+        }
+
+        // ToDo убрать это но надо подумать как лучше сделать
+        if !contains_header(&headers, "Connection") {
+            headers.push(("Connection".into(), "close".into()));
+        }
+
+        // Готовим вложенный HTTP
+        let http_raw = req.http.as_ref().map(|m| m.to_raw());
+        let (http_headers_bytes, http_body_bytes) = split_http(&http_raw);
+
+        // Проставим Preview только на основе Request::preview_size
+        if let Some(ps) = req.preview_size {
+            headers.push(("Preview".into(), ps.to_string()));
+        }
+
+        // Encapsulated
+        if req.is_mod() {
+            if let Some(_) = http_raw {
+                let (hdr_key, body_key) = if req.method == "REQMOD" {
+                    ("req-hdr", "req-body")
+                } else {
+                    ("res-hdr", "res-body")
+                };
+                if http_body_bytes.is_some() {
+                    out.extend_from_slice(
+                        format!(
+                            "Encapsulated: {}=0, {}={}\r\n",
+                            hdr_key,
+                            body_key,
+                            http_headers_bytes.len()
+                        )
+                        .as_bytes(),
+                    );
+                } else {
+                    out.extend_from_slice(format!("Encapsulated: {}=0\r\n", hdr_key).as_bytes());
+                }
+            } else {
+                out.extend_from_slice(b"Encapsulated: null-body=0\r\n");
+            }
+        }
+
+        // Сериализация ICAP-заголовков
+        for (k, v) in &headers {
+            out.extend_from_slice(format!("{}: {}\r\n", k, v).as_bytes());
+        }
+
+        // Конец ICAP заголовков
+        out.extend_from_slice(b"\r\n");
+
+        // Вложенные HTTP-заголовки (если есть)
+        if !http_headers_bytes.is_empty() {
+            out.extend_from_slice(&http_headers_bytes);
+        }
+
+        // Далее — превью-чанки/тело (только для REQMOD/RESPMOD и когда есть body)
+        if req.is_mod() {
+            // Если тела нет — ничего не шлём (даже нулевой чанк не обязателен при null-body)
+            if let Some(body) = http_body_bytes {
+                let (bytes, expect_continue, remaining) =
+                    build_preview_and_chunks(req.preview_size, body)?;
+
+                out.extend_from_slice(&bytes);
+                return Ok(BuiltIcap {
+                    bytes: out,
+                    expect_continue,
+                    remaining_body: remaining,
+                });
+            }
+        }
+
+        // По умолчанию — ничего досылать не надо
+        Ok(BuiltIcap {
+            bytes: out,
+            expect_continue: false,
+            remaining_body: None,
+        })
+    }
+}
+
+/// Построенный ICAP-запрос и метаданные для диалога
+#[derive(Debug, Clone)]
+struct BuiltIcap {
+    /// Стартовая часть запроса: ICAP заголовки + HTTP-заголовки + превью-чанки (+ закрытие превью)
+    bytes: Vec<u8>,
+    /// Нужно ли ждать 100 Continue
+    expect_continue: bool,
+    /// Остаток тела для досылки после 100 Continue
+    remaining_body: Option<Vec<u8>>,
+}
+
+/// Описание ICAP-запроса (семантика — тут)
+#[derive(Debug, Clone)]
+pub struct Request {
+    pub method: String,  // "OPTIONS" | "REQMOD" | "RESPMOD"
+    pub service: String, // "/reqmod", "/respmod" или другой путь
+    pub icap_headers: Vec<(String, String)>,
+    pub http: Option<HttpMessage>,   // вложенное HTTP
+    pub preview_size: Option<usize>, // если Some(n) — включаем Preview: n
+    pub allow_204: bool,
+    pub allow_206: bool,
+}
+
+impl Request {
+    pub fn new(method: &str, service: &str) -> Self {
+        Self {
+            method: method.to_string(),
+            service: service.to_string(),
+            icap_headers: Vec::new(),
+            http: None,
+            preview_size: None,
+            allow_204: false,
+            allow_206: false,
+        }
+    }
+
+    #[inline]
+    fn is_mod(&self) -> bool {
+        self.method == "REQMOD" || self.method == "RESPMOD"
+    }
+
+    pub fn options(service: &str) -> Self {
+        Self::new("OPTIONS", service)
+    }
+    pub fn reqmod(service: &str) -> Self {
+        Self::new("REQMOD", service)
+    }
+    pub fn respmod(service: &str) -> Self {
+        Self::new("RESPMOD", service)
+    }
+
+    /// Добавить ICAP-заголовок. Если это `Preview`, он будет мапплен в `preview_size`.
+    /// Последний вызов имеет приоритет.
+    pub fn header(mut self, name: &str, value: &str) -> Self {
+        if name.eq_ignore_ascii_case("Preview") {
+            if let Ok(n) = value.trim().parse::<usize>() {
+                self.preview_size = Some(n);
+                return self;
+            }
+            // Невалидное значение — сохраняем как обычный заголовок (или можно проигнорировать)
+        }
+        self.icap_headers
+            .push((name.to_string(), value.to_string()));
+        self
+    }
+
+    pub fn http(mut self, msg: HttpMessage) -> Self {
+        self.http = Some(msg);
+        self
+    }
+
+    /// Настроить размер превью (в байтах)
+    pub fn preview(mut self, n: usize) -> Self {
+        self.preview_size = Some(n);
+        self
+    }
+
+    pub fn allow_204(mut self, yes: bool) -> Self {
+        self.allow_204 = yes;
+        self
+    }
+
+    pub fn allow_206(mut self, yes: bool) -> Self {
+        self.allow_206 = yes;
+        self
+    }
+}
+
+fn parse_authority(uri: &str) -> IcapResult<(String, u16)> {
+    let s = uri.trim();
+    let rest = s
+        .strip_prefix("icap://")
+        .ok_or("Authority URI must start with icap://")?;
+    // допускаем и с /..., отрежем путь если есть
+    let authority = rest.split('/').next().unwrap_or(rest);
+    let (host, port) = if let Some(i) = authority.rfind(':') {
+        let h = &authority[..i];
+        let p: u16 = authority[i + 1..].parse().map_err(|_| "Invalid port")?;
+        (h.to_string(), p)
+    } else {
+        (authority.to_string(), 1344)
+    };
+    if host.is_empty() {
+        return Err("Empty host in authority".into());
+    }
+    Ok((host, port))
+}
+
+fn contains_header(headers: &[(String, String)], name_lc: &str) -> bool {
+    headers.iter().any(|(k, _)| k.eq_ignore_ascii_case(name_lc))
+}
+
+fn upsert_header(headers: &mut Vec<(String, String)>, name: &str, value: &str) {
+    if let Some((_, v)) = headers
+        .iter_mut()
+        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+    {
+        *v = value.to_string();
+    } else {
+        headers.push((name.to_string(), value.to_string()));
+    }
+}
+
+fn append_to_allow(headers: &mut Vec<(String, String)>, code: &str) {
+    if let Some((_, v)) = headers
+        .iter_mut()
+        .find(|(k, _)| k.eq_ignore_ascii_case("Allow"))
+    {
+        if !v.split(',').any(|p| p.trim() == code) {
+            v.push_str(", ");
+            v.push_str(code);
+        }
+    } else {
+        headers.push(("Allow".into(), code.into()));
+    }
+}
+
+fn trim_leading_slash(s: &str) -> &str {
+    s.strip_prefix('/').unwrap_or(s)
+}
+
+/// Разделить «сырой» HTTP (headers + body). Возвращает (headers_bytes, Some(body_bytes)).
+/// Если тела нет — body = None. Если http_raw == None — вернёт ([], None).
+fn split_http(http_raw: &Option<Vec<u8>>) -> (Vec<u8>, Option<Vec<u8>>) {
+    if let Some(raw) = http_raw {
+        if let Some(hdr_end) = raw
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .map(|pos| pos + 4)
+        {
+            let headers = raw[..hdr_end].to_vec();
+            if hdr_end < raw.len() {
+                let body = raw[hdr_end..].to_vec();
+                (headers, Some(body))
+            } else {
+                (headers, None)
+            }
+        } else {
+            // Нет \r\n\r\n — считаем, что это только заголовки (или сломанный HTTP)
+            (raw.clone(), None)
+        }
+    } else {
+        (Vec::new(), None)
+    }
+}
+
+/// Сформировать превью-чанки и определить необходимость 100 Continue.
+/// Возвращает (bytes, expect_continue, remaining_body)
+fn build_preview_and_chunks(
+    preview_size: Option<usize>,
+    body: Vec<u8>,
+) -> IcapResult<(Vec<u8>, bool, Option<Vec<u8>>)> {
+    let mut out = Vec::new();
+    match preview_size {
+        None => {
+            if !body.is_empty() {
+                write_chunk_into(&mut out, &body);
+            }
+            out.extend_from_slice(b"0\r\n\r\n");
+            Ok((out, false, None))
+        }
+        Some(ps) if ps == 0 => {
+            if body.is_empty() {
+                // весь «месседж» умещается в превью 0 → IEoF
+                out.extend_from_slice(b"0; ieof\r\n\r\n");
+                Ok((out, false, None))
+            } else {
+                // только заголовки как превью → ждём 100
+                out.extend_from_slice(b"0\r\n\r\n");
+                Ok((out, true, Some(body)))
+            }
+        }
+        Some(ps) => {
+            let send_n = body.len().min(ps);
+            if send_n > 0 {
+                write_chunk_into(&mut out, &body[..send_n]);
+            }
+            let rest = body.len().saturating_sub(send_n);
+            if rest == 0 {
+                out.extend_from_slice(b"0; ieof\r\n\r\n");
+                Ok((out, false, None))
+            } else {
+                out.extend_from_slice(b"0\r\n\r\n");
+                Ok((out, true, Some(body[send_n..].to_vec())))
+            }
+        }
+    }
+}
+
+/// Записать один chunk в поток
+async fn write_chunk(stream: &mut TcpStream, data: &[u8]) -> IcapResult<()> {
+    stream
+        .write_all(format!("{:X}\r\n", data.len()).as_bytes())
+        .await?;
+    if !data.is_empty() {
+        stream.write_all(data).await?;
+    }
+    stream.write_all(b"\r\n").await?;
+    Ok(())
+}
+
+/// Записать один chunk в вектор
+fn write_chunk_into(out: &mut Vec<u8>, data: &[u8]) {
+    out.extend_from_slice(format!("{:X}\r\n", data.len()).as_bytes());
+    if !data.is_empty() {
+        out.extend_from_slice(data);
+    }
+    out.extend_from_slice(b"\r\n");
+}
+
+/// Прочитать ICAP-заголовки (до \r\n\r\n) и вернуть (status_code, буфер_с_заголовками)
+async fn read_icap_headers(stream: &mut TcpStream) -> IcapResult<(u16, Vec<u8>)> {
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 4096];
+    loop {
+        let n = stream.read(&mut tmp).await?;
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        if let Some(idx) = find_double_crlf(&buf) {
+            // Разбираем статус-линию
+            let line_end = buf
+                .windows(2)
+                .position(|w| w == b"\r\n")
+                .unwrap_or(buf.len());
+            let status_line = &buf[..line_end];
+            let code = parse_status_code(status_line).ok_or("Failed to parse ICAP status code")?;
+            // Отрезать лишнее не обязательно — пусть вызывающий решает, что делать с буфером.
+            // Здесь возвращаем всё, что накопили (включая, возможно, начало тела/следующих данных).
+            return Ok((code, buf));
+        }
+    }
+    Err("Unexpected EOF while reading ICAP headers".into())
+}
+
+fn find_double_crlf(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|w| w == b"\r\n\r\n")
+}
+
+fn parse_status_code(line: &[u8]) -> Option<u16> {
+    // Ожидаем "ICAP/1.0 100 Continue" или подобное
+    let s = std::str::from_utf8(line).ok()?;
+    let mut parts = s.split_whitespace();
+    let _ver = parts.next()?; // "ICAP/1.0"
+    let code_str = parts.next()?; // "100"
+    code_str.parse::<u16>().ok()
+}
+
+/// Дочитать поток до EOF в буфер
+async fn read_to_end(stream: &mut TcpStream, out: &mut Vec<u8>) -> IcapResult<()> {
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = stream.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        out.extend_from_slice(&buf[..n]);
+    }
+    Ok(())
 }
