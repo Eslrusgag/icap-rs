@@ -1,13 +1,14 @@
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use icap_rs::http::HttpSession;
+use icap_rs::client::Request;
+use icap_rs::http::HttpMessage;
 use icap_rs::{
-    IcapClient, IcapMethod, IcapOptionsBuilder, IcapRequest, IcapResponse, IcapServer,
-    IcapStatusCode, TransferBehavior, error::IcapError,
+    Client, IcapMethod, IcapOptionsBuilder, Response, Server, StatusCode, TransferBehavior,
+    error::IcapError,
 };
 use std::time::Duration;
 use tokio::runtime::Runtime;
 
-/// Создает простой тестовый сервер
+/// Создаёт и запускает тестовый ICAP-сервер на 127.0.0.1:1345 с сервисом /benchmark
 async fn create_test_server() -> Result<(), Box<dyn std::error::Error>> {
     let options = IcapOptionsBuilder::new(
         vec![IcapMethod::ReqMod, IcapMethod::RespMod],
@@ -23,7 +24,7 @@ async fn create_test_server() -> Result<(), Box<dyn std::error::Error>> {
     .default_transfer_behavior(TransferBehavior::Preview)
     .build()?;
 
-    let server = IcapServer::builder()
+    let server = Server::builder()
         .bind("127.0.0.1:1345")
         .add_service("benchmark", benchmark_handler)
         .add_options_config("benchmark", options)
@@ -34,77 +35,63 @@ async fn create_test_server() -> Result<(), Box<dyn std::error::Error>> {
         let _ = server.run().await;
     });
 
+    // даём серверу подняться
     tokio::time::sleep(Duration::from_millis(100)).await;
     Ok(())
 }
 
-async fn benchmark_handler(request: IcapRequest) -> Result<IcapResponse, IcapError> {
-    match request.method.as_str() {
-        "REQMOD" | "RESPMOD" => {
-            // Возвращаем 204 No Content для максимальной скорости
-            Ok(
-                IcapResponse::new(IcapStatusCode::NoContent204, "No Content")
-                    .add_header("ISTag", "\"benchmark-server-v1.0\""),
-            )
-        }
-        "OPTIONS" => {
-            // Обрабатывается автоматически сервером
-            Ok(IcapResponse::new(IcapStatusCode::Ok200, "OK"))
-        }
-        _ => Ok(IcapResponse::new(
-            IcapStatusCode::MethodNotAllowed405,
-            "Method Not Allowed",
-        )),
-    }
+async fn benchmark_handler(_request: icap_rs::Request) -> Result<Response, IcapError> {
+    // Максимальная скорость — ничего не модифицируем, отвечаем 204
+    Ok(Response::new(StatusCode::NoContent204, "No Content")
+        .add_header("ISTag", "\"benchmark-server-v1.0\""))
 }
 
 fn bench_server_throughput(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
 
-    // Запускаем сервер
+    // Поднимаем сервер и создаём один клиент на все замеры
     rt.block_on(async {
         create_test_server()
             .await
             .expect("Failed to start test server");
     });
+    let client = Client::new("127.0.0.1", 1345).default_header("User-Agent", "rs-icap-bench/0.1.0");
 
     let mut group = c.benchmark_group("server_throughput");
     group.sample_size(100);
     group.measurement_time(Duration::from_secs(10));
 
-    // Различные размеры нагрузки
     for concurrent_requests in [1, 10, 50, 100, 200].iter() {
         group.throughput(Throughput::Elements(*concurrent_requests as u64));
 
+        let client_cloned = client.clone();
         group.bench_with_input(
             BenchmarkId::new("concurrent_requests", concurrent_requests),
             concurrent_requests,
-            |b, &concurrent_requests| {
+            |b, &concurrency| {
                 b.to_async(&rt).iter(|| async {
-                    let mut handles = Vec::new();
+                    let mut handles = Vec::with_capacity(concurrency);
 
-                    for _ in 0..concurrent_requests {
-                        let handle = tokio::spawn(async {
-                            let http_session = HttpSession::new("GET", "/test")
-                                .add_header("Content-Type", "text/plain")
-                                .with_body_string("test data");
+                    for _ in 0..concurrency {
+                        let client_task = client_cloned.clone();
 
-                            let client = IcapClient::builder()
-                                .set_host("127.0.0.1")
-                                .set_port(1345)
-                                .set_service("benchmark")
-                                .set_icap_method("REQMOD")
-                                .with_http_session(http_session)
+                        let handle = tokio::spawn(async move {
+                            // Вложенный HTTP-запрос
+                            let http = HttpMessage::builder("GET /test HTTP/1.1")
+                                .header("Content-Type", "text/plain")
+                                .body_string("test data")
                                 .build();
 
-                            client.send().await
+                            let icap_req = Request::reqmod("/benchmark").allow_204(true).http(http);
+
+                            client_task.send(&icap_req).await
                         });
+
                         handles.push(handle);
                     }
 
-                    // Ждем завершения всех запросов
-                    for handle in handles {
-                        let _ = handle.await;
+                    for h in handles {
+                        let _ = h.await;
                     }
                 });
             },
@@ -116,42 +103,36 @@ fn bench_server_throughput(c: &mut Criterion) {
 fn bench_client_latency(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
 
-    // Запускаем сервер
     rt.block_on(async {
         create_test_server()
             .await
             .expect("Failed to start test server");
     });
+    let client = Client::new("127.0.0.1", 1345).default_header("User-Agent", "rs-icap-bench/0.1.0");
 
     let mut group = c.benchmark_group("client_latency");
     group.sample_size(200);
     group.measurement_time(Duration::from_secs(5));
 
-    // Различные размеры данных
-    for data_size in [100, 1024, 10240, 102400].iter() {
+    for data_size in [100, 1024, 10_240, 102_400].iter() {
         let test_data = "x".repeat(*data_size);
-
         group.throughput(Throughput::Bytes(*data_size as u64));
 
+        let client_cloned = client.clone();
         group.bench_with_input(
             BenchmarkId::new("data_size_bytes", data_size),
             &test_data,
-            |b, test_data| {
+            |b, body| {
                 b.to_async(&rt).iter(|| async {
-                    let http_session = HttpSession::new("POST", "/upload")
-                        .add_header("Content-Type", "application/octet-stream")
-                        .add_header("Content-Length", &test_data.len().to_string())
-                        .with_body_string(test_data);
-
-                    let client = IcapClient::builder()
-                        .set_host("127.0.0.1")
-                        .set_port(1345)
-                        .set_service("benchmark")
-                        .set_icap_method("REQMOD")
-                        .with_http_session(http_session)
+                    let http = HttpMessage::builder("POST /upload HTTP/1.1")
+                        .header("Content-Type", "application/octet-stream")
+                        .header("Content-Length", &body.len().to_string())
+                        .body_string(body)
                         .build();
 
-                    let _ = client.send().await;
+                    let icap_req = Request::reqmod("/benchmark").allow_204(true).http(http);
+
+                    let _ = client_cloned.send(&icap_req).await;
                 });
             },
         );
@@ -162,54 +143,46 @@ fn bench_client_latency(c: &mut Criterion) {
 fn bench_options_requests(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
 
-    // Запускаем сервер
     rt.block_on(async {
         create_test_server()
             .await
             .expect("Failed to start test server");
     });
+    let client = Client::new("127.0.0.1", 1345).default_header("User-Agent", "rs-icap-bench/0.1.0");
 
     let mut group = c.benchmark_group("options_requests");
     group.sample_size(500);
 
-    group.bench_function("options_single", |b| {
-        b.to_async(&rt).iter(|| async {
-            let client = IcapClient::builder()
-                .set_host("127.0.0.1")
-                .set_port(1345)
-                .set_service("benchmark")
-                .set_icap_method("OPTIONS")
-                .build();
-
-            let _ = client.send().await;
+    // одиночный OPTIONS
+    {
+        let client_cloned = client.clone();
+        group.bench_function("options_single", |b| {
+            b.to_async(&rt).iter(|| async {
+                let icap_req = Request::options("/benchmark");
+                let _ = client_cloned.send(&icap_req).await;
+            });
         });
-    });
+    }
 
-    // Параллельные OPTIONS запросы
-    for concurrent in [10, 50, 100].iter() {
+    // параллельные OPTIONS
+    for &concurrent in &[10usize, 50, 100] {
+        let client_cloned = client.clone();
         group.bench_with_input(
             BenchmarkId::new("options_concurrent", concurrent),
-            concurrent,
-            |b, &concurrent| {
+            &concurrent,
+            |b, &concurrency| {
                 b.to_async(&rt).iter(|| async {
-                    let mut handles = Vec::new();
-
-                    for _ in 0..concurrent {
-                        let handle = tokio::spawn(async {
-                            let client = IcapClient::builder()
-                                .set_host("127.0.0.1")
-                                .set_port(1345)
-                                .set_service("benchmark")
-                                .set_icap_method("OPTIONS")
-                                .build();
-
-                            client.send().await
+                    let mut handles = Vec::with_capacity(concurrency);
+                    for _ in 0..concurrency {
+                        let client_task = client_cloned.clone();
+                        let handle = tokio::spawn(async move {
+                            let icap_req = Request::options("/benchmark");
+                            client_task.send(&icap_req).await
                         });
                         handles.push(handle);
                     }
-
-                    for handle in handles {
-                        let _ = handle.await;
+                    for h in handles {
+                        let _ = h.await;
                     }
                 });
             },
@@ -221,78 +194,68 @@ fn bench_options_requests(c: &mut Criterion) {
 fn bench_integration_mixed_load(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
 
-    // Запускаем сервер
     rt.block_on(async {
         create_test_server()
             .await
             .expect("Failed to start test server");
     });
+    let client = Client::new("127.0.0.1", 1345).default_header("User-Agent", "rs-icap-bench/0.1.0");
 
     let mut group = c.benchmark_group("integration_mixed_load");
     group.sample_size(50);
     group.measurement_time(Duration::from_secs(15));
 
+    let client_cloned = client.clone();
     group.bench_function("mixed_workload", |b| {
         b.to_async(&rt).iter(|| async {
             let mut handles = Vec::new();
 
-            // 30% OPTIONS запросов
+            // 30% OPTIONS
             for _ in 0..30 {
-                let handle = tokio::spawn(async {
-                    let client = IcapClient::builder()
-                        .set_host("127.0.0.1")
-                        .set_port(1345)
-                        .set_service("benchmark")
-                        .set_icap_method("OPTIONS")
-                        .build();
-                    client.send().await
+                let c = client_cloned.clone();
+                let handle = tokio::spawn(async move {
+                    let icap_req = Request::options("/benchmark");
+                    c.send(&icap_req).await
                 });
                 handles.push(handle);
             }
 
-            // 35% REQMOD запросов
+            // 35% REQMOD
             for i in 0..35 {
+                let c = client_cloned.clone();
                 let handle = tokio::spawn(async move {
                     let test_data = format!("request_data_{}", i);
-                    let http_session = HttpSession::new("POST", "/api/data")
-                        .add_header("Content-Type", "application/json")
-                        .with_body_string(&test_data);
-
-                    let client = IcapClient::builder()
-                        .set_host("127.0.0.1")
-                        .set_port(1345)
-                        .set_service("benchmark")
-                        .set_icap_method("REQMOD")
-                        .with_http_session(http_session)
+                    let http = HttpMessage::builder("POST /api/data HTTP/1.1")
+                        .header("Content-Type", "application/json")
+                        .body_string(&test_data)
                         .build();
-                    client.send().await
+
+                    let icap_req = Request::reqmod("/benchmark").allow_204(true).http(http);
+
+                    c.send(&icap_req).await
                 });
                 handles.push(handle);
             }
 
-            // 35% RESPMOD запросов
+            // 35% RESPMOD
             for i in 0..35 {
+                let c = client_cloned.clone();
                 let handle = tokio::spawn(async move {
                     let response_data = format!("response_data_{}", i);
-                    let http_session = HttpSession::new("GET", "/api/response")
-                        .add_header("Accept", "application/json")
-                        .with_body_string(&response_data);
-
-                    let client = IcapClient::builder()
-                        .set_host("127.0.0.1")
-                        .set_port(1345)
-                        .set_service("benchmark")
-                        .set_icap_method("RESPMOD")
-                        .with_http_session(http_session)
+                    let http = HttpMessage::builder("HTTP/1.1 200 OK")
+                        .header("Content-Type", "application/json")
+                        .body_string(&response_data)
                         .build();
-                    client.send().await
+
+                    let icap_req = Request::respmod("/benchmark").allow_204(true).http(http);
+
+                    c.send(&icap_req).await
                 });
                 handles.push(handle);
             }
 
-            // Ждем завершения всех запросов
-            for handle in handles {
-                let _ = handle.await;
+            for h in handles {
+                let _ = h.await;
             }
         });
     });
@@ -308,21 +271,21 @@ fn bench_request_parsing(c: &mut Criterion) {
                        Host: 127.0.0.1:1344\r\n\
                        User-Agent: ICAP-Client/1.0\r\n\
                        Allow: 204\r\n\
-                       Encapsulated: req-hdr=0, null-body=120\r\n\
+                       Encapsulated: req-hdr=0, req-body=120\r\n\
                        \r\n\
                        GET /test HTTP/1.1\r\n\
                        Host: example.com\r\n\
                        Content-Type: text/plain\r\n\
-                       Content-Length: 11\r\n\
+                       Content-Length: 9\r\n\
                        \r\n\
-                       test data\r\n";
+                       test data";
 
     group.throughput(Throughput::Bytes(test_request.len() as u64));
 
     group.bench_function("parse_icap_request", |b| {
         b.iter(|| {
-            // Имитируем парсинг ICAP запроса
-            let lines: Vec<&str> = test_request.lines().collect();
+            // Упрощённая имитация парсинга ICAP-запроса
+            let lines: Vec<&str> = test_request.split("\r\n").collect();
             let _first_line = lines[0];
             let mut _headers = std::collections::HashMap::new();
 
@@ -346,21 +309,21 @@ fn bench_response_creation(c: &mut Criterion) {
 
     group.bench_function("create_204_response", |b| {
         b.iter(|| {
-            let _response = IcapResponse::new(IcapStatusCode::NoContent204, "No Content")
+            let _response = Response::new(StatusCode::NoContent204, "No Content")
                 .add_header("ISTag", "\"benchmark-server-v1.0\"")
                 .add_header("Server", "ICAP-RS/1.0");
         });
     });
 
     group.bench_function("create_200_response_with_body", |b| {
-		b.iter(|| {
-			let body_data = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 13\r\n\r\nHello, World!";
-			let _response = IcapResponse::new(IcapStatusCode::Ok200, "OK")
-				.add_header("ISTag", "\"benchmark-server-v1.0\"")
-				.add_header("Encapsulated", "res-hdr=0, res-body=100")
-				.with_body(body_data);
-		});
-	});
+        b.iter(|| {
+            let body_data = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 13\r\n\r\nHello, World!";
+            let _response = Response::new(StatusCode::Ok200, "OK")
+                .add_header("ISTag", "\"benchmark-server-v1.0\"")
+                .add_header("Encapsulated", "res-hdr=0, res-body=100")
+                .with_body(body_data);
+        });
+    });
 
     group.finish();
 }

@@ -1,4 +1,4 @@
-use crate::icap_response::{IcapResponse, IcapStatusCode};
+use crate::response::{Response, StatusCode};
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use std::fmt;
@@ -32,7 +32,7 @@ pub enum TransferBehavior {
 
 /// Конфигурация OPTIONS для ICAP сервиса
 #[derive(Debug, Clone)]
-pub struct IcapOptionsConfig {
+pub struct OptionsConfig {
     /// Методы, поддерживаемые этим сервисом (ОБЯЗАТЕЛЬНЫЙ)
     pub methods: Vec<IcapMethod>,
 
@@ -77,7 +77,7 @@ pub struct IcapOptionsConfig {
     pub opt_body: Option<Vec<u8>>,
 }
 
-impl IcapOptionsConfig {
+impl OptionsConfig {
     /// Создает новую конфигурацию OPTIONS с минимальными обязательными параметрами
     pub fn new(methods: Vec<IcapMethod>, istag: &str) -> Self {
         Self {
@@ -167,8 +167,8 @@ impl IcapOptionsConfig {
     }
 
     /// Создает ICAP ответ на основе конфигурации
-    pub fn build_response(&self) -> IcapResponse {
-        let mut response = IcapResponse::new(IcapStatusCode::Ok200, "OK");
+    pub fn build_response(&self) -> Response {
+        let mut response = Response::new(StatusCode::Ok200, "OK");
 
         // Обязательные заголовки
 
@@ -305,22 +305,22 @@ impl IcapOptionsConfig {
     }
 }
 
-impl Default for IcapOptionsConfig {
+impl Default for OptionsConfig {
     fn default() -> Self {
         Self::new(vec![IcapMethod::RespMod], "default-service-tag-1.0")
     }
 }
 
-/// Строитель для IcapOptionsConfig
+/// Строитель для OptionsConfig
 pub struct IcapOptionsBuilder {
-    config: IcapOptionsConfig,
+    config: OptionsConfig,
 }
 
 impl IcapOptionsBuilder {
     /// Создает новый строитель
     pub fn new(methods: Vec<IcapMethod>, istag: &str) -> Self {
         Self {
-            config: IcapOptionsConfig::new(methods, istag),
+            config: OptionsConfig::new(methods, istag),
         }
     }
 
@@ -385,7 +385,7 @@ impl IcapOptionsBuilder {
     }
 
     /// Строит финальную конфигурацию
-    pub fn build(self) -> Result<IcapOptionsConfig, String> {
+    pub fn build(self) -> Result<OptionsConfig, String> {
         self.config.validate()?;
         Ok(self.config)
     }

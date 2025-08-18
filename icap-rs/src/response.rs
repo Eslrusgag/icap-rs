@@ -5,7 +5,7 @@ use std::str::FromStr;
 
 /// ICAP Status Codes
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum IcapStatusCode {
+pub enum StatusCode {
     Continue100,
     Ok200,
     NoContent204,
@@ -18,38 +18,38 @@ pub enum IcapStatusCode {
     GatewayTimeout504,
 }
 
-impl fmt::Display for IcapStatusCode {
+impl fmt::Display for StatusCode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            IcapStatusCode::Continue100 => write!(f, "100"),
-            IcapStatusCode::Ok200 => write!(f, "200"),
-            IcapStatusCode::NoContent204 => write!(f, "204"),
-            IcapStatusCode::BadRequest400 => write!(f, "400"),
-            IcapStatusCode::NotFound404 => write!(f, "404"),
-            IcapStatusCode::MethodNotAllowed405 => write!(f, "405"),
-            IcapStatusCode::RequestEntityTooLarge413 => write!(f, "413"),
-            IcapStatusCode::InternalServerError500 => write!(f, "500"),
-            IcapStatusCode::ServiceUnavailable503 => write!(f, "503"),
-            IcapStatusCode::GatewayTimeout504 => write!(f, "504"),
+            StatusCode::Continue100 => write!(f, "100"),
+            StatusCode::Ok200 => write!(f, "200"),
+            StatusCode::NoContent204 => write!(f, "204"),
+            StatusCode::BadRequest400 => write!(f, "400"),
+            StatusCode::NotFound404 => write!(f, "404"),
+            StatusCode::MethodNotAllowed405 => write!(f, "405"),
+            StatusCode::RequestEntityTooLarge413 => write!(f, "413"),
+            StatusCode::InternalServerError500 => write!(f, "500"),
+            StatusCode::ServiceUnavailable503 => write!(f, "503"),
+            StatusCode::GatewayTimeout504 => write!(f, "504"),
         }
     }
 }
 
-impl FromStr for IcapStatusCode {
+impl FromStr for StatusCode {
     type Err = &'static str;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "100" => Ok(IcapStatusCode::Continue100),
-            "200" => Ok(IcapStatusCode::Ok200),
-            "204" => Ok(IcapStatusCode::NoContent204),
-            "400" => Ok(IcapStatusCode::BadRequest400),
-            "404" => Ok(IcapStatusCode::NotFound404),
-            "405" => Ok(IcapStatusCode::MethodNotAllowed405),
-            "413" => Ok(IcapStatusCode::RequestEntityTooLarge413),
-            "500" => Ok(IcapStatusCode::InternalServerError500),
-            "503" => Ok(IcapStatusCode::ServiceUnavailable503),
-            "504" => Ok(IcapStatusCode::GatewayTimeout504),
+            "100" => Ok(StatusCode::Continue100),
+            "200" => Ok(StatusCode::Ok200),
+            "204" => Ok(StatusCode::NoContent204),
+            "400" => Ok(StatusCode::BadRequest400),
+            "404" => Ok(StatusCode::NotFound404),
+            "405" => Ok(StatusCode::MethodNotAllowed405),
+            "413" => Ok(StatusCode::RequestEntityTooLarge413),
+            "500" => Ok(StatusCode::InternalServerError500),
+            "503" => Ok(StatusCode::ServiceUnavailable503),
+            "504" => Ok(StatusCode::GatewayTimeout504),
             _ => Err("Invalid ICAP status code"),
         }
     }
@@ -57,17 +57,17 @@ impl FromStr for IcapStatusCode {
 
 /// ICAP Response structure
 #[derive(Debug, Clone)]
-pub struct IcapResponse {
+pub struct Response {
     pub version: String,
-    pub status_code: IcapStatusCode,
+    pub status_code: StatusCode,
     pub status_text: String,
     pub headers: HashMap<String, String>,
     pub body: Vec<u8>,
 }
 
-impl IcapResponse {
+impl Response {
     /// Create a new ICAP response
-    pub fn new(status_code: IcapStatusCode, status_text: &str) -> Self {
+    pub fn new(status_code: StatusCode, status_text: &str) -> Self {
         Self {
             version: "ICAP/1.0".to_string(),
             status_code,
@@ -84,7 +84,7 @@ impl IcapResponse {
     pub fn no_content() -> Self {
         Self {
             version: "ICAP/1.0".to_string(),
-            status_code: IcapStatusCode::NoContent204,
+            status_code: StatusCode::NoContent204,
             status_text: "No Content".to_string(),
             headers: HashMap::new(),
             body: Vec::new(),
@@ -95,7 +95,7 @@ impl IcapResponse {
     pub fn no_content_with_headers(headers: HashMap<String, String>) -> Self {
         Self {
             version: "ICAP/1.0".to_string(),
-            status_code: IcapStatusCode::NoContent204,
+            status_code: StatusCode::NoContent204,
             status_text: "No Content".to_string(),
             headers,
             body: Vec::new(),
@@ -163,7 +163,7 @@ impl IcapResponse {
     pub fn is_success(&self) -> bool {
         matches!(
             self.status_code,
-            IcapStatusCode::Ok200 | IcapStatusCode::NoContent204
+            StatusCode::Ok200 | StatusCode::NoContent204
         )
     }
 
@@ -171,22 +171,22 @@ impl IcapResponse {
     pub fn is_error(&self) -> bool {
         matches!(
             self.status_code,
-            IcapStatusCode::BadRequest400
-                | IcapStatusCode::NotFound404
-                | IcapStatusCode::MethodNotAllowed405
-                | IcapStatusCode::RequestEntityTooLarge413
-                | IcapStatusCode::InternalServerError500
-                | IcapStatusCode::ServiceUnavailable503
-                | IcapStatusCode::GatewayTimeout504
+            StatusCode::BadRequest400
+                | StatusCode::NotFound404
+                | StatusCode::MethodNotAllowed405
+                | StatusCode::RequestEntityTooLarge413
+                | StatusCode::InternalServerError500
+                | StatusCode::ServiceUnavailable503
+                | StatusCode::GatewayTimeout504
         )
     }
 }
 
-impl Default for IcapResponse {
+impl Default for Response {
     fn default() -> Self {
         Self {
             version: "ICAP/1.0".to_string(),
-            status_code: IcapStatusCode::Ok200,
+            status_code: StatusCode::Ok200,
             status_text: "OK".to_string(),
             headers: HashMap::new(),
             body: Vec::new(),
@@ -194,7 +194,7 @@ impl Default for IcapResponse {
     }
 }
 
-impl fmt::Display for IcapResponse {
+impl fmt::Display for Response {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
@@ -216,15 +216,15 @@ impl fmt::Display for IcapResponse {
 
 /// Builder for ICAP responses
 #[derive(Debug)]
-pub struct IcapResponseBuilder {
-    response: IcapResponse,
+pub struct ResponseBuilder {
+    response: Response,
 }
 
-impl IcapResponseBuilder {
+impl ResponseBuilder {
     /// Create a new response builder
-    pub fn new(status_code: IcapStatusCode, status_text: &str) -> Self {
+    pub fn new(status_code: StatusCode, status_text: &str) -> Self {
         Self {
-            response: IcapResponse::new(status_code, status_text),
+            response: Response::new(status_code, status_text),
         }
     }
 
@@ -253,7 +253,7 @@ impl IcapResponseBuilder {
     }
 
     /// Build the final response
-    pub fn build(self) -> IcapResponse {
+    pub fn build(self) -> Response {
         self.response
     }
 }

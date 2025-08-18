@@ -1,6 +1,6 @@
 use icap_rs::{
-    HttpMessageTrait, IcapMethod, IcapOptionsBuilder, IcapRequest, IcapResponse, IcapServer,
-    IcapStatusCode, TransferBehavior, error::IcapError,
+    HttpMessageTrait, IcapMethod, IcapOptionsBuilder, Request, Response, Server, StatusCode,
+    TransferBehavior, error::IcapError,
 };
 use tokio;
 use tracing::info;
@@ -52,7 +52,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .build()?;
 
     // Создаем сервер с сервисами и их OPTIONS конфигурациями
-    let server = IcapServer::builder()
+    let server = Server::builder()
         .bind("127.0.0.1:1344")
         .add_service("content-filter", content_filter_handler)
         .add_options_config("content-filter", content_filter_options)
@@ -75,7 +75,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Обработчик для сервиса content-filter
-async fn content_filter_handler(request: IcapRequest) -> Result<IcapResponse, IcapError> {
+async fn content_filter_handler(request: Request) -> Result<Response, IcapError> {
     info!("Content filter processing request: {}", request.method);
 
     match request.method.as_str() {
@@ -96,7 +96,7 @@ async fn content_filter_handler(request: IcapRequest) -> Result<IcapResponse, Ic
                             .replace("</script>", " -->");
                         filtered_response.body = filtered_body.into_bytes();
 
-                        let icap_response = IcapResponse::new(IcapStatusCode::Ok200, "OK")
+                        let icap_response = Response::new(StatusCode::Ok200, "OK")
                             .add_header("ISTag", "\"content-filter-v2.1\"")
                             .add_header("Encapsulated", "res-hdr=0, res-body=100")
                             .with_body(&filtered_response.to_raw());
@@ -107,20 +107,18 @@ async fn content_filter_handler(request: IcapRequest) -> Result<IcapResponse, Ic
             }
 
             // Возвращаем 204 No Content (не требует модификации)
-            Ok(
-                IcapResponse::new(IcapStatusCode::NoContent204, "No Content")
-                    .add_header("ISTag", "\"content-filter-v2.1\""),
-            )
+            Ok(Response::new(StatusCode::NoContent204, "No Content")
+                .add_header("ISTag", "\"content-filter-v2.1\""))
         }
-        _ => Ok(IcapResponse::new(
-            IcapStatusCode::MethodNotAllowed405,
+        _ => Ok(Response::new(
+            StatusCode::MethodNotAllowed405,
             "Method Not Allowed",
         )),
     }
 }
 
 /// Обработчик для сервиса virus-scan
-async fn virus_scan_handler(request: IcapRequest) -> Result<IcapResponse, IcapError> {
+async fn virus_scan_handler(request: Request) -> Result<Response, IcapError> {
     info!("Virus scanner processing request: {}", request.method);
 
     match request.method.as_str() {
@@ -145,7 +143,7 @@ async fn virus_scan_handler(request: IcapRequest) -> Result<IcapResponse, IcapEr
                          <html><body>Access blocked by virus scanner</body></html>"
                     );
 
-                    return Ok(IcapResponse::new(IcapStatusCode::Ok200, "OK")
+                    return Ok(Response::new(StatusCode::Ok200, "OK")
                         .add_header("ISTag", "\"virus-scan-v3.0\"")
                         .add_header("Encapsulated", "res-hdr=0, res-body=100")
                         .with_body(block_response.as_bytes()));
@@ -153,10 +151,8 @@ async fn virus_scan_handler(request: IcapRequest) -> Result<IcapResponse, IcapEr
             }
 
             // Запрос чист
-            Ok(
-                IcapResponse::new(IcapStatusCode::NoContent204, "No Content")
-                    .add_header("ISTag", "\"virus-scan-v3.0\""),
-            )
+            Ok(Response::new(StatusCode::NoContent204, "No Content")
+                .add_header("ISTag", "\"virus-scan-v3.0\""))
         }
         "RESPMOD" => {
             info!("Scanning HTTP response");
@@ -175,13 +171,11 @@ async fn virus_scan_handler(request: IcapRequest) -> Result<IcapResponse, IcapEr
                 }
             }
 
-            Ok(
-                IcapResponse::new(IcapStatusCode::NoContent204, "No Content")
-                    .add_header("ISTag", "\"virus-scan-v3.0\""),
-            )
+            Ok(Response::new(StatusCode::NoContent204, "No Content")
+                .add_header("ISTag", "\"virus-scan-v3.0\""))
         }
-        _ => Ok(IcapResponse::new(
-            IcapStatusCode::MethodNotAllowed405,
+        _ => Ok(Response::new(
+            StatusCode::MethodNotAllowed405,
             "Method Not Allowed",
         )),
     }

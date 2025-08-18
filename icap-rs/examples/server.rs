@@ -1,4 +1,4 @@
-use icap_rs::{HttpMessage, IcapResponse, IcapServer, IcapStatusCode};
+use icap_rs::{HttpMessage, Response, Server, StatusCode};
 use tracing::{error, info, warn};
 
 #[tokio::main]
@@ -9,12 +9,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .init();
 
     // Create server with all services
-    let server = IcapServer::builder()
+    let server = Server::builder()
         .bind("127.0.0.1:1344")
         .add_service("echo", |request| async move {
             info!("Echo service called with method: {}", request.method);
 
-            let response = IcapResponse::new(IcapStatusCode::Ok200, "OK")
+            let response = Response::new(StatusCode::Ok200, "OK")
                 .add_header("Content-Length", "0")
                 .add_header("Server", "icap-rs/0.1.0");
 
@@ -23,7 +23,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .add_service("test", |request| async move {
             info!("Test service called with method: {}", request.method);
 
-            let response = IcapResponse::new(IcapStatusCode::Ok200, "OK")
+            let response = Response::new(StatusCode::Ok200, "OK")
                 .add_header("Content-Length", "0")
                 .add_header("Server", "icap-rs/0.1.0")
                 .add_header("X-Request-Method", &request.method)
@@ -36,9 +36,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
             // Check if this is a REQMOD request
             if request.method != "REQMOD" {
-                let response =
-                    IcapResponse::new(IcapStatusCode::MethodNotAllowed405, "Method Not Allowed")
-                        .add_header("Content-Length", "0");
+                let response = Response::new(StatusCode::MethodNotAllowed405, "Method Not Allowed")
+                    .add_header("Content-Length", "0");
                 return Ok(response);
             }
 
@@ -53,7 +52,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
                 if !needs_modification {
                     info!("No modification needed, returning 204 No Content");
-                    return Ok(IcapResponse::no_content().add_header("Server", "icap-rs/0.1.0"));
+                    return Ok(Response::no_content().add_header("Server", "icap-rs/0.1.0"));
                 }
             }
 
@@ -77,13 +76,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     body: http_request.body,
                 };
 
-                let response = IcapResponse::new(IcapStatusCode::Ok200, "OK")
-                    .add_header("Content-Length", "0");
+                let response =
+                    Response::new(StatusCode::Ok200, "OK").add_header("Content-Length", "0");
 
                 Ok(response)
             } else {
                 warn!("REQMOD request received but no HTTP request data found");
-                let response = IcapResponse::new(IcapStatusCode::BadRequest400, "Bad Request")
+                let response = Response::new(StatusCode::BadRequest400, "Bad Request")
                     .add_header("Content-Length", "0");
                 Ok(response)
             }
@@ -93,9 +92,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
             // Check if this is a RESPMOD request
             if request.method != "RESPMOD" {
-                let response =
-                    IcapResponse::new(IcapStatusCode::MethodNotAllowed405, "Method Not Allowed")
-                        .add_header("Content-Length", "0");
+                let response = Response::new(StatusCode::MethodNotAllowed405, "Method Not Allowed")
+                    .add_header("Content-Length", "0");
                 return Ok(response);
             }
 
@@ -110,7 +108,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
                 if !needs_modification {
                     info!("No modification needed, returning 204 No Content");
-                    return Ok(IcapResponse::no_content().add_header("Server", "icap-rs/0.1.0"));
+                    return Ok(Response::no_content().add_header("Server", "icap-rs/0.1.0"));
                 }
             }
 
@@ -139,13 +137,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     body: http_response.body,
                 };
 
-                let response = IcapResponse::new(IcapStatusCode::Ok200, "OK")
-                    .add_header("Content-Length", "0");
+                let response =
+                    Response::new(StatusCode::Ok200, "OK").add_header("Content-Length", "0");
 
                 Ok(response)
             } else {
                 warn!("RESPMOD request received but no HTTP response data found");
-                let response = IcapResponse::new(IcapStatusCode::BadRequest400, "Bad Request")
+                let response = Response::new(StatusCode::BadRequest400, "Bad Request")
                     .add_header("Content-Length", "0");
                 Ok(response)
             }

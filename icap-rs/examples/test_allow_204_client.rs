@@ -1,5 +1,5 @@
 use icap_rs::parser;
-use icap_rs::{HttpMessage, HttpMessageTrait, IcapRequest, IcapResponse};
+use icap_rs::{HttpMessage, HttpMessageTrait, Request, Response};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::{error, info};
@@ -44,7 +44,7 @@ async fn test_reqmod_with_allow_204(
         .add_header("Accept", "application/json");
 
     // Create ICAP request with Allow: 204
-    let icap_request = IcapRequest::new("REQMOD", "icap://localhost/content-filter", "ICAP/1.0")
+    let icap_request = Request::new("REQMOD", "icap://localhost/content-filter", "ICAP/1.0")
         .add_header("Host", "localhost:1344")
         .add_header("Allow", "204")
         .add_header("Content-Length", &http_request.to_raw().len().to_string())
@@ -85,7 +85,7 @@ async fn test_reqmod_without_allow_204(
         .add_header("Accept", "application/json");
 
     // Create ICAP request without Allow: 204
-    let icap_request = IcapRequest::new("REQMOD", "icap://localhost/content-filter", "ICAP/1.0")
+    let icap_request = Request::new("REQMOD", "icap://localhost/content-filter", "ICAP/1.0")
         .add_header("Host", "localhost:1344")
         .add_header("Content-Length", &http_request.to_raw().len().to_string())
         .with_http_request(http_request);
@@ -125,7 +125,7 @@ async fn test_respmod_with_allow_204(
         .with_body_string("<html><body>Hello World</body></html>");
 
     // Create ICAP request with Allow: 204
-    let icap_request = IcapRequest::new("RESPMOD", "icap://localhost/content-filter", "ICAP/1.0")
+    let icap_request = Request::new("RESPMOD", "icap://localhost/content-filter", "ICAP/1.0")
         .add_header("Host", "localhost:1344")
         .add_header("Allow", "204")
         .add_header("Content-Length", &http_response.to_raw().len().to_string())
@@ -166,7 +166,7 @@ async fn test_preview_request(
         .add_header("Accept", "application/json");
 
     // Create ICAP request with Preview header (no Allow: 204)
-    let icap_request = IcapRequest::new("REQMOD", "icap://localhost/content-filter", "ICAP/1.0")
+    let icap_request = Request::new("REQMOD", "icap://localhost/content-filter", "ICAP/1.0")
         .add_header("Host", "localhost:1344")
         .add_header("Preview", "1024")
         .add_header("Content-Length", &http_request.to_raw().len().to_string())
@@ -195,13 +195,13 @@ async fn test_preview_request(
     Ok(())
 }
 
-fn serialize_icap_request(request: &IcapRequest) -> Vec<u8> {
+fn serialize_icap_request(request: &Request) -> Vec<u8> {
     parser::serialize_icap_request(request)
 }
 
 async fn read_icap_response(
     stream: &mut TcpStream,
-) -> Result<IcapResponse, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Response, Box<dyn std::error::Error + Send + Sync>> {
     let mut buffer = Vec::new();
     let mut temp_buffer = [0; 1024];
 
@@ -225,6 +225,5 @@ async fn read_icap_response(
     }
 
     // Parse response
-    IcapResponse::from_raw(&buffer)
-        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+    Response::from_raw(&buffer).map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
 }

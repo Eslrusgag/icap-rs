@@ -4,7 +4,7 @@ use std::fmt;
 
 /// Структура ICAP запроса
 #[derive(Debug, Clone)]
-pub struct IcapRequest {
+pub struct Request {
     pub method: String,
     pub uri: String,
     pub version: String,
@@ -13,7 +13,7 @@ pub struct IcapRequest {
     pub http_response: Option<HttpMessage>,
 }
 
-impl IcapRequest {
+impl Request {
     /// Создает новый ICAP запрос
     pub fn new(method: &str, uri: &str, version: &str) -> Self {
         Self {
@@ -112,7 +112,7 @@ impl IcapRequest {
     }
 }
 
-impl Default for IcapRequest {
+impl Default for Request {
     fn default() -> Self {
         Self {
             method: "OPTIONS".to_string(),
@@ -125,7 +125,7 @@ impl Default for IcapRequest {
     }
 }
 
-impl fmt::Display for IcapRequest {
+impl fmt::Display for Request {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{} {} {}", self.method, self.uri, self.version)?;
 

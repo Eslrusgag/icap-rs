@@ -1,22 +1,9 @@
 use crate::error::IcapResult;
 use crate::http::{HttpMessage, HttpMessageTrait};
-use crate::icap_request::IcapRequest;
-use crate::icap_response::IcapResponse;
+use crate::request::Request;
+use crate::response::Response;
 use std::collections::HashMap;
 use std::str::FromStr;
-
-/// Парсит HTTP заголовки из строки
-pub fn parse_headers(headers_str: &str) -> HashMap<String, String> {
-    let mut headers = HashMap::new();
-
-    for line in headers_str.lines() {
-        if let Some((name, value)) = split_header(line) {
-            headers.insert(name, value);
-        }
-    }
-
-    headers
-}
 
 /// Разделяет строку заголовка на имя и значение
 #[inline]
@@ -43,7 +30,7 @@ pub fn is_http_start_line(line: &str) -> bool {
 }
 
 /// Парсит ICAP запрос из сырых байтов
-pub fn parse_icap_request(data: &[u8]) -> IcapResult<IcapRequest> {
+pub fn parse_icap_request(data: &[u8]) -> IcapResult<Request> {
     let text = String::from_utf8_lossy(data);
     let mut lines = text.lines();
 
@@ -54,7 +41,7 @@ pub fn parse_icap_request(data: &[u8]) -> IcapResult<IcapRequest> {
     let uri = parts.next().ok_or("Invalid request line")?.to_string();
     let version = parts.next().ok_or("Invalid request line")?.to_string();
 
-    let mut request = IcapRequest::new(&method, &uri, &version);
+    let mut request = Request::new(&method, &uri, &version);
 
     // Временные структуры для HTTP сообщений
     let mut current_http: Option<HttpMessage> = None;
@@ -100,7 +87,6 @@ pub fn parse_icap_request(data: &[u8]) -> IcapResult<IcapRequest> {
         }
     }
 
-    // Последнее HTTP сообщение (если было)
     if let Some(msg) = current_http {
         if method == "REQMOD" {
             request.http_request = Some(msg);
@@ -113,7 +99,7 @@ pub fn parse_icap_request(data: &[u8]) -> IcapResult<IcapRequest> {
 }
 
 /// Сериализует ICAP запрос в байты
-pub fn serialize_icap_request(request: &IcapRequest) -> Vec<u8> {
+pub fn serialize_icap_request(request: &Request) -> Vec<u8> {
     let mut raw = Vec::new();
 
     // Request line
@@ -142,7 +128,7 @@ pub fn serialize_icap_request(request: &IcapRequest) -> Vec<u8> {
 }
 
 /// Сериализует ICAP ответ в байты
-pub fn serialize_icap_response(response: &IcapResponse) -> IcapResult<Vec<u8>> {
+pub fn serialize_icap_response(response: &Response) -> IcapResult<Vec<u8>> {
     let mut result = Vec::new();
 
     // Status line
@@ -223,7 +209,7 @@ pub fn extract_service_name(uri: &str) -> IcapResult<String> {
 }
 
 /// Парсит ICAP ответ из сырых байтов
-pub fn parse_icap_response(raw: &[u8]) -> IcapResult<IcapResponse> {
+pub fn parse_icap_response(raw: &[u8]) -> IcapResult<Response> {
     if raw.is_empty() {
         return Err("Empty response".into());
     }
@@ -239,23 +225,23 @@ pub fn parse_icap_response(raw: &[u8]) -> IcapResult<IcapResponse> {
     }
 
     let version = parts[0].to_string();
-    let status_code = match crate::icap_response::IcapStatusCode::from_str(parts[1]) {
+    let status_code = match crate::response::StatusCode::from_str(parts[1]) {
         Ok(code) => code,
         Err(_) => {
             // Try to parse as unknown status code
             if let Ok(code_num) = parts[1].parse::<u16>() {
                 // Create a custom status code for unknown values
                 match code_num {
-                    100 => crate::icap_response::IcapStatusCode::Continue100,
-                    200 => crate::icap_response::IcapStatusCode::Ok200,
-                    204 => crate::icap_response::IcapStatusCode::NoContent204,
-                    400 => crate::icap_response::IcapStatusCode::BadRequest400,
-                    404 => crate::icap_response::IcapStatusCode::NotFound404,
-                    405 => crate::icap_response::IcapStatusCode::MethodNotAllowed405,
-                    413 => crate::icap_response::IcapStatusCode::RequestEntityTooLarge413,
-                    500 => crate::icap_response::IcapStatusCode::InternalServerError500,
-                    503 => crate::icap_response::IcapStatusCode::ServiceUnavailable503,
-                    504 => crate::icap_response::IcapStatusCode::GatewayTimeout504,
+                    100 => crate::response::StatusCode::Continue100,
+                    200 => crate::response::StatusCode::Ok200,
+                    204 => crate::response::StatusCode::NoContent204,
+                    400 => crate::response::StatusCode::BadRequest400,
+                    404 => crate::response::StatusCode::NotFound404,
+                    405 => crate::response::StatusCode::MethodNotAllowed405,
+                    413 => crate::response::StatusCode::RequestEntityTooLarge413,
+                    500 => crate::response::StatusCode::InternalServerError500,
+                    503 => crate::response::StatusCode::ServiceUnavailable503,
+                    504 => crate::response::StatusCode::GatewayTimeout504,
                     _ => return Err(format!("Unknown ICAP status code: {}", code_num).into()),
                 }
             } else {
@@ -292,7 +278,7 @@ pub fn parse_icap_response(raw: &[u8]) -> IcapResult<IcapResponse> {
         Vec::new()
     };
 
-    Ok(IcapResponse {
+    Ok(Response {
         version,
         status_code,
         status_text,
