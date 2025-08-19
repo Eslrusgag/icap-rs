@@ -1,8 +1,10 @@
 use clap::Parser;
-use icap_rs::Client;
-use icap_rs::client::Request;
+use http::{
+    HeaderName, HeaderValue, Method, Request as HttpRequest, Response as HttpResponse, StatusCode,
+    Version,
+};
+use icap_rs::client::{Client, Request};
 use icap_rs::error::IcapResult;
-use icap_rs::http::HttpMessage;
 use std::fs;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
@@ -16,7 +18,7 @@ use tracing::{debug, error, info, warn};
     long_about = "A Rust implementation of ICAP client with a c-icap-client-like CLI"
 )]
 struct Args {
-    /// Full ICAP URI like icap://host[:port]/service)
+    /// Full ICAP URI like icap://host[:port]/service
     #[arg(short = 'u', long, default_value = "icap://127.0.0.1:1344/")]
     uri: String,
 
@@ -32,11 +34,11 @@ struct Args {
     #[arg(long = "method")]
     method: Option<String>,
 
-    /// Send REQMOD with given request URL
+    /// Send REQMOD with given request URL (origin-form or absolute URI)
     #[arg(long = "req")]
     req_url: Option<String>,
 
-    /// Send RESPMOD with given request URL (we’ll encapsulate HTTP info)
+    /// Send RESPMOD with given request URL (we’ll put it into a header for trace)
     #[arg(long = "resp")]
     resp_url: Option<String>,
 
@@ -80,7 +82,7 @@ struct Args {
     #[arg(short = 'v', long, action = clap::ArgAction::SetTrue)]
     verbose: bool,
 
-    /// Print the generated ICAP request summary without sending it
+    /// Print the generated ICAP request (raw wire) without sending it
     #[arg(long = "print-request", action = clap::ArgAction::SetTrue)]
     print_request: bool,
 }
@@ -106,7 +108,7 @@ async fn main() -> IcapResult<()> {
     info!("Starting rs-icap-client");
     debug!("Arguments: {:?}", args);
 
-    let icap_method = if let Some(m) = args.method {
+    let icap_method = if let Some(m) = args.method.as_deref() {
         m.to_uppercase()
     } else if args.req_url.is_some() {
         "REQMOD".to_string()
@@ -118,127 +120,148 @@ async fn main() -> IcapResult<()> {
         "OPTIONS".to_string()
     };
 
-    // В новой архитектуре клиент НИЧЕГО сам не добавляет про Preview.
-    let client = Client::from_uri(&args.uri)?;
+    // Клиент через билдер (можно расширять конфиг тут)
+    let client = Client::builder().from_uri(&args.uri)?.build();
 
     let service = service_from_uri(&args.uri).unwrap_or_else(|| "/options".to_string());
 
-    // Сборка Request
-    let mut req_parts = Request::new(&icap_method, &service);
+    let mut icap_req = Request::new(&icap_method, &service);
 
     if !args.no204 {
-        req_parts = req_parts.allow_204(true);
+        icap_req = icap_req.allow_204(true);
     }
     if args.allow_206 {
-        req_parts = req_parts.allow_206(true);
+        icap_req = icap_req.allow_206(true);
     }
 
-    // Сначала обработаем дополнительные ICAP-заголовки (-x).
-    // Если включён --nopreview, то принудительно игнорируем любые попытки задать Preview через -x.
     for h in &args.xheader {
-        if let Some((k, v)) = h.split_once(':') {
-            let key = k.trim();
-            let val = v.trim();
-            if key.eq_ignore_ascii_case("Preview") {
-                if args.nopreview {
-                    warn!("--nopreview is set: skipping header '{}: {}'", key, val);
-                    continue;
-                }
-                // Request::header маппит Preview -> preview_size
-                req_parts = req_parts.header(key, val);
-            } else {
-                req_parts = req_parts.header(key, val);
-            }
-        } else {
-            warn!("Bad -x header format (use \"Name: Value\"): '{}'", h);
-        }
-    }
-
-    // Затем CLI-параметр превью. Если --nopreview, игнорируем.
-    if !args.nopreview {
-        if let Some(n) = args.preview_size {
-            req_parts = req_parts.preview(n);
-        }
-    } else if args.preview_size.is_some() {
-        warn!("--nopreview overrides --preview-size, Preview will not be sent");
-    }
-
-    // Вложенный HTTP только для REQMOD/RESPMOD
-    if icap_method == "REQMOD" || icap_method == "RESPMOD" {
-        let mut http = if let Some(req_url) = &args.req_url {
-            HttpMessage::builder(&format!("GET {} HTTP/1.1", req_url))
-                .header("Host", host_from_url(req_url).unwrap_or("example.com"))
-                .build()
-        } else if let Some(resp_url) = &args.resp_url {
-            // Упрощённая заглушка HTTP-ответа
-            HttpMessage::builder("HTTP/1.1 200 OK")
-                .header("Content-Type", "application/octet-stream")
-                .header("X-Resp-Source", resp_url)
-                .build()
-        } else if args.filename.is_some() {
-            HttpMessage::builder("GET /rs-icap-client HTTP/1.1")
-                .header("Host", "localhost")
-                .build()
-        } else {
-            HttpMessage::builder("POST /rs-icap-client HTTP/1.1")
-                .header("Host", "localhost")
-                .build()
-        };
-
-        for h in &args.hx_header {
-            if let Some((k, v)) = h.split_once(':') {
-                http = http.add_header(k.trim(), v.trim());
-            } else {
-                warn!("Bad --hx header format (use \"Name: Value\"): '{}'", h);
-            }
-        }
-        if icap_method == "RESPMOD" {
-            for h in &args.rhx_header {
-                if let Some((k, v)) = h.split_once(':') {
-                    http = http.add_header(k.trim(), v.trim());
+        match parse_header_line(h) {
+            Ok((k, v)) => {
+                if k.eq_ignore_ascii_case("preview") {
+                    if args.nopreview {
+                        warn!("--nopreview set: skipping '{}: {}'", k, v);
+                    } else if let Ok(n) = v.parse::<usize>() {
+                        icap_req = icap_req.preview(n);
+                    } else {
+                        warn!("Invalid Preview value in -x: '{}: {}'", k, v);
+                    }
                 } else {
-                    warn!("Bad --rhx header format (use \"Name: Value\"): '{}'", h);
+                    icap_req = icap_req.icap_header(&k, &v);
                 }
             }
+            Err(e) => warn!("Bad -x header '{}': {}", h, e),
         }
+    }
 
-        if let Some(filename) = &args.filename {
+    // CLI превью
+    if args.nopreview {
+        if args.preview_size.is_some() {
+            warn!("--nopreview overrides --preview-size; Preview will not be sent");
+        }
+    } else if let Some(n) = args.preview_size {
+        icap_req = icap_req.preview(n);
+    }
+
+    // ── Вложенный HTTP только для REQMOD/RESPMOD
+    if icap_method == "REQMOD" || icap_method == "RESPMOD" {
+        // Тело из файла (если задано)
+        let file_bytes = if let Some(filename) = &args.filename {
             match fs::read(filename) {
                 Ok(bytes) => {
-                    http = http.with_body(&bytes);
-                    debug!("Added file content to HTTP: {} bytes", bytes.len());
+                    debug!("Loaded file '{}': {} bytes", filename, bytes.len());
+                    Some(bytes)
                 }
                 Err(e) => {
                     error!("Failed to read file {}: {}", filename, e);
                     return Err(e.into());
                 }
             }
-        }
+        } else {
+            None
+        };
 
-        req_parts = req_parts.http(http);
+        if icap_method == "REQMOD" {
+            // Сборка HTTP-запроса
+            let (host_hdr, uri) = match args.req_url.as_deref() {
+                Some(url) => {
+                    // Если absolute-form, достанем host; если origin-form — пусть юзер задаст Host через --hx.
+                    let host = host_from_url(url).map(|s| s.to_string());
+                    (host, url.to_string())
+                }
+                None => (Some("localhost".into()), "/rs-icap-client".into()),
+            };
+
+            let mut builder = HttpRequest::builder()
+                .method(Method::GET)
+                .version(Version::HTTP_11)
+                .uri(uri);
+
+            // Host
+            if let Some(h) = host_hdr.as_deref() {
+                builder = builder.header("Host", h);
+            }
+
+            // Пользовательские request headers (--hx)
+            for h in &args.hx_header {
+                match parse_header_line(h) {
+                    Ok((k, v)) => {
+                        builder = builder.header(
+                            HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                            HeaderValue::from_str(&v).unwrap(),
+                        );
+                    }
+                    Err(e) => warn!("Bad --hx header '{}': {}", h, e),
+                }
+            }
+
+            // Тело
+            let body = file_bytes.unwrap_or_default();
+            let http_req = builder.body(body).expect("failed to build HTTP request");
+
+            icap_req = icap_req.with_http_request(http_req);
+        } else {
+            // RESPMOD: собираем HTTP-ответ
+            let mut builder = HttpResponse::builder()
+                .status(StatusCode::OK)
+                .version(Version::HTTP_11);
+
+            // Пользовательские response headers (--rhx)
+            for h in &args.rhx_header {
+                match parse_header_line(h) {
+                    Ok((k, v)) => {
+                        builder = builder.header(
+                            HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                            HeaderValue::from_str(&v).unwrap(),
+                        );
+                    }
+                    Err(e) => warn!("Bad --rhx header '{}': {}", h, e),
+                }
+            }
+
+            if let Some(u) = &args.resp_url {
+                builder = builder.header("X-Resp-Source", u);
+            }
+
+            let body = file_bytes.unwrap_or_default();
+            let http_resp = builder.body(body).expect("failed to build HTTP response");
+
+            icap_req = icap_req.with_http_response(http_resp);
+        }
     } else {
         debug!("Sending OPTIONS request");
     }
 
     info!("Sending {} to {}", icap_method, args.uri);
 
-    // Печать сформированного запроса (без отправки)
+    // Печать сырого ICAP-запроса (без отправки)
     if args.print_request {
-        return match client.get_request(&req_parts) {
-            Ok(bytes) => {
-                // ВНИМАНИЕ: это может содержать бинарные данные тела — печать «как есть» только для отладки
-                println!("{}", String::from_utf8_lossy(&bytes));
-                Ok(())
-            }
-            Err(e) => {
-                error!("Failed to generate request: {}", e);
-                Err(e)
-            }
-        };
+        let bytes = client.get_request(&icap_req)?;
+        println!("{}", String::from_utf8_lossy(&bytes));
+        return Ok(());
     }
 
     // Отправка
-    match client.send(&req_parts).await {
+    match client.send(&icap_req).await {
         Ok(response) => {
             println!("ICAP/1.0 {} {}", response.status_code, response.status_text);
             if args.verbose {
@@ -253,6 +276,7 @@ async fn main() -> IcapResult<()> {
                 file.write_all(&response.body).await?;
                 info!("Response body written to file: {}", output_file);
             } else {
+                // тело может быть бинарным — для отладки печатаем как lossy utf8
                 print!("{}", String::from_utf8_lossy(&response.body));
             }
 
@@ -281,4 +305,16 @@ fn host_from_url(url: &str) -> Option<&str> {
         return rest.split('/').next();
     }
     None
+}
+
+fn parse_header_line(line: &str) -> Result<(String, String), &'static str> {
+    if let Some((k, v)) = line.split_once(':') {
+        let key = k.trim();
+        let val = v.trim();
+        if key.is_empty() || val.is_empty() {
+            return Err("empty name or value");
+        }
+        return Ok((key.to_string(), val.to_string()));
+    }
+    Err("no ':' separator")
 }
