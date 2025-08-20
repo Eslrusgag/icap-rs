@@ -1,223 +1,213 @@
 use crate::error::IcapResult;
-use crate::http::{HttpMessage, HttpMessageTrait};
-use crate::request::Request;
-use crate::response::Response;
-use std::collections::HashMap;
+use crate::request::{EmbeddedHttp, Request};
+use crate::response::{Response, StatusCode};
+use std::borrow::Cow;
+
+use http::{
+    HeaderMap, HeaderName, HeaderValue, Request as HttpRequest, Response as HttpResponse,
+    StatusCode as HttpStatus, Version,
+};
+use std::fmt::Write;
 use std::str::FromStr;
+use tracing::{debug, trace};
 
-/// Разделяет строку заголовка на имя и значение
 #[inline]
-pub fn split_header(line: &str) -> Option<(String, String)> {
-    line.find(':').map(|pos| {
-        (
-            line[..pos].trim().to_string(),
-            line[pos + 1..].trim().to_string(),
-        )
-    })
+fn find_double_crlf(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4)
 }
 
-/// Проверяет, является ли строка началом HTTP сообщения
 #[inline]
-pub fn is_http_start_line(line: &str) -> bool {
-    line.starts_with("HTTP/")
-        || line.starts_with("GET ")
-        || line.starts_with("POST ")
-        || line.starts_with("PUT ")
-        || line.starts_with("DELETE ")
-        || line.starts_with("HEAD ")
-        || line.starts_with("OPTIONS ")
-        || line.starts_with("PATCH ")
+pub fn is_complete_icap_request(buffer: &[u8]) -> bool {
+    find_double_crlf(buffer).is_some()
 }
 
-/// Парсит ICAP запрос из сырых байтов
+#[inline]
+pub fn is_complete_icap_response(buffer: &[u8]) -> bool {
+    find_double_crlf(buffer).is_some()
+}
+
+pub fn extract_service_name(uri: &str) -> IcapResult<String> {
+    let s = uri
+        .rsplit('/')
+        .next()
+        .ok_or("Invalid ICAP URI (no /service)")?;
+    if s.is_empty() {
+        Err("Empty service name".into())
+    } else {
+        Ok(s.to_string())
+    }
+}
+
+pub(crate) fn http_version_str(v: Version) -> &'static str {
+    match v {
+        Version::HTTP_09 => "HTTP/0.9",
+        Version::HTTP_10 => "HTTP/1.0",
+        Version::HTTP_11 => "HTTP/1.1",
+        Version::HTTP_2 => "HTTP/2.0",
+        Version::HTTP_3 => "HTTP/3.0",
+        _ => "HTTP/1.1",
+    }
+}
+
 pub fn parse_icap_request(data: &[u8]) -> IcapResult<Request> {
-    let text = String::from_utf8_lossy(data);
-    let mut lines = text.lines();
+    trace!("parse_icap_request: len={}", data.len());
+    let hdr_end = find_double_crlf(data).ok_or("ICAP request headers not complete")?;
+    let head = &data[..hdr_end];
+    let head_str = std::str::from_utf8(head)?;
 
-    // Разбор первой строки
+    // Request line: METHOD <icap-uri> ICAP/1.0
+    let mut lines = head_str.split("\r\n");
     let request_line = lines.next().ok_or("Empty request")?;
     let mut parts = request_line.split_whitespace();
     let method = parts.next().ok_or("Invalid request line")?.to_string();
-    let uri = parts.next().ok_or("Invalid request line")?.to_string();
-    let version = parts.next().ok_or("Invalid request line")?.to_string();
+    let icap_uri = parts.next().ok_or("Invalid request line")?.to_string();
+    let _version = parts.next().ok_or("Invalid request line")?.to_string();
+    debug!("parse_icap_request: {} {}", method, icap_uri);
 
-    let mut request = Request::new(&method, &uri, &version);
-
-    // Временные структуры для HTTP сообщений
-    let mut current_http: Option<HttpMessage> = None;
-    let mut in_icap_headers = true;
-
+    // ICAP headers
+    let mut icap_headers = HeaderMap::new();
     for line in lines {
-        let line = line.trim();
-
         if line.is_empty() {
-            if in_icap_headers {
-                in_icap_headers = false;
-                continue;
-            } else if let Some(msg) = current_http.take() {
-                // Заканчиваем HTTP сообщение
-                if method == "REQMOD" {
-                    request.http_request = Some(msg);
-                } else if method == "RESPMOD" {
-                    request.http_response = Some(msg);
+            break;
+        }
+        if let Some(colon) = line.find(':') {
+            let name = &line[..colon];
+            let value = line[colon + 1..].trim();
+            icap_headers.insert(
+                HeaderName::from_bytes(name.as_bytes())?,
+                HeaderValue::from_str(value)?,
+            );
+        }
+    }
+
+    let service = icap_uri.rsplit('/').next().unwrap_or("").to_string();
+
+    let allow_204 = icap_headers
+        .get("Allow")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.split(',').any(|p| p.trim() == "204"))
+        .unwrap_or(false);
+
+    let allow_206 = icap_headers
+        .get("Allow")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.split(',').any(|p| p.trim() == "206"))
+        .unwrap_or(false);
+
+    let preview_size = icap_headers
+        .get("Preview")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<usize>().ok());
+
+    let rest = &data[hdr_end..];
+    let embedded = if rest.is_empty() {
+        None
+    } else if let Some(http_hdr_end) = find_double_crlf(rest) {
+        let http_head = &rest[..http_hdr_end];
+        let http_head_str = std::str::from_utf8(http_head)?;
+        let mut hlines = http_head_str.split("\r\n");
+        let start = hlines.next().unwrap_or_default();
+
+        if start.starts_with("HTTP/") {
+            // HTTP Response
+            let mut p = start.split_whitespace();
+            let _ver = p.next().unwrap_or("HTTP/1.1");
+            let code = p.next().unwrap_or("200").parse::<u16>().unwrap_or(200);
+            debug!("parse_icap_request: embedded HTTP response code={}", code);
+
+            let mut http_headers = HeaderMap::new();
+            for line in hlines {
+                if line.is_empty() {
+                    break;
                 }
-                continue;
+                if let Some(colon) = line.find(':') {
+                    let name = &line[..colon];
+                    let value = line[colon + 1..].trim();
+                    http_headers.insert(
+                        HeaderName::from_bytes(name.as_bytes())?,
+                        HeaderValue::from_str(value)?,
+                    );
+                }
             }
-        }
-
-        if in_icap_headers {
-            if is_http_start_line(line) {
-                // Начало HTTP сообщения
-                current_http = Some(HttpMessage {
-                    start_line: line.to_string(),
-                    headers: HashMap::new(),
-                    body: Vec::new(),
-                });
-                in_icap_headers = false;
-            } else if let Some((name, value)) = split_header(line) {
-                request.headers.insert(name, value);
+            let body = rest[http_hdr_end..].to_vec();
+            let mut builder = HttpResponse::builder()
+                .status(HttpStatus::from_u16(code).unwrap_or(HttpStatus::OK))
+                .version(Version::HTTP_11);
+            {
+                let headers_mut = builder
+                    .headers_mut()
+                    .ok_or("response builder: headers_mut is None")?;
+                headers_mut.extend(http_headers);
             }
-        } else if let Some(http_msg) = current_http.as_mut() {
-            if let Some((name, value)) = split_header(line) {
-                http_msg.headers.insert(name, value);
-            } else {
-                http_msg.body.extend_from_slice(line.as_bytes());
-                http_msg.body.extend_from_slice(b"\r\n");
+            let resp = builder
+                .body(body)
+                .map_err(|e| format!("build http::Response: {e}"))?;
+            Some(EmbeddedHttp::Resp(resp))
+        } else {
+            // HTTP Request
+            let mut p = start.split_whitespace();
+            let m = p.next().unwrap_or("GET");
+            let u = p.next().unwrap_or("/");
+            debug!("parse_icap_request: embedded HTTP request {} {}", m, u);
+
+            let mut http_headers = HeaderMap::new();
+            for line in hlines {
+                if line.is_empty() {
+                    break;
+                }
+                if let Some(colon) = line.find(':') {
+                    let name = &line[..colon];
+                    let value = line[colon + 1..].trim();
+                    http_headers.insert(
+                        HeaderName::from_bytes(name.as_bytes())?,
+                        HeaderValue::from_str(value)?,
+                    );
+                }
             }
-        }
-    }
-
-    if let Some(msg) = current_http {
-        if method == "REQMOD" {
-            request.http_request = Some(msg);
-        } else if method == "RESPMOD" {
-            request.http_response = Some(msg);
-        }
-    }
-
-    Ok(request)
-}
-
-/// Сериализует ICAP запрос в байты
-pub fn serialize_icap_request(request: &Request) -> Vec<u8> {
-    let mut raw = Vec::new();
-
-    // Request line
-    raw.extend_from_slice(
-        format!("{} {} {}\r\n", request.method, request.uri, request.version).as_bytes(),
-    );
-
-    // Headers
-    for (name, value) in &request.headers {
-        raw.extend_from_slice(format!("{}: {}\r\n", name, value).as_bytes());
-    }
-
-    // Empty line
-    raw.extend_from_slice(b"\r\n");
-
-    // HTTP message if present
-    if let Some(ref http_req) = request.http_request {
-        raw.extend_from_slice(&http_req.to_raw());
-    }
-
-    if let Some(ref http_resp) = request.http_response {
-        raw.extend_from_slice(&http_resp.to_raw());
-    }
-
-    raw
-}
-
-/// Сериализует ICAP ответ в байты
-pub fn serialize_icap_response(response: &Response) -> IcapResult<Vec<u8>> {
-    let mut result = Vec::new();
-
-    // Status line
-    let status_line = format!(
-        "{} {} {}\r\n",
-        response.version, response.status_code, response.status_text
-    );
-    result.extend_from_slice(status_line.as_bytes());
-
-    // Headers
-    for (name, value) in &response.headers {
-        let header_line = format!("{}: {}\r\n", name, value);
-        result.extend_from_slice(header_line.as_bytes());
-    }
-
-    // Empty line
-    result.extend_from_slice(b"\r\n");
-
-    // Body
-    if !response.body.is_empty() {
-        result.extend_from_slice(&response.body);
-    }
-
-    Ok(result)
-}
-
-/// Проверяет, является ли ICAP запрос полным
-pub fn is_complete_icap_request(buffer: &[u8]) -> bool {
-    let content = String::from_utf8_lossy(buffer);
-    let lines: Vec<&str> = content.lines().collect();
-
-    // Ищем двойной перенос строки, который разделяет заголовки и тело
-    let mut empty_line_count = 0;
-    let line_count = lines.len();
-
-    for line in &lines {
-        if line.trim().is_empty() {
-            empty_line_count += 1;
-            if empty_line_count >= 2 {
-                return true;
+            let body = rest[http_hdr_end..].to_vec();
+            let mut builder = HttpRequest::builder()
+                .method(m)
+                .uri(u)
+                .version(Version::HTTP_11);
+            {
+                let headers_mut = builder
+                    .headers_mut()
+                    .ok_or("request builder: headers_mut is None")?;
+                headers_mut.extend(http_headers);
             }
+            let req = builder
+                .body(body)
+                .map_err(|e| format!("build http::Request: {e}"))?;
+            Some(EmbeddedHttp::Req(req))
         }
-    }
-
-    // Если нет двойного переноса, проверяем, есть ли хотя бы заголовки
-    line_count >= 2
-}
-
-/// Проверяет, является ли ICAP ответ полным
-pub fn is_complete_icap_response(buffer: &[u8]) -> bool {
-    let content = String::from_utf8_lossy(buffer);
-    let lines: Vec<&str> = content.lines().collect();
-
-    // Look for double newline that separates headers and body
-    let mut empty_line_count = 0;
-
-    for line in &lines {
-        if line.trim().is_empty() {
-            empty_line_count += 1;
-            if empty_line_count >= 2 {
-                return true;
-            }
-        }
-    }
-
-    // If no double newline, check if we have at least headers
-    lines.len() >= 2
-}
-
-/// Извлекает имя сервиса из URI
-pub fn extract_service_name(uri: &str) -> IcapResult<String> {
-    // URI формат: icap://host:port/service
-    if let Some(service_start) = uri.rfind('/') {
-        Ok(uri[service_start + 1..].to_string())
     } else {
-        Err("Invalid ICAP URI format".into())
-    }
+        None
+    };
+
+    Ok(Request {
+        method,
+        service,
+        icap_headers,
+        embedded,
+        preview_size,
+        allow_204,
+        allow_206,
+        preview_ieof: false,
+    })
 }
 
-/// Парсит ICAP ответ из сырых байтов
 pub fn parse_icap_response(raw: &[u8]) -> IcapResult<Response> {
+    trace!("parse_icap_response: len={}", raw.len());
     if raw.is_empty() {
         return Err("Empty response".into());
     }
 
-    let content = String::from_utf8_lossy(raw);
-    let mut lines = content.lines();
+    let hdr_end = find_double_crlf(raw).ok_or("ICAP response headers not complete")?;
+    let head = &raw[..hdr_end];
+    let head_str = std::str::from_utf8(head)?;
+    let mut lines = head_str.split("\r\n");
 
-    // Parse status line
+    // Статусная строка
     let status_line = lines.next().ok_or("Empty response")?;
     let parts: Vec<&str> = status_line.split_whitespace().collect();
     if parts.len() < 3 {
@@ -225,58 +215,49 @@ pub fn parse_icap_response(raw: &[u8]) -> IcapResult<Response> {
     }
 
     let version = parts[0].to_string();
-    let status_code = match crate::response::StatusCode::from_str(parts[1]) {
+    let status_code = match StatusCode::from_str(parts[1]) {
         Ok(code) => code,
         Err(_) => {
-            // Try to parse as unknown status code
-            if let Ok(code_num) = parts[1].parse::<u16>() {
-                // Create a custom status code for unknown values
-                match code_num {
-                    100 => crate::response::StatusCode::Continue100,
-                    200 => crate::response::StatusCode::Ok200,
-                    204 => crate::response::StatusCode::NoContent204,
-                    400 => crate::response::StatusCode::BadRequest400,
-                    404 => crate::response::StatusCode::NotFound404,
-                    405 => crate::response::StatusCode::MethodNotAllowed405,
-                    413 => crate::response::StatusCode::RequestEntityTooLarge413,
-                    500 => crate::response::StatusCode::InternalServerError500,
-                    503 => crate::response::StatusCode::ServiceUnavailable503,
-                    504 => crate::response::StatusCode::GatewayTimeout504,
-                    _ => return Err(format!("Unknown ICAP status code: {}", code_num).into()),
-                }
-            } else {
-                return Err("Invalid status code format".into());
+            let code_num = parts[1].parse::<u16>().map_err(|_| "Invalid status code")?;
+            match code_num {
+                100 => StatusCode::Continue100,
+                200 => StatusCode::Ok200,
+                204 => StatusCode::NoContent204,
+                400 => StatusCode::BadRequest400,
+                404 => StatusCode::NotFound404,
+                405 => StatusCode::MethodNotAllowed405,
+                413 => StatusCode::RequestEntityTooLarge413,
+                500 => StatusCode::InternalServerError500,
+                503 => StatusCode::ServiceUnavailable503,
+                504 => StatusCode::GatewayTimeout504,
+                _ => return Err(format!("Unknown ICAP status code: {}", code_num).into()),
             }
         }
     };
     let status_text = parts[2..].join(" ");
+    debug!(
+        "parse_icap_response: {} {} {}",
+        version, status_code, status_text
+    );
 
-    let mut headers = HashMap::new();
-    let mut body_start = 0;
-
-    // Parse headers
-    for (line_num, line) in lines.enumerate() {
+    let mut headers = HeaderMap::new();
+    for line in lines {
         if line.is_empty() {
-            body_start = line_num + 1;
             break;
         }
-
-        if let Some(colon_pos) = line.find(':') {
-            let name = line[..colon_pos].trim();
-            let value = line[colon_pos + 1..].trim();
-            if !name.is_empty() {
-                headers.insert(name.to_string(), value.to_string());
-            }
+        if let Some(colon) = line.find(':') {
+            let name = &line[..colon];
+            let value = line[colon + 1..].trim();
+            headers.insert(
+                HeaderName::from_bytes(name.as_bytes())?,
+                HeaderValue::from_str(value)?,
+            );
         }
     }
 
-    // Extract body
-    let body = if body_start > 0 {
-        let body_lines: Vec<&str> = content.lines().skip(body_start).collect();
-        body_lines.join("\n").into_bytes()
-    } else {
-        Vec::new()
-    };
+    // Тело (всё после CRLFCRLF)
+    let body = raw[hdr_end..].to_vec();
+    trace!("parse_icap_response: body_len={}", body.len());
 
     Ok(Response {
         version,
@@ -285,4 +266,200 @@ pub fn parse_icap_response(raw: &[u8]) -> IcapResult<Response> {
         headers,
         body,
     })
+}
+
+pub fn serialize_icap_request(req: &Request) -> IcapResult<Vec<u8>> {
+    let full_uri = format!("icap://localhost/{}", req.service.trim_start_matches('/'));
+
+    let mut out = String::new();
+    write!(&mut out, "{} {} ICAP/1.0\r\n", req.method, full_uri).unwrap();
+
+    for (name, value) in req.icap_headers.iter() {
+        let canon = canonical_icap_header(name.as_str());
+        write!(
+            &mut out,
+            "{}: {}\r\n",
+            canon,
+            value.to_str().unwrap_or_default()
+        )
+        .unwrap();
+    }
+    out.push_str("\r\n");
+
+    let mut bytes = out.into_bytes();
+    if let Some(ref emb) = req.embedded {
+        match emb {
+            EmbeddedHttp::Req(r) => bytes.extend_from_slice(&serialize_http_request(r)),
+            EmbeddedHttp::Resp(r) => bytes.extend_from_slice(&serialize_http_response(r)),
+        }
+    }
+    Ok(bytes)
+}
+
+pub fn serialize_icap_response(resp: &Response) -> IcapResult<Vec<u8>> {
+    use std::fmt::Write as _;
+
+    // Status line
+    let mut head = String::new();
+    write!(
+        &mut head,
+        "{} {} {}\r\n",
+        resp.version, resp.status_code, resp.status_text
+    )
+    .unwrap();
+
+    // Canonicalize header names on output
+    for (name, value) in resp.headers.iter() {
+        let canon = canonical_icap_header(name.as_str());
+        write!(
+            &mut head,
+            "{}: {}\r\n",
+            canon,
+            value.to_str().unwrap_or_default()
+        )
+        .unwrap();
+    }
+    head.push_str("\r\n");
+
+    let mut out = head.into_bytes();
+
+    if resp.body.is_empty() {
+        return Ok(out);
+    }
+
+    let encapsulated = resp
+        .headers
+        .get("Encapsulated")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_default();
+
+    let is_http_embedded = encapsulated.contains("req-hdr=") || encapsulated.contains("res-hdr=");
+
+    if is_http_embedded {
+        if let Some(pos) = resp.body.windows(4).position(|w| w == b"\r\n\r\n") {
+            let http_hdr_end = pos + 4;
+
+            // 1) raw HTTP headers
+            out.extend_from_slice(&resp.body[..http_hdr_end]);
+
+            // 2) HTTP body → ICAP chunked
+            let http_body = &resp.body[http_hdr_end..];
+            if !http_body.is_empty() {
+                let size_line = format!("{:X}\r\n", http_body.len());
+                out.extend_from_slice(size_line.as_bytes());
+                out.extend_from_slice(http_body);
+                out.extend_from_slice(b"\r\n0\r\n\r\n");
+            } else {
+                out.extend_from_slice(b"0\r\n\r\n");
+            }
+            return Ok(out);
+        }
+    }
+
+    out.extend_from_slice(&resp.body);
+    Ok(out)
+}
+
+fn serialize_http_request(req: &HttpRequest<Vec<u8>>) -> Vec<u8> {
+    let mut out = String::new();
+    write!(
+        &mut out,
+        "{} {} {}\r\n",
+        req.method(),
+        req.uri(),
+        http_version_str(req.version())
+    )
+    .unwrap();
+
+    for (n, v) in req.headers().iter() {
+        write!(
+            &mut out,
+            "{}: {}\r\n",
+            n.as_str(),
+            v.to_str().unwrap_or_default()
+        )
+        .unwrap();
+    }
+    out.push_str("\r\n");
+
+    let mut bytes = out.into_bytes();
+    bytes.extend_from_slice(req.body());
+    bytes
+}
+
+fn serialize_http_response(resp: &HttpResponse<Vec<u8>>) -> Vec<u8> {
+    let mut out = String::new();
+    let code: HttpStatus = resp.status();
+    write!(
+        &mut out,
+        "{} {} {}\r\n",
+        http_version_str(resp.version()),
+        code.as_u16(),
+        code.canonical_reason().unwrap_or("")
+    )
+    .unwrap();
+
+    for (n, v) in resp.headers().iter() {
+        write!(
+            &mut out,
+            "{}: {}\r\n",
+            n.as_str(),
+            v.to_str().unwrap_or_default()
+        )
+        .unwrap();
+    }
+    out.push_str("\r\n");
+
+    let mut bytes = out.into_bytes();
+    bytes.extend_from_slice(resp.body());
+    bytes
+}
+
+/// Return canonical ICAP header name (title-cased, with special-cases).
+/// Input should be lowercased (http::HeaderName::as_str() already is).
+fn canonical_icap_header(name: &str) -> Cow<str> {
+    match name {
+        // ICAP core / common headers
+        "methods" => Cow::Borrowed("Methods"),
+        "istag" => Cow::Borrowed("ISTag"),
+        "encapsulated" => Cow::Borrowed("Encapsulated"),
+        "service" => Cow::Borrowed("Service"),
+        "max-connections" => Cow::Borrowed("Max-Connections"),
+        "options-ttl" => Cow::Borrowed("Options-TTL"),
+        "preview" => Cow::Borrowed("Preview"),
+        "allow" => Cow::Borrowed("Allow"),
+        "service-id" => Cow::Borrowed("Service-ID"),
+        "opt-body-type" => Cow::Borrowed("Opt-body-type"),
+        // Transfer-* group used by some servers
+        "transfer-preview" => Cow::Borrowed("Transfer-Preview"),
+        "transfer-ignore" => Cow::Borrowed("Transfer-Ignore"),
+        "transfer-complete" => Cow::Borrowed("Transfer-Complete"),
+        // Generic/HTTP-ish ones that we might include too
+        "date" => Cow::Borrowed("Date"),
+        "server" => Cow::Borrowed("Server"),
+        "connection" => Cow::Borrowed("Connection"),
+        "content-length" => Cow::Borrowed("Content-Length"),
+        "content-type" => Cow::Borrowed("Content-Type"),
+        "cache-control" => Cow::Borrowed("Cache-Control"),
+        "pragma" => Cow::Borrowed("Pragma"),
+        "expires" => Cow::Borrowed("Expires"),
+        // Fallback: Title-Case each hyphen-separated token.
+        _ => {
+            let mut out = String::with_capacity(name.len());
+            for (i, seg) in name.split('-').enumerate() {
+                if i > 0 {
+                    out.push('-');
+                }
+                let mut chars = seg.chars();
+                if let Some(c0) = chars.next() {
+                    out.extend(c0.to_uppercase());
+                    for c in chars {
+                        out.extend(c.to_lowercase());
+                    }
+                }
+            }
+            Cow::Owned(out)
+        }
+    }
 }

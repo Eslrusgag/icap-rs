@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "icap-rs",
-    "rs-icap-client"
+    "rs-icap-client",
+    "rs-icap-server"
 ]
 resolver = "3"
