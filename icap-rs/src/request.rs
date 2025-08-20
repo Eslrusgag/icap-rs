@@ -1,158 +1,138 @@
-use crate::http::HttpMessage;
-use std::collections::HashMap;
-use std::fmt;
+//! ICAP request types and helpers.
+//!
+//! This module defines:
+//! - [`EmbeddedHttp`]: an enum for embedded HTTP messages (request/response).
+//! - [`Request`]: the single, public ICAP request type used by the client.
+//!
+//! The [`Request`] type is used by `icap_rs::Client` to build and send ICAP
+//! messages (`OPTIONS`, `REQMOD`, `RESPMOD`), including Preview negotiation
+//! and optional fast-204 (`ieof`) hints. Attach embedded HTTP via
+//! [`Request::with_http_request`] / [`Request::with_http_response`].
+//!
+//! # Example (REQMOD with embedded HTTP request)
+//! ```rust
+//! use http::Request as HttpRequest;
+//! use icap_rs::Request; // re-exported from icap_rs::request
+//!
+//! let http_req = HttpRequest::builder()
+//!     .method("GET")
+//!     .uri("http://example.com/")
+//!     .header("Host", "example.com")
+//!     .body(Vec::new())
+//!     .unwrap();
+//!
+//! let icap_req = Request::reqmod("icap/full")
+//!     .allow_204(true)
+//!     .preview(4)
+//!     .with_http_request(http_req);
+//!
+//! assert!(icap_req.method.eq_ignore_ascii_case("REQMOD"));
+//! assert!(icap_req.allow_204);
+//! assert_eq!(icap_req.preview_size, Some(4));
+//! ```
 
-/// Структура ICAP запроса
+use http::{HeaderMap, HeaderName, HeaderValue, Request as HttpRequest, Response as HttpResponse};
+
+/// Embedded HTTP message inside an ICAP request.
+#[derive(Debug, Clone)]
+pub enum EmbeddedHttp {
+    /// Embedded HTTP request (typical for `REQMOD`).
+    Req(HttpRequest<Vec<u8>>),
+    /// Embedded HTTP response (typical for `RESPMOD`).
+    Resp(HttpResponse<Vec<u8>>),
+}
+
+/// Single public ICAP request type used by the client.
+///
+/// This structure carries ICAP method/service and flags that influence how
+/// the request is serialized on the wire (Preview, Allow: 204/206, ieof).
 #[derive(Debug, Clone)]
 pub struct Request {
+    /// ICAP method: `"OPTIONS" | "REQMOD" | "RESPMOD"`.
     pub method: String,
-    pub uri: String,
-    pub version: String,
-    pub headers: HashMap<String, String>,
-    pub http_request: Option<HttpMessage>,
-    pub http_response: Option<HttpMessage>,
+    /// Service path like `"icap/full"` or `"respmod"`. Leading slash is allowed.
+    pub service: String,
+    /// ICAP headers (case-insensitive).
+    pub icap_headers: HeaderMap,
+    /// Optional embedded HTTP message (request/response).
+    pub embedded: Option<EmbeddedHttp>,
+    /// `Preview: n` (if set).
+    pub preview_size: Option<usize>,
+    /// Whether `Allow: 204` should be advertised.
+    pub allow_204: bool,
+    /// Whether `Allow: 206` should be advertised.
+    pub allow_206: bool,
+    /// If `true` and `preview_size == Some(0)`, send `0; ieof` (fast 204 hint).
+    pub preview_ieof: bool,
 }
 
 impl Request {
-    /// Создает новый ICAP запрос
-    pub fn new(method: &str, uri: &str, version: &str) -> Self {
+    /// Create a new ICAP request.
+    pub fn new(method: &str, service: &str) -> Self {
         Self {
             method: method.to_string(),
-            uri: uri.to_string(),
-            version: version.to_string(),
-            headers: HashMap::new(),
-            http_request: None,
-            http_response: None,
+            service: service.to_string(),
+            icap_headers: HeaderMap::new(),
+            embedded: None,
+            preview_size: None,
+            allow_204: false,
+            allow_206: false,
+            preview_ieof: false,
         }
     }
 
-    /// Добавляет заголовок
-    pub fn add_header(mut self, name: &str, value: &str) -> Self {
-        self.headers.insert(name.to_string(), value.to_string());
+    /// Convenience constructors.
+    pub fn options(service: &str) -> Self {
+        Self::new("OPTIONS", service)
+    }
+    pub fn reqmod(service: &str) -> Self {
+        Self::new("REQMOD", service)
+    }
+    pub fn respmod(service: &str) -> Self {
+        Self::new("RESPMOD", service)
+    }
+
+    /// Set/override an ICAP header.
+    pub fn icap_header(mut self, name: &str, value: &str) -> Self {
+        let n: HeaderName = name.parse().expect("invalid ICAP header name");
+        let v: HeaderValue = HeaderValue::from_str(value).expect("invalid ICAP header value");
+        self.icap_headers.insert(n, v);
         self
     }
 
-    /// Устанавливает HTTP запрос
-    pub fn with_http_request(mut self, http_req: HttpMessage) -> Self {
-        self.http_request = Some(http_req);
+    /// Preview controls.
+    pub fn preview(mut self, n: usize) -> Self {
+        self.preview_size = Some(n);
+        self
+    }
+    pub fn preview_ieof(mut self, yes: bool) -> Self {
+        self.preview_ieof = yes;
         self
     }
 
-    /// Устанавливает HTTP ответ
-    pub fn with_http_response(mut self, http_resp: HttpMessage) -> Self {
-        self.http_response = Some(http_resp);
+    /// Advertise Allow: 204/206.
+    pub fn allow_204(mut self, yes: bool) -> Self {
+        self.allow_204 = yes;
+        self
+    }
+    pub fn allow_206(mut self, yes: bool) -> Self {
+        self.allow_206 = yes;
         self
     }
 
-    /// Получает значение заголовка
-    pub fn get_header(&self, name: &str) -> Option<&String> {
-        self.headers.get(name)
+    /// True for REQMOD/RESPMOD.
+    #[inline]
+    pub fn is_mod(&self) -> bool {
+        self.method.eq_ignore_ascii_case("REQMOD") || self.method.eq_ignore_ascii_case("RESPMOD")
     }
 
-    /// Проверяет наличие заголовка
-    pub fn has_header(&self, name: &str) -> bool {
-        self.headers.contains_key(name)
+    /// Attach embedded HTTP.
+    pub fn with_http_request(mut self, req: HttpRequest<Vec<u8>>) -> Self {
+        self.embedded = Some(EmbeddedHttp::Req(req));
+        self
     }
-
-    /// Удаляет заголовок
-    pub fn remove_header(&mut self, name: &str) -> Option<String> {
-        self.headers.remove(name)
-    }
-
-    /// Проверяет, является ли запрос REQMOD
-    pub fn is_reqmod(&self) -> bool {
-        self.method == "REQMOD"
-    }
-
-    /// Проверяет, является ли запрос RESPMOD
-    pub fn is_respmod(&self) -> bool {
-        self.method == "RESPMOD"
-    }
-
-    /// Проверяет, является ли запрос OPTIONS
-    pub fn is_options(&self) -> bool {
-        self.method == "OPTIONS"
-    }
-
-    /// Извлекает имя сервиса из URI
-    pub fn service_name(&self) -> Option<String> {
-        self.uri
-            .strip_prefix("icap://")
-            .and_then(|uri| uri.split('/').next())
-            .map(|s| s.to_string())
-    }
-
-    /// Проверяет, разрешен ли ответ 204 No Content
-    ///
-    /// Согласно RFC 3507, клиент может включить заголовок "Allow: 204" в запрос,
-    /// указывая, что сервер может ответить с "204 No Content", если объект не нуждается в модификации.
-    pub fn allows_204(&self) -> bool {
-        if let Some(allow_header) = self.get_header("Allow") {
-            allow_header.contains("204")
-        } else {
-            false
-        }
-    }
-
-    /// Проверяет, является ли это предварительным просмотром (preview)
-    ///
-    /// В случае предварительного просмотра сервер может ответить 204 No Content
-    /// даже если заголовок "Allow: 204" отсутствует.
-    pub fn is_preview(&self) -> bool {
-        self.has_header("Preview")
-    }
-
-    /// Проверяет, можно ли вернуть ответ 204 No Content
-    ///
-    /// Возвращает true если:
-    /// 1. Запрос содержит заголовок "Allow: 204", или
-    /// 2. Это предварительный просмотр (preview)
-    pub fn can_return_204(&self) -> bool {
-        self.allows_204() || self.is_preview()
-    }
-}
-
-impl Default for Request {
-    fn default() -> Self {
-        Self {
-            method: "OPTIONS".to_string(),
-            uri: "icap://localhost/".to_string(),
-            version: "ICAP/1.0".to_string(),
-            headers: HashMap::new(),
-            http_request: None,
-            http_response: None,
-        }
-    }
-}
-
-impl fmt::Display for Request {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} {} {}", self.method, self.uri, self.version)?;
-
-        for (name, value) in &self.headers {
-            write!(f, "\n{}: {}", name, value)?;
-        }
-
-        if let Some(ref http_req) = self.http_request {
-            write!(f, "\n\nHTTP Request:\n{}", http_req.start_line)?;
-            for (name, value) in &http_req.headers {
-                write!(f, "\n{}: {}", name, value)?;
-            }
-            if !http_req.body.is_empty() {
-                write!(f, "\n\n{}", String::from_utf8_lossy(&http_req.body))?;
-            }
-        }
-
-        if let Some(ref http_resp) = self.http_response {
-            write!(f, "\n\nHTTP Response:\n{}", http_resp.start_line)?;
-            for (name, value) in &http_resp.headers {
-                write!(f, "\n{}: {}", name, value)?;
-            }
-            if !http_resp.body.is_empty() {
-                write!(f, "\n\n{}", String::from_utf8_lossy(&http_resp.body))?;
-            }
-        }
-
-        Ok(())
+    pub fn with_http_response(mut self, resp: HttpResponse<Vec<u8>>) -> Self {
+        self.embedded = Some(EmbeddedHttp::Resp(resp));
+        self
     }
 }

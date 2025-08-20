@@ -1,117 +1,130 @@
+//! Error handling for the ICAP library.
+//!
+//! This module defines:
+//! - [`IcapError`]: the main error type for ICAP operations.
+//! - [`IcapResult<T>`]: a convenient alias for `Result<T, IcapError>`.
+//! - [`ToIcapResult`]: a helper trait for converting generic `Result` into `IcapResult`.
+//!
+//! It covers network errors, parsing/serialization, configuration issues, and unexpected failures.
+use http::header::{InvalidHeaderName, InvalidHeaderValue};
 use std::error::{Error as StdError, Error};
+use std::str::Utf8Error;
 use thiserror::Error;
 
-/// Основной тип ошибки для ICAP библиотеки
+/// Main error type for the ICAP library.
+///
+/// It covers network issues, parsing/serialization errors, invalid protocol fields,
+/// configuration/service/handler failures, and unexpected runtime errors.
 #[derive(Error, Debug)]
 pub enum IcapError {
-    /// Ошибка сети (TCP соединение, таймаут и т.д.)
+    /// Network-level error (TCP connection, timeout, etc.).
     #[error("Network error: {0}")]
     Network(#[from] std::io::Error),
 
-    /// Ошибка парсинга ICAP сообщения
+    /// Failed to parse an ICAP message.
     #[error("ICAP parsing error: {0}")]
     Parse(String),
 
-    /// Ошибка HTTP парсинга
+    /// Failed to parse an embedded HTTP message.
     #[error("HTTP parsing error: {0}")]
     HttpParse(String),
 
-    /// Неверный статус код
+    /// Invalid ICAP status code.
     #[error("Invalid status code: {0}")]
     InvalidStatusCode(String),
 
-    /// Неверный метод
+    /// Invalid ICAP method.
     #[error("Invalid method: {0}")]
     InvalidMethod(String),
 
-    /// Неверный URI
+    /// Invalid ICAP URI.
     #[error("Invalid URI: {0}")]
     InvalidUri(String),
 
-    /// Неверная версия протокола
+    /// Invalid ICAP protocol version.
     #[error("Invalid protocol version: {0}")]
     InvalidVersion(String),
 
-    /// Ошибка заголовка
+    /// Invalid or malformed header.
     #[error("Header error: {0}")]
     Header(String),
 
-    /// Ошибка тела сообщения
+    /// Error while handling the message body.
     #[error("Body error: {0}")]
     Body(String),
 
-    /// Ошибка сервиса
+    /// Service-related error.
     #[error("Service error: {0}")]
     Service(String),
 
-    /// Ошибка конфигурации
+    /// Configuration error.
     #[error("Configuration error: {0}")]
     Configuration(String),
 
-    /// Ошибка обработчика
+    /// Application handler error.
     #[error("Handler error: {0}")]
     Handler(String),
 
-    /// Ошибка сериализации
+    /// Serialization error.
     #[error("Serialization error: {0}")]
     Serialization(String),
 
-    /// Ошибка десериализации
+    /// Deserialization error.
     #[error("Deserialization error: {0}")]
     Deserialization(String),
 
-    /// Неизвестная ошибка
+    /// Unexpected/unclassified error.
     #[error("Unexpected error: {0}")]
     Unexpected(String),
 }
 
 impl IcapError {
-    /// Создает ошибку парсинга
+    /// Create a parsing error.
     pub fn parse(message: impl Into<String>) -> Self {
         Self::Parse(message.into())
     }
 
-    /// Создает ошибку HTTP парсинга
+    /// Create an HTTP parsing error.
     pub fn http_parse(message: impl Into<String>) -> Self {
         Self::HttpParse(message.into())
     }
 
-    /// Создает ошибку заголовка
+    /// Create a header error.
     pub fn header(message: impl Into<String>) -> Self {
         Self::Header(message.into())
     }
 
-    /// Создает ошибку тела сообщения
+    /// Create a body error.
     pub fn body(message: impl Into<String>) -> Self {
         Self::Body(message.into())
     }
 
-    /// Создает ошибку сервиса
+    /// Create a service error.
     pub fn service(message: impl Into<String>) -> Self {
         Self::Service(message.into())
     }
 
-    /// Создает ошибку конфигурации
+    /// Create a configuration error.
     pub fn configuration(message: impl Into<String>) -> Self {
         Self::Configuration(message.into())
     }
 
-    /// Создает ошибку обработчика
+    /// Create a handler error.
     pub fn handler(message: impl Into<String>) -> Self {
         Self::Handler(message.into())
     }
 
-    /// Создает ошибку сериализации
+    /// Create a serialization error.
     pub fn serialization(message: impl Into<String>) -> Self {
         Self::Serialization(message.into())
     }
 
-    /// Создает ошибку десериализации
+    /// Create a deserialization error.
     pub fn deserialization(message: impl Into<String>) -> Self {
         Self::Deserialization(message.into())
     }
 
-    /// Создает неизвестную ошибку
+    /// Create an unknown/unexpected error.
     pub fn unknown(message: impl Into<String>) -> Self {
         Self::Unexpected(message.into())
     }
@@ -135,10 +148,12 @@ impl From<Box<dyn Error + Send + Sync>> for IcapError {
     }
 }
 
-/// Результат операций ICAP
+/// Convenient alias for results in the ICAP library.
 pub type IcapResult<T> = Result<T, IcapError>;
 
-/// Конвертирует стандартный Result в IcapResult
+/// Converts a generic `Result<T, E>` into an `IcapResult<T>`.
+///
+/// Any error is wrapped into [`IcapError::Unexpected`].
 pub trait ToIcapResult<T> {
     fn to_icap_result(self) -> IcapResult<T>;
 }
@@ -149,5 +164,21 @@ where
 {
     fn to_icap_result(self) -> IcapResult<T> {
         self.map_err(|e| IcapError::Unexpected(e.to_string()))
+    }
+}
+
+impl From<Utf8Error> for IcapError {
+    fn from(e: Utf8Error) -> Self {
+        IcapError::HttpParse(e.to_string())
+    }
+}
+impl From<InvalidHeaderName> for IcapError {
+    fn from(e: InvalidHeaderName) -> Self {
+        IcapError::HttpParse(e.to_string())
+    }
+}
+impl From<InvalidHeaderValue> for IcapError {
+    fn from(e: InvalidHeaderValue) -> Self {
+        IcapError::HttpParse(e.to_string())
     }
 }

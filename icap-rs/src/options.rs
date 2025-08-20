@@ -1,9 +1,21 @@
+//! ICAP OPTIONS configuration (WIP).
+//!
+//! This module provides types to build an ICAP `OPTIONS` response for a given
+//! service. It includes:
+//! - [`IcapMethod`] — methods supported by a service
+//! - [`TransferBehavior`] — per-extension transfer hints (Preview/Ignore/Complete)
+//! - [`OptionsConfig`] — a builder-like struct that serializes to an ICAP response
+//! - [`IcapOptionsBuilder`] — fluent builder that validates the config
+//!
+//! Status: **work in progress** — covers common headers used by popular ICAP
+//! servers/clients. Extend as needed for your deployment.
+
 use crate::response::{Response, StatusCode};
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use std::fmt;
 
-/// ICAP методы, поддерживаемые сервисом
+/// ICAP methods supported by a service.
 #[derive(Debug, Clone, PartialEq)]
 pub enum IcapMethod {
     ReqMod,
@@ -19,66 +31,52 @@ impl fmt::Display for IcapMethod {
     }
 }
 
-/// Поведение для расширений файлов в Transfer-* заголовках
+/// Transfer behavior for file extensions advertised via `Transfer-*` headers.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TransferBehavior {
-    /// Файлы должны быть отправлены с preview
+    /// Files should be sent with preview.
     Preview,
-    /// Файлы должны быть проигнорированы
+    /// Files should be ignored.
     Ignore,
-    /// Файлы должны быть отправлены полностью без preview
+    /// Files should be sent fully without preview.
     Complete,
 }
 
-/// Конфигурация OPTIONS для ICAP сервиса
+/// Configuration for generating an ICAP `OPTIONS` response.
 #[derive(Debug, Clone)]
 pub struct OptionsConfig {
-    /// Методы, поддерживаемые этим сервисом (ОБЯЗАТЕЛЬНЫЙ)
+    /// Supported ICAP methods (REQUIRED).
     pub methods: Vec<IcapMethod>,
-
-    /// Описание сервиса
+    /// Human-readable service description (optional).
     pub service: Option<String>,
-
-    /// ISTag - уникальный идентификатор конфигурации сервиса (ОБЯЗАТЕЛЬНЫЙ)
+    /// Service tag (REQUIRED). A unique identifier for the service configuration.
     pub istag: String,
-
-    /// Максимальное количество соединений
+    /// Max concurrent connections hint (optional).
     pub max_connections: Option<u32>,
-
-    /// Время жизни OPTIONS ответа в секундах
+    /// TTL (seconds) for caching the OPTIONS response (optional).
     pub options_ttl: Option<u32>,
-
-    /// Дата сервера
+    /// Server date (optional). If set, formatted as HTTP-date (GMT).
     pub date: Option<DateTime<Utc>>,
-
-    /// Короткий идентификатор сервиса
+    /// Short service identifier (optional).
     pub service_id: Option<String>,
-
-    /// Список поддерживаемых возможностей (ОПЦИОНАЛЬНЫЙ)
-    /// Например: "204" для поддержки 204 ответа
+    /// Capabilities advertised in `Allow` (optional), e.g. `"204"`.
     pub allow: Vec<String>,
-
-    /// Размер preview в байтах
+    /// `Preview` size in bytes (optional).
     pub preview: Option<u32>,
-
-    /// Поведение для различных расширений файлов
+    /// Per-extension transfer behavior (`Transfer-*` headers).
     pub transfer_rules: HashMap<String, TransferBehavior>,
-
-    /// Поведение по умолчанию для файлов (должно быть установлено если есть transfer_rules)
+    /// Default transfer behavior applied when an extension is not matched.
     pub default_transfer_behavior: Option<TransferBehavior>,
-
-    /// Дополнительные пользовательские заголовки
+    /// Extra custom headers to include as `Header: Value`.
     pub custom_headers: HashMap<String, String>,
-
-    /// Opt-body тип (если присутствует opt-body)
+    /// `Opt-body-type` (if `opt-body` is present).
     pub opt_body_type: Option<String>,
-
-    /// Opt-body содержимое
+    /// Optional message body to advertise via `Encapsulated: opt-body=0`.
     pub opt_body: Option<Vec<u8>>,
 }
 
 impl OptionsConfig {
-    /// Создает новую конфигурацию OPTIONS с минимальными обязательными параметрами
+    /// Create a new OPTIONS config with required fields.
     pub fn new(methods: Vec<IcapMethod>, istag: &str) -> Self {
         Self {
             methods,
@@ -98,81 +96,79 @@ impl OptionsConfig {
         }
     }
 
-    /// Устанавливает описание сервиса
+    /// Set the human-readable service description.
     pub fn with_service(mut self, service: &str) -> Self {
         self.service = Some(service.to_string());
         self
     }
 
-    /// Устанавливает максимальное количество соединений
+    /// Set maximum connections hint.
     pub fn with_max_connections(mut self, max_connections: u32) -> Self {
         self.max_connections = Some(max_connections);
         self
     }
 
-    /// Устанавливает время жизни OPTIONS ответа
+    /// Set `Options-TTL` (seconds).
     pub fn with_options_ttl(mut self, ttl: u32) -> Self {
         self.options_ttl = Some(ttl);
         self
     }
 
-    /// Устанавливает дату сервера
+    /// Set server date (UTC).
     pub fn with_date(mut self, date: DateTime<Utc>) -> Self {
         self.date = Some(date);
         self
     }
 
-    /// Устанавливает идентификатор сервиса
+    /// Set short service ID.
     pub fn with_service_id(mut self, service_id: &str) -> Self {
         self.service_id = Some(service_id.to_string());
         self
     }
 
-    /// Добавляет поддерживаемую возможность
+    /// Add a capability to `Allow` (e.g. `"204"`).
     pub fn add_allow(mut self, capability: &str) -> Self {
         self.allow.push(capability.to_string());
         self
     }
 
-    /// Устанавливает размер preview
+    /// Set Preview size (bytes).
     pub fn with_preview(mut self, preview: u32) -> Self {
         self.preview = Some(preview);
         self
     }
 
-    /// Добавляет правило для расширения файла
+    /// Add rule for a file extension (e.g. "pdf", "exe").
     pub fn add_transfer_rule(mut self, extension: &str, behavior: TransferBehavior) -> Self {
         self.transfer_rules.insert(extension.to_string(), behavior);
         self
     }
 
-    /// Устанавливает поведение по умолчанию для файлов
+    /// Set default transfer behavior (applied when an extension is not matched).
     pub fn with_default_transfer_behavior(mut self, behavior: TransferBehavior) -> Self {
         self.default_transfer_behavior = Some(behavior);
         self
     }
 
-    /// Добавляет пользовательский заголовок
+    /// Add a custom header.
     pub fn add_custom_header(mut self, name: &str, value: &str) -> Self {
         self.custom_headers
             .insert(name.to_string(), value.to_string());
         self
     }
 
-    /// Устанавливает opt-body
+    /// Set opt-body and its type.
     pub fn with_opt_body(mut self, body_type: &str, body: Vec<u8>) -> Self {
         self.opt_body_type = Some(body_type.to_string());
         self.opt_body = Some(body);
         self
     }
 
-    /// Создает ICAP ответ на основе конфигурации
+    /// Build an ICAP `OPTIONS` response from this config.
     pub fn build_response(&self) -> Response {
         let mut response = Response::new(StatusCode::Ok200, "OK");
 
-        // Обязательные заголовки
-
-        // Methods (ОБЯЗАТЕЛЬНЫЙ)
+        // Methods
         let methods_str = self
             .methods
             .iter()
@@ -181,18 +177,16 @@ impl OptionsConfig {
             .join(", ");
         response = response.add_header("Methods", &methods_str);
 
-        // ISTag (ОБЯЗАТЕЛЬНЫЙ)
+        // ISTag
         response = response.add_header("ISTag", &format!("\"{}\"", self.istag));
 
-        // Encapsulated (ОБЯЗАТЕЛЬНЫЙ)
+        // Encapsulated
         let encapsulated_value = if self.opt_body.is_some() {
             "opt-body=0"
         } else {
             "null-body=0"
         };
         response = response.add_header("Encapsulated", encapsulated_value);
-
-        // Опциональные заголовки
 
         if let Some(ref service) = self.service {
             response = response.add_header("Service", service);
@@ -229,7 +223,7 @@ impl OptionsConfig {
             response = response.add_header("Opt-body-type", opt_body_type);
         }
 
-        // Transfer-* заголовки
+        // Transfer-* headers
         if !self.transfer_rules.is_empty() {
             let mut preview_extensions = Vec::new();
             let mut ignore_extensions = Vec::new();
@@ -243,7 +237,7 @@ impl OptionsConfig {
                 }
             }
 
-            // Добавляем поведение по умолчанию
+            // Default behavior marker as "*"
             if let Some(ref default_behavior) = self.default_transfer_behavior {
                 match default_behavior {
                     TransferBehavior::Preview => preview_extensions.push("*".to_string()),
@@ -255,23 +249,21 @@ impl OptionsConfig {
             if !preview_extensions.is_empty() {
                 response = response.add_header("Transfer-Preview", &preview_extensions.join(", "));
             }
-
             if !ignore_extensions.is_empty() {
                 response = response.add_header("Transfer-Ignore", &ignore_extensions.join(", "));
             }
-
             if !complete_extensions.is_empty() {
                 response =
                     response.add_header("Transfer-Complete", &complete_extensions.join(", "));
             }
         }
 
-        // Пользовательские заголовки
+        // Custom headers
         for (name, value) in &self.custom_headers {
             response = response.add_header(name, value);
         }
 
-        // Opt-body
+        // Optional body
         if let Some(ref opt_body) = self.opt_body {
             response = response.with_body(opt_body);
         }
@@ -279,28 +271,22 @@ impl OptionsConfig {
         response
     }
 
-    /// Валидирует конфигурацию
+    /// Validate invariants for this configuration.
     pub fn validate(&self) -> Result<(), String> {
         if self.methods.is_empty() {
             return Err("Methods list cannot be empty".to_string());
         }
-
         if self.istag.is_empty() {
             return Err("ISTag cannot be empty".to_string());
         }
-
-        // Проверяем, что если есть transfer_rules, то должно быть поведение по умолчанию
         if !self.transfer_rules.is_empty() && self.default_transfer_behavior.is_none() {
             return Err(
                 "Default transfer behavior must be set when transfer rules are defined".to_string(),
             );
         }
-
-        // Проверяем, что если есть opt_body, то должен быть opt_body_type
         if self.opt_body.is_some() && self.opt_body_type.is_none() {
             return Err("Opt-body-type must be set when opt-body is present".to_string());
         }
-
         Ok(())
     }
 }
@@ -311,80 +297,83 @@ impl Default for OptionsConfig {
     }
 }
 
-/// Строитель для OptionsConfig
+/// Fluent builder for [`OptionsConfig`].
+///
+/// Prefer using this builder over constructing [`OptionsConfig`] directly when
+/// you want validation via [`IcapOptionsBuilder::build`].
 pub struct IcapOptionsBuilder {
     config: OptionsConfig,
 }
 
 impl IcapOptionsBuilder {
-    /// Создает новый строитель
+    /// Start a new builder with required fields.
     pub fn new(methods: Vec<IcapMethod>, istag: &str) -> Self {
         Self {
             config: OptionsConfig::new(methods, istag),
         }
     }
 
-    /// Устанавливает описание сервиса
+    /// Set service description.
     pub fn service(mut self, service: &str) -> Self {
         self.config = self.config.with_service(service);
         self
     }
 
-    /// Устанавливает максимальное количество соединений
+    /// Set max connections.
     pub fn max_connections(mut self, max_connections: u32) -> Self {
         self.config = self.config.with_max_connections(max_connections);
         self
     }
 
-    /// Устанавливает время жизни OPTIONS ответа
+    /// Set `Options-TTL` (seconds).
     pub fn options_ttl(mut self, ttl: u32) -> Self {
         self.config = self.config.with_options_ttl(ttl);
         self
     }
 
-    /// Устанавливает дату сервера (по умолчанию текущая)
+    /// Set current UTC date.
     pub fn with_current_date(mut self) -> Self {
         self.config = self.config.with_date(Utc::now());
         self
     }
 
-    /// Устанавливает идентификатор сервиса
+    /// Set service ID.
     pub fn service_id(mut self, service_id: &str) -> Self {
         self.config = self.config.with_service_id(service_id);
         self
     }
 
-    /// Добавляет поддержку 204 ответа
+    /// Add `204` to `Allow`.
     pub fn allow_204(mut self) -> Self {
         self.config = self.config.add_allow("204");
         self
     }
 
-    /// Устанавливает размер preview
+    /// Set Preview size (bytes).
     pub fn preview(mut self, preview: u32) -> Self {
         self.config = self.config.with_preview(preview);
         self
     }
 
-    /// Добавляет правило для расширения файла
+    /// Add a per-extension transfer rule.
     pub fn transfer_rule(mut self, extension: &str, behavior: TransferBehavior) -> Self {
         self.config = self.config.add_transfer_rule(extension, behavior);
         self
     }
 
-    /// Устанавливает поведение по умолчанию для файлов
+    /// Set default transfer behavior (`*`).
     pub fn default_transfer_behavior(mut self, behavior: TransferBehavior) -> Self {
         self.config = self.config.with_default_transfer_behavior(behavior);
         self
     }
 
-    /// Добавляет пользовательский заголовок
+    /// Add a custom header.
     pub fn custom_header(mut self, name: &str, value: &str) -> Self {
         self.config = self.config.add_custom_header(name, value);
         self
     }
 
-    /// Строит финальную конфигурацию
+    /// Finish and validate.
     pub fn build(self) -> Result<OptionsConfig, String> {
         self.config.validate()?;
         Ok(self.config)
