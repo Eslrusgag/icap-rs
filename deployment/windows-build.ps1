@@ -1,46 +1,106 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$projectRoot = $PSScriptRoot
+$scriptDir = $PSScriptRoot
 $targetTriple = "x86_64-unknown-linux-musl"
 $buildProfile = "release"
-$buildedDir = Join-Path $projectRoot "builded"
+$deploymentDir = $scriptDir
+$buildedDir = Join-Path $deploymentDir "builded"
 $deploymentSenderPath = "C:\Users\warka\Desktop\rust\bins\deployment-sender.exe"
+$logFile = Join-Path $deploymentDir "build-output.log"
+
+function Get-CargoRoot([string]$startDir)
+{
+    $d = Resolve-Path $startDir
+    while ($true)
+    {
+        if (Test-Path (Join-Path $d "Cargo.toml"))
+        {
+            return $d
+        }
+        $parent = Split-Path $d -Parent
+        if (-not $parent -or $parent -eq $d)
+        {
+            break
+        }
+        $d = $parent
+    }
+    return $startDir
+}
+
+$cargoRoot = Get-CargoRoot $deploymentDir
+
+function Map-CrossPathToHost([string]$p)
+{
+    if (-not $p)
+    {
+        return $null
+    }
+    if ( $p.StartsWith("/target/"))
+    {
+        $rel = $p.TrimStart("/").Replace("/", "\")   # "target\..."
+        return Join-Path $cargoRoot $rel
+    }
+    return $p
+}
+
+function Is-RealBinPath([string]$p)
+{
+    if (-not $p)
+    {
+        return $false
+    }
+    $norm = $p.Replace('/', '\')
+    if ($norm -notmatch "\\target\\[^\\]+\\(release|debug)\\")
+    {
+        return $false
+    }
+    if ($norm -match "\\target\\(release|debug)\\build\\")
+    {
+        return $false
+    }
+    return (Test-Path $p)
+}
+
 
 if (-not (Get-Command cargo -ErrorAction SilentlyContinue))
 {
-    Write-Host "Ошибка: cargo не найден в PATH." -ForegroundColor Red
+    Write-Host "Error: 'cargo' not found in PATH." -ForegroundColor Red
     exit 1
 }
 if (-not (Get-Command cross -ErrorAction SilentlyContinue))
 {
-    Write-Host "Ошибка: cross не найден в PATH. Установите: cargo install cross" -ForegroundColor Red
+    Write-Host "Error: 'cross' not found in PATH. Install with: cargo install cross" -ForegroundColor Red
     exit 1
 }
 
-Write-Host "Проверка: cross +stable check --target $targetTriple" -ForegroundColor Cyan
-$check = & cross +stable check --target $targetTriple 2>&1
+Write-Host "Check: cargo check" -ForegroundColor Cyan
+$checkOutput = & cargo check 2>&1 | Tee-Object -Variable checkOutput
 if ($LASTEXITCODE -ne 0)
 {
-    Write-Host "Ошибка: cross check не прошёл. Исправьте ошибки выше." -ForegroundColor Red
+    Write-Host "Error: cargo check failed. See output above." -ForegroundColor Red
     exit 1
 }
-Write-Host "cross check успешно завершён." -ForegroundColor Green
+Write-Host "cargo check completed successfully." -ForegroundColor Green
 
-Write-Host "Сборка: cross +stable build --release --target $targetTriple (c JSON-выводом)" -ForegroundColor Cyan
-# Важно: --message-format=json позволяет корректно вытащить пути к исполняемым файлам
-$buildOutput = & cross +stable build --$buildProfile --target $targetTriple --message-format=json 2>&1
-if ($LASTEXITCODE -ne 0)
+Write-Host "Build: cross +stable build --$buildProfile --target $targetTriple" -ForegroundColor Cyan
+if (Test-Path $logFile)
 {
-    Write-Host "Ошибка: сборка завершилась неуспешно." -ForegroundColor Red
-    exit 1
+    Remove-Item $logFile -Force -ErrorAction SilentlyContinue
 }
-Write-Host "Сборка успешно завершена." -ForegroundColor Green
 
-# --- Парсинг JSON-вывода и сбор путей к итоговым бинарям ---
-# Ищем объекты с reason = "compiler-artifact" и непустым полем "executable"
-$executables = @()
-foreach ($line in ($buildOutput -split "`r?`n"))
+$mf = "json-diagnostic-rendered-ansi"
+$buildOutput = & cross +stable build --$buildProfile --target $targetTriple --message-format=$mf 2>&1 `
+    | Tee-Object -Variable buildOutput `
+    | Tee-Object -FilePath $logFile
+$exitCode = $LASTEXITCODE
+$buildOutputText = ($buildOutput -join "`n")
+
+
+$binNames = New-Object System.Collections.Generic.HashSet[string]
+$exeCandidates = @()
+
+foreach ($line in ($buildOutputText -split "`r?`n"))
 {
     if ( [string]::IsNullOrWhiteSpace($line))
     {
@@ -49,43 +109,117 @@ foreach ($line in ($buildOutput -split "`r?`n"))
     try
     {
         $obj = $line | ConvertFrom-Json -ErrorAction Stop
-        if ($obj.reason -eq "compiler-artifact" -and $obj.PSObject.Properties.Name -contains "executable")
+
+        if ($obj.reason -eq "compiler-artifact" -and $obj.target)
         {
-            if ($obj.executable)
+            if ($obj.target.kind -contains "bin" -and $obj.target.name)
             {
-                $executables += $obj.executable
+                if ($obj.package_id -and ($obj.package_id -like "path+file://*"))
+                {
+                    [void]$binNames.Add([string]$obj.target.name)
+                }
             }
+            if ($obj.target.kind -contains "bin" -and $obj.PSObject.Properties.Name -contains "executable" -and $obj.executable)
+            {
+                if ($obj.package_id -and ($obj.package_id -like "path+file://*"))
+                {
+                    $exeCandidates += $obj | Select-Object `
+                        @{ n = "executable"; e = { $_.executable } }, `
+                         @{ n = "name"; e = { $_.target.name } }
+                }
+            }
+        }
+
+        if ($exitCode -ne 0 -and $obj.reason -eq "compiler-message" -and $obj.message -and $obj.message.rendered)
+        {
+            Write-Host $obj.message.rendered
         }
     }
     catch
     {
-        # Игнор строк, которые не являются JSON
     }
 }
-$executables = $executables | Where-Object { $_ } | Select-Object -Unique
 
-if (-not $executables -or $executables.Count -eq 0)
+if ($exitCode -ne 0)
 {
-    # Фолбэк: берём все файлы без расширения из target/<triple>/release
-    $fallbackDir = Join-Path $projectRoot "target\$targetTriple\$buildProfile"
-    if (Test-Path $fallbackDir)
+    Write-Host "Error: build failed." -ForegroundColor Red
+    if (Test-Path $logFile)
     {
-        $executables = Get-ChildItem -Path $fallbackDir -File |
-                Where-Object { [IO.Path]::GetExtension($_.Name) -eq "" } |
-                Select-Object -ExpandProperty FullName
+        Write-Host "---- Last 200 lines of build-output.log ----" -ForegroundColor Yellow
+        Get-Content $logFile -Tail 200 | ForEach-Object { Write-Host $_ }
+        Write-Host "-------------------------------------------" -ForegroundColor Yellow
+        Write-Host ("Full build log saved to: {0}" -f $logFile) -ForegroundColor Yellow
     }
-}
-
-if (-not $executables -or $executables.Count -eq 0)
-{
-    Write-Host "Не удалось определить собранные исполняемые файлы." -ForegroundColor Red
     exit 1
 }
 
-Write-Host "Найдено исполняемых файлов: $( $executables.Count )"
-$executables | ForEach-Object { Write-Host "  $_" }
+Write-Host "Build completed successfully." -ForegroundColor Green
 
-# --- Подготовка папки builded ---
+$executables = @(
+$exeCandidates |
+        ForEach-Object {
+            $mapped = Map-CrossPathToHost $_.executable
+            $fileBase = [IO.Path]::GetFileName($mapped)
+            $nameMatch = ($fileBase -eq $_.name) -or ($fileBase -eq "$( $_.name ).exe")
+            if ($nameMatch -and (Is-RealBinPath $mapped))
+            {
+                $mapped
+            }
+        } |
+        Select-Object -Unique
+)
+
+
+if (-not $executables -or @($executables).Count -eq 0)
+{
+    $fallbackDir = Join-Path $cargoRoot "target\$targetTriple\$buildProfile"
+    if (Test-Path $fallbackDir)
+    {
+        $names = @($binNames)
+        if (-not $names -or @($names).Count -eq 0)
+        {
+            $names = @()
+        }
+
+        $fallback = @()
+
+        if (@($names).Count -gt 0)
+        {
+            foreach ($n in @($names))
+            {
+                $cand1 = Join-Path $fallbackDir $n
+                $cand2 = Join-Path $fallbackDir ($n + ".exe")
+                if (Test-Path $cand1)
+                {
+                    $fallback += $cand1
+                }
+                if (Test-Path $cand2)
+                {
+                    $fallback += $cand2
+                }
+            }
+        }
+        else
+        {
+            $fallback = Get-ChildItem -Path $fallbackDir -File |
+                    Where-Object { [IO.Path]::GetExtension($_.Name) -eq "" } |
+                    Select-Object -ExpandProperty FullName
+        }
+
+        $executables = @($fallback | Where-Object { Test-Path $_ } | Select-Object -Unique)
+    }
+}
+
+if (-not $executables -or @($executables).Count -eq 0)
+{
+    Write-Host "Could not determine built executables." -ForegroundColor Red
+    Write-Host "Tip: verify [[bin]] names and inspect $( Split-Path -Leaf $logFile )." -ForegroundColor Yellow
+    exit 1
+}
+
+Write-Host ("Executables found: {0}" -f (@($executables).Count))
+@($executables) | ForEach-Object { Write-Host "  $_" }
+
 if (Test-Path $buildedDir)
 {
     Remove-Item "$buildedDir\*" -Recurse -Force -ErrorAction SilentlyContinue
@@ -95,37 +229,32 @@ else
     New-Item -ItemType Directory -Path $buildedDir | Out-Null
 }
 
-# Копируем только бинарники (без .d, .rlib, и т.п.)
-foreach ($exe in $executables)
+foreach ($exe in @($executables))
 {
-    # На musl таргете расширения обычно нет; просто копируем как есть
     Copy-Item -Path $exe -Destination $buildedDir -Force
 }
+Write-Host "Binaries copied to: $buildedDir" -ForegroundColor Green
 
-Write-Host "Бинарные файлы скопированы в: $buildedDir" -ForegroundColor Green
-
-# --- Отправка через deployment-sender ---
 if (-not (Test-Path $deploymentSenderPath))
 {
-    Write-Host "Предупреждение: deployment-sender не найден по пути: $deploymentSenderPath" -ForegroundColor Yellow
-    Write-Host "Пропускаю шаг отправки." -ForegroundColor Yellow
+    Write-Host "Warning: deployment-sender not found at: $deploymentSenderPath" -ForegroundColor Yellow
+    Write-Host "Skipping deploy step." -ForegroundColor Yellow
     exit 0
 }
 
-# Формируем список путей к файлам в builded
-$files = Get-ChildItem -Path $buildedDir -File | Where-Object { $_.Extension -ne '.d' }
-if (-not $files -or $files.Count -eq 0)
+$files = @(Get-ChildItem -Path $buildedDir -File | Where-Object { $_.Extension -ne '.d' })
+if (-not $files -or @($files).Count -eq 0)
 {
-    Write-Host "Нет файлов для отправки в $buildedDir." -ForegroundColor Yellow
+    Write-Host "No files to send in $buildedDir." -ForegroundColor Yellow
     exit 0
 }
-$filePaths = $files | ForEach-Object { $_.FullName }
+$filePaths = @($files | ForEach-Object { $_.FullName })
 
-Write-Host "Отправка файлов через deployment-sender..." -ForegroundColor Cyan
+Write-Host "Sending files via deployment-sender..." -ForegroundColor Cyan
 & $deploymentSenderPath $filePaths
 if ($LASTEXITCODE -ne 0)
 {
-    Write-Host "Ошибка: Не удалось отправить файлы через deployment-sender." -ForegroundColor Red
+    Write-Host "Error: deployment-sender failed." -ForegroundColor Red
     exit 1
 }
-Write-Host "Файлы успешно отправлены через deployment-sender." -ForegroundColor Green
+Write-Host "Files sent successfully via deployment-sender." -ForegroundColor Green
