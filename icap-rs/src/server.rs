@@ -9,7 +9,6 @@
 //! Status: experimental; APIs may change.
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::str;
 use std::sync::Arc;
 
@@ -19,8 +18,9 @@ use tokio::sync::RwLock;
 use tracing::{error, trace, warn};
 
 use crate::error::IcapResult;
+use crate::request::parse_icap_request;
 use crate::{
-    IcapMethod, OptionsConfig, Request, Response, StatusCode, parse_icap_request,
+    IcapMethod, OptionsConfig, Request, Response, StatusCode, read_chunked_to_end,
     serialize_icap_response,
 };
 
@@ -59,9 +59,7 @@ impl Server {
             let services = Arc::clone(&self.services);
             let options_configs = Arc::clone(&self.options_configs);
             tokio::spawn(async move {
-                if let Err(e) =
-                    Self::handle_connection(socket, addr, services, options_configs).await
-                {
+                if let Err(e) = Self::handle_connection(socket, services, options_configs).await {
                     error!("Error handling connection {}: {}", addr, e);
                 }
             });
@@ -84,7 +82,6 @@ impl Server {
     ///  - If there is no body, the ICAP message ends at the ICAP headers CRLFCRLF.
     async fn handle_connection(
         mut socket: TcpStream,
-        addr: SocketAddr,
         services: Arc<RwLock<HashMap<String, RequestHandler>>>,
         options_configs: Arc<RwLock<HashMap<String, OptionsConfig>>>,
     ) -> IcapResult<()> {
@@ -100,11 +97,11 @@ impl Server {
                 let n = socket.read(&mut tmp).await?;
                 if n == 0 {
                     // Peer closed; if nothing buffered, just exit.
-                    if buf.is_empty() {
-                        return Ok(());
+                    return if buf.is_empty() {
+                        Ok(())
                     } else {
-                        return Err("EOF before complete ICAP headers".into());
-                    }
+                        Err("EOF before complete ICAP headers".into())
+                    };
                 }
                 buf.extend_from_slice(&tmp[..n]);
             };
@@ -258,78 +255,4 @@ impl Default for ServerBuilder {
 /// Find the end of the ICAP header block.
 fn headers_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4)
-}
-
-/// Parse a single ICAP chunk at `from`.
-/// Returns (next_pos, is_final_zero_chunk, chunk_size).
-fn parse_one_chunk(buf: &[u8], from: usize) -> Option<(usize, bool, usize)> {
-    let mut i = from;
-    while i + 1 < buf.len() {
-        if buf[i] == b'\r' && buf[i + 1] == b'\n' {
-            // size line: "<hex>[;ext]\r\n"
-            let size_line = &buf[from..i];
-            let size_hex = size_line.split(|&b| b == b';').next().unwrap_or(size_line);
-            let size_str = std::str::from_utf8(size_hex).ok()?.trim();
-            let size = usize::from_str_radix(size_str, 16).ok()?;
-            let after_size = i + 2;
-            let need = after_size + size + 2; // +CRLF after chunk data
-            if buf.len() < need {
-                return None;
-            }
-            if size == 0 {
-                // zero chunk; trailing CRLF for (empty) trailers must follow
-                if buf.len() < after_size + 2 {
-                    return None;
-                }
-                return Some((after_size, true, 0));
-            }
-            return Some((need, false, size));
-        }
-        i += 1;
-    }
-    None
-}
-
-/// Read an ICAP chunked body to the terminating zero chunk and return
-/// the absolute offset in `buf` **right after** the final CRLF.
-/// `pos` must point to the first byte of the first chunk-size line.
-async fn read_chunked_to_end(
-    stream: &mut TcpStream,
-    buf: &mut Vec<u8>,
-    mut pos: usize,
-) -> IcapResult<usize> {
-    loop {
-        match parse_one_chunk(buf, pos) {
-            Some((next_pos, is_final_zero, _size)) => {
-                if is_final_zero {
-                    // After size line CRLF of the zero-chunk.
-                    pos = next_pos;
-                    // Ensure we have the trailing CRLF for (empty) trailers.
-                    while buf.len() < pos + 2 {
-                        let mut tmp = [0u8; 4096];
-                        let n = stream.read(&mut tmp).await?;
-                        if n == 0 {
-                            return Err("Unexpected EOF after zero chunk".into());
-                        }
-                        buf.extend_from_slice(&tmp[..n]);
-                    }
-                    if &buf[pos..pos + 2] != b"\r\n" {
-                        return Err("Invalid ICAP chunked terminator".into());
-                    }
-                    // Return absolute end-of-message offset.
-                    return Ok(pos + 2);
-                } else {
-                    pos = next_pos;
-                }
-            }
-            None => {
-                let mut tmp = [0u8; 4096];
-                let n = stream.read(&mut tmp).await?;
-                if n == 0 {
-                    return Err("Unexpected EOF while reading ICAP chunked body".into());
-                }
-                buf.extend_from_slice(&tmp[..n]);
-            }
-        }
-    }
 }

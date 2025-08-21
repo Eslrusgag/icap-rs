@@ -31,7 +31,13 @@
 //! assert_eq!(icap_req.preview_size, Some(4));
 //! ```
 
-use http::{HeaderMap, HeaderName, HeaderValue, Request as HttpRequest, Response as HttpResponse};
+use crate::error::IcapResult;
+use crate::icap::find_double_crlf;
+use http::{
+    HeaderMap, HeaderName, HeaderValue, Request as HttpRequest, Response as HttpResponse,
+    StatusCode as HttpStatus, Version,
+};
+use tracing::{debug, trace};
 
 /// Embedded HTTP message inside an ICAP request.
 #[derive(Debug, Clone)]
@@ -137,4 +143,151 @@ impl Request {
         self.embedded = Some(EmbeddedHttp::Resp(resp));
         self
     }
+}
+
+pub(crate) fn parse_icap_request(data: &[u8]) -> IcapResult<Request> {
+    trace!("parse_icap_request: len={}", data.len());
+    let hdr_end = find_double_crlf(data).ok_or("ICAP request headers not complete")?;
+    let head = &data[..hdr_end];
+    let head_str = std::str::from_utf8(head)?;
+
+    // Request line: METHOD <icap-uri> ICAP/1.0
+    let mut lines = head_str.split("\r\n");
+    let request_line = lines.next().ok_or("Empty request")?;
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().ok_or("Invalid request line")?.to_string();
+    let icap_uri = parts.next().ok_or("Invalid request line")?.to_string();
+    let _version = parts.next().ok_or("Invalid request line")?.to_string();
+    debug!("parse_icap_request: {} {}", method, icap_uri);
+
+    // ICAP headers
+    let mut icap_headers = HeaderMap::new();
+    for line in lines {
+        if line.is_empty() {
+            break;
+        }
+        if let Some(colon) = line.find(':') {
+            let name = &line[..colon];
+            let value = line[colon + 1..].trim();
+            icap_headers.insert(
+                HeaderName::from_bytes(name.as_bytes())?,
+                HeaderValue::from_str(value)?,
+            );
+        }
+    }
+
+    let service = icap_uri.rsplit('/').next().unwrap_or("").to_string();
+
+    let allow_204 = icap_headers
+        .get("Allow")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.split(',').any(|p| p.trim() == "204"))
+        .unwrap_or(false);
+
+    let allow_206 = icap_headers
+        .get("Allow")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.split(',').any(|p| p.trim() == "206"))
+        .unwrap_or(false);
+
+    let preview_size = icap_headers
+        .get("Preview")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<usize>().ok());
+
+    let rest = &data[hdr_end..];
+    let embedded = if rest.is_empty() {
+        None
+    } else if let Some(http_hdr_end) = crate::parser::icap::find_double_crlf(rest) {
+        let http_head = &rest[..http_hdr_end];
+        let http_head_str = std::str::from_utf8(http_head)?;
+        let mut hlines = http_head_str.split("\r\n");
+        let start = hlines.next().unwrap_or_default();
+
+        if start.starts_with("HTTP/") {
+            // HTTP Response
+            let mut p = start.split_whitespace();
+            let _ver = p.next().unwrap_or("HTTP/1.1");
+            let code = p.next().unwrap_or("200").parse::<u16>().unwrap_or(200);
+            debug!("parse_icap_request: embedded HTTP response code={}", code);
+
+            let mut http_headers = HeaderMap::new();
+            for line in hlines {
+                if line.is_empty() {
+                    break;
+                }
+                if let Some(colon) = line.find(':') {
+                    let name = &line[..colon];
+                    let value = line[colon + 1..].trim();
+                    http_headers.insert(
+                        HeaderName::from_bytes(name.as_bytes())?,
+                        HeaderValue::from_str(value)?,
+                    );
+                }
+            }
+            let body = rest[http_hdr_end..].to_vec();
+            let mut builder = HttpResponse::builder()
+                .status(HttpStatus::from_u16(code).unwrap_or(HttpStatus::OK))
+                .version(Version::HTTP_11);
+            {
+                let headers_mut = builder
+                    .headers_mut()
+                    .ok_or("response builder: headers_mut is None")?;
+                headers_mut.extend(http_headers);
+            }
+            let resp = builder
+                .body(body)
+                .map_err(|e| format!("build http::Response: {e}"))?;
+            Some(EmbeddedHttp::Resp(resp))
+        } else {
+            // HTTP Request
+            let mut p = start.split_whitespace();
+            let m = p.next().unwrap_or("GET");
+            let u = p.next().unwrap_or("/");
+            debug!("parse_icap_request: embedded HTTP request {} {}", m, u);
+
+            let mut http_headers = HeaderMap::new();
+            for line in hlines {
+                if line.is_empty() {
+                    break;
+                }
+                if let Some(colon) = line.find(':') {
+                    let name = &line[..colon];
+                    let value = line[colon + 1..].trim();
+                    http_headers.insert(
+                        HeaderName::from_bytes(name.as_bytes())?,
+                        HeaderValue::from_str(value)?,
+                    );
+                }
+            }
+            let body = rest[http_hdr_end..].to_vec();
+            let mut builder = HttpRequest::builder()
+                .method(m)
+                .uri(u)
+                .version(Version::HTTP_11);
+            {
+                let headers_mut = builder
+                    .headers_mut()
+                    .ok_or("request builder: headers_mut is None")?;
+                headers_mut.extend(http_headers);
+            }
+            let req = builder
+                .body(body)
+                .map_err(|e| format!("build http::Request: {e}"))?;
+            Some(EmbeddedHttp::Req(req))
+        }
+    } else {
+        None
+    };
+
+    Ok(Request {
+        method,
+        service,
+        icap_headers,
+        embedded,
+        preview_size,
+        allow_204,
+        allow_206,
+        preview_ieof: false,
+    })
 }
