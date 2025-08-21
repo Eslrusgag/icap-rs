@@ -648,43 +648,6 @@ fn headers_end(buf: &[u8]) -> Option<usize> {
     find_double_crlf(buf).map(|i| i + 4)
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-struct Encapsulated {
-    req_hdr: Option<usize>,
-    res_hdr: Option<usize>,
-    req_body: Option<usize>,
-    res_body: Option<usize>,
-    null_body: Option<usize>,
-}
-
-fn parse_encapsulated_header(headers_text: &str) -> Encapsulated {
-    let mut enc = Encapsulated::default();
-    for line in headers_text.lines() {
-        let Some((name, val)) = line.split_once(':') else {
-            continue;
-        };
-        if !name.trim().eq_ignore_ascii_case("Encapsulated") {
-            continue;
-        }
-        for part in val.split(',') {
-            let part = part.trim();
-            let mut it = part.split('=');
-            let key = it.next().unwrap_or("").trim().to_ascii_lowercase();
-            let off = it.next().and_then(|s| s.trim().parse::<usize>().ok());
-            match (key.as_str(), off) {
-                ("req-hdr", Some(o)) => enc.req_hdr = Some(o),
-                ("res-hdr", Some(o)) => enc.res_hdr = Some(o),
-                ("req-body", Some(o)) => enc.req_body = Some(o),
-                ("res-body", Some(o)) => enc.res_body = Some(o),
-                ("null-body", Some(o)) => enc.null_body = Some(o),
-                _ => {}
-            }
-        }
-        break;
-    }
-    enc
-}
-
 // Returns (next_pos, is_final, size_of_chunk)
 fn parse_one_chunk(buf: &[u8], from: usize) -> Option<(usize, bool, usize)> {
     let mut i = from;
@@ -757,7 +720,7 @@ async fn read_icap_body_if_any(stream: &mut TcpStream, buf: &mut Vec<u8>) -> Ica
     };
 
     let hdr_text = std::str::from_utf8(&buf[..h_end]).map_err(|_| "Invalid headers utf8")?;
-    let enc = parse_encapsulated_header(hdr_text);
+    let enc = crate::parser::parse_encapsulated_header(hdr_text);
 
     let body_off_rel = enc.req_body.or(enc.res_body);
     let hdr_off_rel = enc.req_hdr.or(enc.res_hdr);
@@ -971,21 +934,6 @@ mod tests {
         let raw2 = serialize_http_request(&req2);
         let (_hdrs2, body2) = split_http_bytes(&raw2);
         assert!(body2.is_none());
-    }
-
-    #[test]
-    fn parse_encapsulated_header_variants() {
-        let t = "Encapsulated: req-hdr=0, req-body=123\r\n";
-        let e = parse_encapsulated_header(t);
-        assert_eq!(e.req_hdr, Some(0));
-        assert_eq!(e.req_body, Some(123));
-        assert_eq!(e.res_hdr, None);
-
-        let t2 = "Some: x\r\nEncapsulated: res-hdr=0, res-body=42\r\nFoo: y\r\n";
-        let e2 = parse_encapsulated_header(t2);
-        assert_eq!(e2.res_hdr, Some(0));
-        assert_eq!(e2.res_body, Some(42));
-        assert!(e2.req_hdr.is_none());
     }
 
     #[test]

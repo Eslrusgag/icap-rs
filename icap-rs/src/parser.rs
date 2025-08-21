@@ -11,6 +11,48 @@ use std::fmt::Write;
 use std::str::FromStr;
 use tracing::{debug, trace};
 
+/// Offsets parsed from the `Encapsulated` header.
+///
+/// Offsets are **relative to the start of the encapsulated area**
+/// (i.e., immediately after the ICAP headers CRLFCRLF).
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct Encapsulated {
+    pub(crate) req_hdr: Option<usize>,
+    pub(crate) res_hdr: Option<usize>,
+    pub(crate) req_body: Option<usize>,
+    pub(crate) res_body: Option<usize>,
+    pub(crate) null_body: Option<usize>,
+}
+
+/// Parse the `Encapsulated:` header into offsets.
+pub(crate) fn parse_encapsulated_header(headers_text: &str) -> Encapsulated {
+    let mut enc = Encapsulated::default();
+    for line in headers_text.lines() {
+        let Some((name, val)) = line.split_once(':') else {
+            continue;
+        };
+        if !name.trim().eq_ignore_ascii_case("Encapsulated") {
+            continue;
+        }
+        for part in val.split(',') {
+            let part = part.trim();
+            let mut it = part.split('=');
+            let key = it.next().unwrap_or("").trim().to_ascii_lowercase();
+            let off = it.next().and_then(|s| s.trim().parse::<usize>().ok());
+            match (key.as_str(), off) {
+                ("req-hdr", Some(o)) => enc.req_hdr = Some(o),
+                ("res-hdr", Some(o)) => enc.res_hdr = Some(o),
+                ("req-body", Some(o)) => enc.req_body = Some(o),
+                ("res-body", Some(o)) => enc.res_body = Some(o),
+                ("null-body", Some(o)) => enc.null_body = Some(o),
+                _ => {}
+            }
+        }
+        break;
+    }
+    enc
+}
+
 #[inline]
 fn find_double_crlf(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4)
@@ -461,5 +503,24 @@ fn canonical_icap_header(name: &str) -> Cow<str> {
             }
             Cow::Owned(out)
         }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_encapsulated_header_variants() {
+        let t = "Encapsulated: req-hdr=0, req-body=123\r\n";
+        let e = parse_encapsulated_header(t);
+        assert_eq!(e.req_hdr, Some(0));
+        assert_eq!(e.req_body, Some(123));
+        assert_eq!(e.res_hdr, None);
+
+        let t2 = "Some: x\r\nEncapsulated: res-hdr=0, res-body=42\r\nFoo: y\r\n";
+        let e2 = parse_encapsulated_header(t2);
+        assert_eq!(e2.res_hdr, Some(0));
+        assert_eq!(e2.res_body, Some(42));
+        assert!(e2.req_hdr.is_none());
     }
 }
