@@ -3,8 +3,8 @@ pub mod icap;
 pub mod wire;
 
 pub use icap::{
-    Encapsulated, canon_icap_header, http_version_str, parse_encapsulated_header,
-    serialize_icap_request, serialize_icap_response,
+    canon_icap_header, http_version_str, parse_encapsulated_header, serialize_icap_request,
+    serialize_icap_response,
 };
 
 pub use wire::{headers_end, parse_one_chunk, read_chunked_to_end, write_chunk, write_chunk_into};
