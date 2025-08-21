@@ -8,17 +8,15 @@
 //! - Keep-Alive reuse of a single idle connection.
 //! - Encapsulated header calculation and chunked bodies.
 use crate::error::IcapResult;
-use crate::parser;
-use crate::response::Response;
-
-use crate::parser::http_version_str;
-use crate::request::{EmbeddedHttp, Request};
-use http::{
-    HeaderMap, HeaderName, HeaderValue, Request as HttpRequest, Response as HttpResponse,
-    StatusCode,
+use crate::parser::parse_encapsulated_header;
+use crate::parser::{
+    canon_icap_header, headers_end, read_chunked_to_end, serialize_http_request,
+    serialize_http_response, split_http_bytes, write_chunk, write_chunk_into,
 };
-use std::fmt::Write as FmtWrite;
-use std::io::Write as IoWrite;
+use crate::request::{EmbeddedHttp, Request};
+use crate::response::{Response, parse_icap_response};
+
+use http::{HeaderMap, HeaderName, HeaderValue};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,7 +24,7 @@ use tokio::fs::File as TokioFile;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
-use tracing::{debug, trace};
+use tracing::trace;
 
 /// High-level ICAP client with connection reuse and Preview negotiation.
 ///
@@ -246,7 +244,7 @@ impl Client {
             let (_code, mut buf) = read_icap_headers(&mut stream).await?;
             read_icap_body_if_any(&mut stream, &mut buf).await?;
             maybe_put_back(self.inner.connection_policy, &self.inner.idle_conn, stream).await;
-            return parser::parse_icap_response(&buf);
+            return parse_icap_response(&buf);
         }
 
         // Handle 100-Continue for Preview
@@ -264,13 +262,13 @@ impl Client {
                 let (_code2, mut response) = read_icap_headers(&mut stream).await?;
                 read_icap_body_if_any(&mut stream, &mut response).await?;
                 maybe_put_back(self.inner.connection_policy, &self.inner.idle_conn, stream).await;
-                parser::parse_icap_response(&response)
+                parse_icap_response(&response)
             } else {
                 // server decided final without continue (e.g., 204)
                 let mut response = hdr_buf;
                 read_icap_body_if_any(&mut stream, &mut response).await?;
                 maybe_put_back(self.inner.connection_policy, &self.inner.idle_conn, stream).await;
-                parser::parse_icap_response(&response)
+                parse_icap_response(&response)
             };
         }
 
@@ -278,7 +276,7 @@ impl Client {
         let (_code, mut response) = read_icap_headers(&mut stream).await?;
         read_icap_body_if_any(&mut stream, &mut response).await?;
         maybe_put_back(self.inner.connection_policy, &self.inner.idle_conn, stream).await;
-        parser::parse_icap_response(&response)
+        parse_icap_response(&response)
     }
 
     /// Send an ICAP request where the embedded HTTP body is streamed from disk.
@@ -342,13 +340,13 @@ impl Client {
             let (_code2, mut response) = read_icap_headers(&mut stream).await?;
             read_icap_body_if_any(&mut stream, &mut response).await?;
             maybe_put_back(self.inner.connection_policy, &self.inner.idle_conn, stream).await;
-            parser::parse_icap_response(&response)
+            parse_icap_response(&response)
         } else {
             // final immediately (e.g., 204)
             let mut response = hdr_buf;
             read_icap_body_if_any(&mut stream, &mut response).await?;
             maybe_put_back(self.inner.connection_policy, &self.inner.idle_conn, stream).await;
-            parser::parse_icap_response(&response)
+            parse_icap_response(&response)
         }
     }
 
@@ -402,7 +400,7 @@ impl Client {
             "icap://{}:{}/{}",
             self.inner.host,
             self.inner.port,
-            trim_leading_slash(&req.service)
+            Self::trim_leading_slash(&req.service)
         );
         out.extend_from_slice(format!("{} {} ICAP/1.0\r\n", req.method, full_uri).as_bytes());
 
@@ -415,7 +413,7 @@ impl Client {
             .unwrap_or_else(|| self.inner.host.clone());
         headers.insert(
             HeaderName::from_static("host"),
-            HeaderValue::from_str(&host_value).unwrap(),
+            HeaderValue::from_str(&host_value)?,
         );
 
         for (n, v) in req.icap_headers.iter() {
@@ -430,7 +428,7 @@ impl Client {
         if let Some(ps) = req.preview_size {
             headers.insert(
                 HeaderName::from_static("preview"),
-                HeaderValue::from_str(&ps.to_string()).unwrap(),
+                HeaderValue::from_str(&ps.to_string())?,
             );
         }
 
@@ -474,7 +472,7 @@ impl Client {
             if name.as_str().eq_ignore_ascii_case("encapsulated") {
                 continue;
             }
-            let cname = canon_icap_header_name(name.as_str());
+            let cname = canon_icap_header(name.as_str());
             out.extend_from_slice(cname.as_bytes());
             out.extend_from_slice(b": ");
             out.extend_from_slice(value.as_bytes());
@@ -509,23 +507,10 @@ impl Client {
             remaining_body: None,
         })
     }
-}
 
-fn canon_icap_header_name(name: &str) -> String {
-    let mut out = String::new();
-    for (i, part) in name.split('-').enumerate() {
-        if i > 0 {
-            out.push('-');
-        }
-        let mut chars = part.chars();
-        if let Some(f) = chars.next() {
-            out.push(f.to_ascii_uppercase());
-            for c in chars {
-                out.push(c.to_ascii_lowercase());
-            }
-        }
+    fn trim_leading_slash(s: &str) -> &str {
+        s.strip_prefix('/').unwrap_or(s)
     }
-    out
 }
 
 /// Return connection back to idle slot if keep-alive is enabled.
@@ -548,71 +533,103 @@ struct BuiltIcap {
     remaining_body: Option<Vec<u8>>,
 }
 
+async fn read_icap_body_if_any(stream: &mut TcpStream, buf: &mut Vec<u8>) -> IcapResult<()> {
+    let Some(h_end) = headers_end(buf) else {
+        return Err("Corrupted ICAP headers".into());
+    };
+
+    let hdr_text = std::str::from_utf8(&buf[..h_end]).map_err(|_| "Invalid headers utf8")?;
+    let enc = parse_encapsulated_header(hdr_text);
+
+    if let Some(body_rel) = enc.req_body.or(enc.res_body) {
+        let body_abs = h_end + body_rel;
+
+        while buf.len() < body_abs {
+            let mut tmp = [0u8; 4096];
+            let n = stream.read(&mut tmp).await?;
+            if n == 0 {
+                return Err("EOF before body".into());
+            }
+            buf.extend_from_slice(&tmp[..n]);
+        }
+
+        // read_chunked_to_end возвращает usize → мапим в ().
+        read_chunked_to_end(stream, buf, body_abs).await.map(|_| ())
+    } else {
+        Ok(())
+    }
+}
+
+fn parse_authority(uri: &str) -> IcapResult<(String, u16)> {
+    let s = uri.trim();
+    let rest = s
+        .strip_prefix("icap://")
+        .ok_or("Authority URI must start with icap://")?;
+    let authority = rest.split('/').next().unwrap_or(rest);
+    let (host, port) = if let Some(i) = authority.rfind(':') {
+        let h = &authority[..i];
+        let p: u16 = authority[i + 1..].parse().map_err(|_| "Invalid port")?;
+        (h.to_string(), p)
+    } else {
+        (authority.to_string(), 1344)
+    };
+    if host.is_empty() {
+        return Err("Empty host in authority".into());
+    }
+    Ok((host, port))
+}
+
+fn append_to_allow(headers: &mut HeaderMap, code: &str) {
+    let name = HeaderName::from_static("allow");
+    match headers.get_mut(&name) {
+        Some(v) => {
+            let mut s = v.to_str().unwrap_or("").to_string();
+            if !s.split(',').any(|p| p.trim() == code) {
+                if !s.is_empty() {
+                    s.push_str(", ");
+                }
+                s.push_str(code);
+                *v = HeaderValue::from_str(&s).unwrap();
+            }
+        }
+        None => {
+            headers.insert(name, HeaderValue::from_str(code).unwrap());
+        }
+    }
+}
+
+async fn read_icap_headers(stream: &mut TcpStream) -> IcapResult<(u16, Vec<u8>)> {
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 4096];
+    loop {
+        let n = stream.read(&mut tmp).await?;
+        if n == 0 {
+            return Err("Unexpected EOF while reading ICAP headers".into());
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+            let line_end = buf
+                .windows(2)
+                .position(|w| w == b"\r\n")
+                .unwrap_or(buf.len());
+            let status_line = &buf[..line_end];
+            let code = {
+                let s = std::str::from_utf8(status_line).map_err(|_| "bad utf8 in status line")?;
+                let mut parts = s.split_whitespace();
+                let _ver = parts.next();
+                let code_str = parts.next().ok_or("missing status code")?;
+                code_str.parse::<u16>().map_err(|_| "bad status code")?
+            };
+            return Ok((code, buf));
+        }
+    }
+}
+
 fn serialize_embedded_http(e: &EmbeddedHttp) -> (Vec<u8>, Option<Vec<u8>>) {
     match e {
         EmbeddedHttp::Req(r) => split_http_bytes(&serialize_http_request(r)),
         EmbeddedHttp::Resp(r) => split_http_bytes(&serialize_http_response(r)),
     }
-}
-
-fn split_http_bytes(raw: &[u8]) -> (Vec<u8>, Option<Vec<u8>>) {
-    if let Some(hdr_end) = raw.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4) {
-        let headers = raw[..hdr_end].to_vec();
-        if hdr_end < raw.len() {
-            (headers, Some(raw[hdr_end..].to_vec()))
-        } else {
-            (headers, None)
-        }
-    } else {
-        (raw.to_vec(), None)
-    }
-}
-
-/// Serialize an HTTP request (from `http` crate) into bytes suitable
-/// for embedding inside an ICAP message (start-line, headers, CRLFCRLF, body).
-fn serialize_http_request(req: &HttpRequest<Vec<u8>>) -> Vec<u8> {
-    let mut out = String::new();
-    write!(
-        out,
-        "{} {} {}\r\n",
-        req.method(),
-        req.uri(),
-        http_version_str(req.version())
-    )
-    .unwrap();
-    for (name, value) in req.headers().iter() {
-        write!(out, "{}: ", name.as_str()).unwrap();
-        out.push_str(value.to_str().unwrap_or_default());
-        out.push_str("\r\n");
-    }
-    out.push_str("\r\n");
-    let mut bytes = out.into_bytes();
-    bytes.extend_from_slice(req.body());
-    bytes
-}
-
-/// Serialize an HTTP response (from `http` crate) into bytes suitable
-/// for embedding inside an ICAP message (status-line, headers, CRLFCRLF, body).
-pub fn serialize_http_response(resp: &HttpResponse<Vec<u8>>) -> Vec<u8> {
-    let mut out = String::new();
-    let code: StatusCode = resp.status();
-    write!(
-        out,
-        "{} {} {}\r\n",
-        http_version_str(resp.version()),
-        code.as_u16(),
-        code.canonical_reason().unwrap_or("")
-    )
-    .unwrap();
-    for (name, value) in resp.headers().iter() {
-        write!(out, "{}: ", name.as_str()).unwrap();
-        out.push_str(value.to_str().unwrap_or_default());
-        out.push_str("\r\n");
-    }
-    out.push_str("\r\n");
-    let mut bytes = out.into_bytes();
-    bytes.extend_from_slice(resp.body());
-    bytes
 }
 
 fn build_preview_and_chunks(
@@ -660,221 +677,10 @@ fn build_preview_and_chunks(
     }
 }
 
-async fn write_chunk(stream: &mut TcpStream, data: &[u8]) -> IcapResult<()> {
-    let mut buf = Vec::with_capacity(16 + data.len() + 2);
-    write!(&mut buf, "{:X}\r\n", data.len())?;
-    if !data.is_empty() {
-        buf.extend_from_slice(data);
-    }
-    buf.extend_from_slice(b"\r\n");
-    stream.write_all(&buf).await?;
-    Ok(())
-}
-
-fn write_chunk_into(out: &mut Vec<u8>, data: &[u8]) {
-    write!(out, "{:X}\r\n", data.len()).unwrap();
-    if !data.is_empty() {
-        out.extend_from_slice(data);
-    }
-    out.extend_from_slice(b"\r\n");
-}
-
-async fn read_icap_headers(stream: &mut TcpStream) -> IcapResult<(u16, Vec<u8>)> {
-    trace!("read_icap_headers: start");
-    let mut buf = Vec::new();
-    let mut tmp = [0u8; 4096];
-    loop {
-        let n = stream.read(&mut tmp).await?;
-        if n == 0 {
-            return Err("Unexpected EOF while reading ICAP headers".into());
-        }
-        buf.extend_from_slice(&tmp[..n]);
-        if let Some(_idx0) = find_double_crlf(&buf) {
-            // status line
-            let line_end = buf
-                .windows(2)
-                .position(|w| w == b"\r\n")
-                .unwrap_or(buf.len());
-            let status_line = &buf[..line_end];
-            let code = parse_status_code(status_line).ok_or("Failed to parse ICAP status code")?;
-            trace!("read_icap_headers: code={}", code);
-            return Ok((code, buf));
-        }
-    }
-}
-
-fn find_double_crlf(buf: &[u8]) -> Option<usize> {
-    buf.windows(4).position(|w| w == b"\r\n\r\n")
-}
-
-fn parse_status_code(line: &[u8]) -> Option<u16> {
-    let s = std::str::from_utf8(line).ok()?;
-    let mut parts = s.split_whitespace();
-    let _ver = parts.next()?; // ICAP/1.0
-    let code_str = parts.next()?; // 100, 200, 204, ...
-    code_str.parse::<u16>().ok()
-}
-
-fn headers_end(buf: &[u8]) -> Option<usize> {
-    find_double_crlf(buf).map(|i| i + 4)
-}
-
-// Returns (next_pos, is_final, size_of_chunk)
-fn parse_one_chunk(buf: &[u8], from: usize) -> Option<(usize, bool, usize)> {
-    let mut i = from;
-    while i + 1 < buf.len() {
-        if buf[i] == b'\r' && buf[i + 1] == b'\n' {
-            let size_line = &buf[from..i];
-            let size_hex = size_line.split(|&b| b == b';').next().unwrap_or(size_line);
-            let size_str = std::str::from_utf8(size_hex).ok()?.trim();
-            let size = usize::from_str_radix(size_str, 16).ok()?;
-            let after_size = i + 2;
-            let need = after_size + size + 2;
-            if buf.len() < need {
-                return None;
-            }
-            if size == 0 {
-                if buf.len() < after_size + 2 {
-                    return None;
-                }
-                return Some((after_size, true, 0));
-            }
-            return Some((need, false, size));
-        }
-        i += 1;
-    }
-    None
-}
-
-async fn read_chunked_to_end(
-    stream: &mut TcpStream,
-    buf: &mut Vec<u8>,
-    mut pos: usize,
-) -> IcapResult<()> {
-    loop {
-        match parse_one_chunk(buf, pos) {
-            Some((new_pos, done, _size)) => {
-                if done {
-                    pos = new_pos;
-                    while buf.len() < pos + 2 {
-                        let mut tmp = [0u8; 4096];
-                        let n = stream.read(&mut tmp).await?;
-                        if n == 0 {
-                            return Err("Unexpected EOF after zero chunk".into());
-                        }
-                        buf.extend_from_slice(&tmp[..n]);
-                    }
-                    if &buf[pos..pos + 2] != b"\r\n" {
-                        return Err("Invalid chunked terminator".into());
-                    }
-                    break;
-                } else {
-                    pos = new_pos;
-                }
-            }
-            None => {
-                let mut tmp = [0u8; 4096];
-                let n = stream.read(&mut tmp).await?;
-                if n == 0 {
-                    return Err("Unexpected EOF while reading ICAP chunked body".into());
-                }
-                buf.extend_from_slice(&tmp[..n]);
-            }
-        }
-    }
-    Ok(())
-}
-
-async fn read_icap_body_if_any(stream: &mut TcpStream, buf: &mut Vec<u8>) -> IcapResult<()> {
-    let Some(h_end) = headers_end(buf) else {
-        return Err("Corrupted ICAP headers".into());
-    };
-
-    let hdr_text = std::str::from_utf8(&buf[..h_end]).map_err(|_| "Invalid headers utf8")?;
-    let enc = crate::parser::parse_encapsulated_header(hdr_text);
-
-    let body_off_rel = enc.req_body.or(enc.res_body);
-    let hdr_off_rel = enc.req_hdr.or(enc.res_hdr);
-
-    if let Some(body_rel) = body_off_rel {
-        let body_abs = h_end + body_rel;
-
-        while buf.len() < body_abs {
-            let mut tmp = [0u8; 4096];
-            let n = stream.read(&mut tmp).await?;
-            if n == 0 {
-                return Err("Unexpected EOF before start of ICAP body".into());
-            }
-            buf.extend_from_slice(&tmp[..n]);
-        }
-
-        if let Some(hrel) = hdr_off_rel
-            && hrel <= body_rel
-            && h_end + body_rel <= buf.len()
-        {
-            let http_hdr_len = body_rel - hrel;
-            debug!(
-                "read_icap_body_if_any: embedded HTTP headers len={} (offset {}..{})",
-                http_hdr_len,
-                h_end + hrel,
-                h_end + body_rel
-            );
-        }
-
-        read_chunked_to_end(stream, buf, body_abs).await
-    } else if enc.null_body.is_some() {
-        Ok(())
-    } else {
-        Ok(())
-    }
-}
-
-fn trim_leading_slash(s: &str) -> &str {
-    s.strip_prefix('/').unwrap_or(s)
-}
-
-fn parse_authority(uri: &str) -> IcapResult<(String, u16)> {
-    let s = uri.trim();
-    let rest = s
-        .strip_prefix("icap://")
-        .ok_or("Authority URI must start with icap://")?;
-    let authority = rest.split('/').next().unwrap_or(rest);
-    let (host, port) = if let Some(i) = authority.rfind(':') {
-        let h = &authority[..i];
-        let p: u16 = authority[i + 1..].parse().map_err(|_| "Invalid port")?;
-        (h.to_string(), p)
-    } else {
-        (authority.to_string(), 1344)
-    };
-    if host.is_empty() {
-        return Err("Empty host in authority".into());
-    }
-    Ok((host, port))
-}
-
-fn append_to_allow(headers: &mut HeaderMap, code: &str) {
-    let name = HeaderName::from_static("allow");
-    match headers.get_mut(&name) {
-        Some(v) => {
-            let mut s = v.to_str().unwrap_or("").to_string();
-            if !s.split(',').any(|p| p.trim() == code) {
-                if !s.is_empty() {
-                    s.push_str(", ");
-                }
-                s.push_str(code);
-                *v = HeaderValue::from_str(&s).unwrap();
-            }
-        }
-        None => {
-            headers.insert(name, HeaderValue::from_str(code).unwrap());
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use http::{Request as HttpReq, Response as HttpResp, StatusCode, Version, header};
+    use http::{Request as HttpReq, Version, header};
 
     fn bytes_to_string_prefix(v: &[u8], n: usize) -> String {
         String::from_utf8_lossy(&v[..v.len().min(n)]).to_string()
@@ -916,19 +722,6 @@ mod tests {
     }
 
     #[test]
-    fn canon_icap_header_name_cases() {
-        assert_eq!(canon_icap_header_name("user-agent"), "User-Agent");
-        assert_eq!(canon_icap_header_name("preview"), "Preview");
-        assert_eq!(canon_icap_header_name("x-foo-bar"), "X-Foo-Bar");
-    }
-
-    #[test]
-    fn trim_leading_slash_works() {
-        assert_eq!(trim_leading_slash("/icap/test"), "icap/test");
-        assert_eq!(trim_leading_slash("icap/test"), "icap/test");
-    }
-
-    #[test]
     fn append_to_allow_no_duplicates() {
         let mut h = HeaderMap::new();
         append_to_allow(&mut h, "204");
@@ -938,73 +731,6 @@ mod tests {
         assert!(s.contains("204"));
         assert!(s.contains("206"));
         assert_eq!(s.matches("204").count(), 1);
-    }
-
-    #[test]
-    #[ignore]
-    fn serialize_http_request_basic() {
-        let req = HttpReq::builder()
-            .method("GET")
-            .uri("http://example.com/path?q=1")
-            .version(Version::HTTP_11)
-            .header("Host", "example.com")
-            .header("Accept", "*/*")
-            .body(Vec::<u8>::new())
-            .unwrap();
-
-        let bytes = serialize_http_request(&req);
-        let text = String::from_utf8(bytes).unwrap();
-        assert!(text.starts_with("GET http://example.com/path?q=1 HTTP/1.1\r\n"));
-        assert!(text.contains("Host: example.com\r\n"));
-        assert!(text.contains("\r\n\r\n"));
-    }
-
-    #[test]
-    #[ignore]
-    fn serialize_http_response_basic() {
-        let resp = HttpResp::builder()
-            .status(StatusCode::OK)
-            .version(Version::HTTP_11)
-            .header("Content-Type", "text/plain")
-            .body(b"ok".to_vec())
-            .unwrap();
-
-        let bytes = serialize_http_response(&resp);
-        let text = String::from_utf8(bytes).unwrap();
-        assert!(text.starts_with("HTTP/1.1 200 OK\r\n"));
-        assert!(text.contains("Content-Type: text/plain\r\n"));
-        assert!(text.ends_with("\r\nok"));
-    }
-
-    #[test]
-    fn split_http_bytes_with_and_without_body() {
-        let req = HttpReq::builder()
-            .method("POST")
-            .uri("/upload")
-            .version(Version::HTTP_11)
-            .header(header::HOST, "x")
-            .header("Content-Length", "4")
-            .body(b"DATA".to_vec())
-            .unwrap();
-        let raw = serialize_http_request(&req);
-        let (hdrs, body) = split_http_bytes(&raw);
-        assert!(
-            String::from_utf8(hdrs.clone())
-                .unwrap()
-                .ends_with("\r\n\r\n")
-        );
-        assert_eq!(body.unwrap(), b"DATA".to_vec());
-
-        let req2 = HttpReq::builder()
-            .method("HEAD")
-            .uri("/")
-            .version(Version::HTTP_11)
-            .header(header::HOST, "x")
-            .body(Vec::<u8>::new())
-            .unwrap();
-        let raw2 = serialize_http_request(&req2);
-        let (_hdrs2, body2) = split_http_bytes(&raw2);
-        assert!(body2.is_none());
     }
 
     #[test]

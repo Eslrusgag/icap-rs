@@ -27,9 +27,11 @@
 //! ```
 
 use crate::error::IcapResult;
+use crate::headers_end;
 use http::{HeaderMap, HeaderName, HeaderValue};
 use std::fmt;
 use std::str::FromStr;
+use tracing::{debug, trace};
 
 /// ICAP status codes as defined in RFC 3507.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,6 +65,27 @@ impl fmt::Display for StatusCode {
             StatusCode::GatewayTimeout504 => "504",
         };
         write!(f, "{s}")
+    }
+}
+
+impl TryFrom<u16> for StatusCode {
+    type Error = &'static str;
+
+    fn try_from(v: u16) -> Result<Self, Self::Error> {
+        Ok(match v {
+            100 => StatusCode::Continue100,
+            200 => StatusCode::Ok200,
+            204 => StatusCode::NoContent204,
+            206 => StatusCode::PartialContent206,
+            400 => StatusCode::BadRequest400,
+            404 => StatusCode::NotFound404,
+            405 => StatusCode::MethodNotAllowed405,
+            413 => StatusCode::RequestEntityTooLarge413,
+            500 => StatusCode::InternalServerError500,
+            503 => StatusCode::ServiceUnavailable503,
+            504 => StatusCode::GatewayTimeout504,
+            _ => return Err("Invalid ICAP status code"),
+        })
     }
 }
 
@@ -160,7 +183,7 @@ impl Response {
 
     /// Parse an ICAP response from raw bytes.
     pub fn from_raw(raw: &[u8]) -> IcapResult<Self> {
-        crate::parser::parse_icap_response(raw)
+        parse_icap_response(raw)
     }
 
     /// Get a header value by name.
@@ -268,4 +291,70 @@ impl ResponseBuilder {
     pub fn build(self) -> Response {
         self.response
     }
+}
+
+pub fn parse_icap_response(raw: &[u8]) -> IcapResult<Response> {
+    trace!("parse_icap_response: len={}", raw.len());
+    if raw.is_empty() {
+        return Err("Empty response".into());
+    }
+
+    let hdr_end = headers_end(raw).ok_or("ICAP response headers not complete")?;
+    let head = &raw[..hdr_end];
+    let head_str = std::str::from_utf8(head)?;
+    let mut lines = head_str.split("\r\n");
+
+    let status_line = lines.next().ok_or("Empty response")?;
+    let parts: Vec<&str> = status_line.split_whitespace().collect();
+    if parts.len() < 2 {
+        return Err("Invalid status line format".into());
+    }
+
+    let version = parts[0].to_string();
+
+    let status_code = match StatusCode::from_str(parts[1]) {
+        Ok(code) => code,
+        Err(_) => {
+            let code_num = parts[1].parse::<u16>().map_err(|_| "Invalid status code")?;
+            StatusCode::try_from(code_num)
+                .map_err(|_| format!("Unknown ICAP status code: {}", code_num))?
+        }
+    };
+
+    let status_text = if parts.len() > 2 {
+        parts[2..].join(" ")
+    } else {
+        String::new()
+    };
+
+    debug!(
+        "parse_icap_response: {} {} {}",
+        version, status_code, status_text
+    );
+
+    let mut headers = HeaderMap::new();
+    for line in lines {
+        if line.is_empty() {
+            break;
+        }
+        if let Some(colon) = line.find(':') {
+            let name = &line[..colon];
+            let value = line[colon + 1..].trim();
+            headers.insert(
+                HeaderName::from_bytes(name.as_bytes())?,
+                HeaderValue::from_str(value)?,
+            );
+        }
+    }
+
+    let body = raw[hdr_end..].to_vec();
+    trace!("parse_icap_response: body_len={}", body.len());
+
+    Ok(Response {
+        version,
+        status_code,
+        status_text,
+        headers,
+        body,
+    })
 }
