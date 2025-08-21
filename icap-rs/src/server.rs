@@ -112,7 +112,7 @@ impl Server {
             // Parse Encapsulated from the headers block.
             let hdr_text =
                 std::str::from_utf8(&buf[..h_end]).map_err(|_| "Invalid ICAP headers utf8")?;
-            let enc = parse_encapsulated_header(hdr_text);
+            let enc = crate::parser::parse_encapsulated_header(hdr_text);
 
             // Compute the end of this ICAP message in `buf`.
             // Start with the headers-only case; extend if there is a chunked body.
@@ -258,48 +258,6 @@ impl Default for ServerBuilder {
 /// Find the end of the ICAP header block.
 fn headers_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4)
-}
-
-/// Offsets parsed from the `Encapsulated` header.
-///
-/// Offsets are **relative to the start of the encapsulated area**
-/// (i.e., immediately after the ICAP headers CRLFCRLF).
-#[derive(Debug, Clone, Copy, Default)]
-struct EncapsulatedPositions {
-    req_hdr: Option<usize>,
-    res_hdr: Option<usize>,
-    req_body: Option<usize>,
-    res_body: Option<usize>,
-    null_body: Option<usize>,
-}
-
-/// Parse the `Encapsulated:` header into offsets.
-fn parse_encapsulated_header(headers_text: &str) -> EncapsulatedPositions {
-    let mut enc = EncapsulatedPositions::default();
-    for line in headers_text.lines() {
-        let Some((name, val)) = line.split_once(':') else {
-            continue;
-        };
-        if !name.trim().eq_ignore_ascii_case("Encapsulated") {
-            continue;
-        }
-        for part in val.split(',') {
-            let part = part.trim();
-            let mut it = part.split('=');
-            let key = it.next().unwrap_or("").trim().to_ascii_lowercase();
-            let off = it.next().and_then(|s| s.trim().parse::<usize>().ok());
-            match (key.as_str(), off) {
-                ("req-hdr", Some(o)) => enc.req_hdr = Some(o),
-                ("res-hdr", Some(o)) => enc.res_hdr = Some(o),
-                ("req-body", Some(o)) => enc.req_body = Some(o),
-                ("res-body", Some(o)) => enc.res_body = Some(o),
-                ("null-body", Some(o)) => enc.null_body = Some(o),
-                _ => {}
-            }
-        }
-        break;
-    }
-    enc
 }
 
 /// Parse a single ICAP chunk at `from`.
