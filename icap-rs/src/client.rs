@@ -26,6 +26,8 @@ use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tracing::trace;
 
+const MAX_HDR_BYTES: usize = 64 * 1024;
+
 /// High-level ICAP client with connection reuse and Preview negotiation.
 ///
 /// Construct via [`Client::builder()`] and send requests using [`Client::send`]
@@ -601,26 +603,79 @@ fn append_to_allow(headers: &mut HeaderMap, code: &str) {
 async fn read_icap_headers(stream: &mut TcpStream) -> IcapResult<(u16, Vec<u8>)> {
     let mut buf = Vec::new();
     let mut tmp = [0u8; 4096];
-    loop {
-        let n = stream.read(&mut tmp).await?;
-        if n == 0 {
-            return Err("Unexpected EOF while reading ICAP headers".into());
+
+    // Returns true if we already have the canonical end-of-headers marker.
+    let has_double_crlf = |b: &Vec<u8>| b.windows(4).any(|w| w == b"\r\n\r\n");
+    // Returns the position of the first CRLF (end of the status line).
+    let first_crlf_pos = |b: &Vec<u8>| b.windows(2).position(|w| w == b"\r\n");
+
+    // Helper: try to parse status code if we have at least one CRLF (status line complete).
+    let parse_status_if_possible = |b: &Vec<u8>| -> Result<Option<u16>, &'static str> {
+        if let Some(line_end) = first_crlf_pos(b) {
+            let status_line = &b[..line_end];
+            let s = std::str::from_utf8(status_line).map_err(|_| "bad utf8 in status line")?;
+            let mut parts = s.split_whitespace();
+            let _ver = parts.next(); // "ICAP/1.0"
+            let code_str = parts.next().ok_or("missing status code")?;
+            let code = code_str.parse::<u16>().map_err(|_| "bad status code")?;
+            Ok(Some(code))
+        } else {
+            Ok(None)
         }
-        buf.extend_from_slice(&tmp[..n]);
-        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-            let line_end = buf
-                .windows(2)
-                .position(|w| w == b"\r\n")
-                .unwrap_or(buf.len());
+    };
+
+    loop {
+        let n = stream
+            .read(&mut tmp)
+            .await
+            .map_err(|e| format!("I/O error reading ICAP headers: {e}").to_string())?;
+
+        if n == 0 {
+            // Peer closed before we saw \r\n\r\n.
+            // Some non-strict servers send only a single CRLF and then close.
+            // If we already have a status line, normalize to \r\n\r\n for compatibility.
+            if first_crlf_pos(&buf).is_some() && !has_double_crlf(&buf) {
+                buf.extend_from_slice(b"\r\n"); // synthesize the missing empty line
+            } else {
+                return Err("Unexpected EOF while reading ICAP headers".into());
+            }
+        } else {
+            buf.extend_from_slice(&tmp[..n]);
+        }
+
+        // 1) Fast path: canonical end-of-headers found.
+        if has_double_crlf(&buf) {
+            let line_end = first_crlf_pos(&buf).unwrap_or(buf.len());
             let status_line = &buf[..line_end];
+
             let code = {
                 let s = std::str::from_utf8(status_line).map_err(|_| "bad utf8 in status line")?;
                 let mut parts = s.split_whitespace();
-                let _ver = parts.next();
+                let _ver = parts.next(); // "ICAP/1.0"
                 let code_str = parts.next().ok_or("missing status code")?;
                 code_str.parse::<u16>().map_err(|_| "bad status code")?
             };
+
             return Ok((code, buf));
+        }
+
+        // 2) Lenient error handling:
+        // If we have a complete status line and it's an error (4xx/5xx),
+        // some servers send only one CRLF and keep the connection open.
+        // To avoid hanging forever, accept a single-CRLF terminator for error responses
+        // by normalizing it to \r\n\r\n and returning immediately.
+        if let Some(code) = parse_status_if_possible(&buf).map_err(|e| e.to_string())? {
+            if code >= 400 && code <= 599 {
+                if !has_double_crlf(&buf) {
+                    buf.extend_from_slice(b"\r\n"); // synthesize the missing empty line
+                }
+                return Ok((code, buf));
+            }
+        }
+
+        if buf.len() > MAX_HDR_BYTES {
+            // Defensive bound: prevent unbounded growth if peer never terminates headers.
+            return Err("ICAP headers too large".into());
         }
     }
 }
@@ -681,6 +736,8 @@ fn build_preview_and_chunks(
 mod tests {
     use super::*;
     use http::{Request as HttpReq, Version, header};
+    use tokio::net::TcpListener;
+    use tokio::time::timeout;
 
     fn bytes_to_string_prefix(v: &[u8], n: usize) -> String {
         String::from_utf8_lossy(&v[..v.len().min(n)]).to_string()
@@ -933,5 +990,123 @@ mod tests {
         let wire = c.get_request_wire(&req, false).unwrap();
         let head = extract_headers_text(&wire);
         assert!(find_header_line(&head, "User-Agent").is_some());
+    }
+
+    async fn connect_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        (client, server)
+    }
+
+    /// Server helper to write bytes and optionally keep the socket open (no close).
+    async fn server_write_and_optionally_hang(
+        mut server: TcpStream,
+        bytes: &[u8],
+        keep_open_ms: u64,
+    ) {
+        server.write_all(bytes).await.unwrap();
+        server.flush().await.unwrap();
+        if keep_open_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(keep_open_ms)).await;
+        } else {
+            // drop closes the socket
+        }
+    }
+
+    /// 1) 404 + single CRLF, connection kept open.
+    /// Expectation: read_icap_headers returns quickly with code=404 and buffer normalized to CRLFCRLF.
+    #[tokio::test]
+    async fn error_404_single_crlf_kept_open_returns_quickly() {
+        let (mut client, server) = connect_pair().await;
+
+        // Spawn server: send status + single CRLF and keep connection open for a while.
+        tokio::spawn(server_write_and_optionally_hang(
+            server,
+            b"ICAP/1.0 404 ICAP Service not found\r\n",
+            1500, // keep open long enough; client must not wait for this
+        ));
+
+        // Client must finish fast; we protect with a small timeout.
+        let (code, buf) = timeout(Duration::from_millis(300), read_icap_headers(&mut client))
+            .await
+            .expect("client hung on single-CRLF 404")
+            .expect("read_icap_headers failed");
+
+        assert_eq!(code, 404, "status code should be 404");
+        // Buffer should end with CRLFCRLF after normalization.
+        assert!(
+            buf.ends_with(b"\r\n\r\n"),
+            "buffer should be normalized to CRLFCRLF"
+        );
+    }
+
+    /// 2) 404 with headers and proper CRLFCRLF.
+    #[tokio::test]
+    async fn error_404_with_headers_and_double_crlf() {
+        let (mut client, server) = connect_pair().await;
+
+        let wire = b"ICAP/1.0 404 ICAP Service not found\r\nISTag: x\r\nDate: Thu, 21 Aug 2025 17:00:00 GMT\r\n\r\n";
+        tokio::spawn(server_write_and_optionally_hang(server, wire, 0));
+
+        let (code, buf) = timeout(Duration::from_millis(300), read_icap_headers(&mut client))
+            .await
+            .expect("client hung on proper 404")
+            .expect("read_icap_headers failed");
+
+        assert_eq!(code, 404);
+        assert!(buf.ends_with(b"\r\n\r\n"));
+        let text = String::from_utf8(buf.clone()).unwrap();
+        assert!(text.contains("ISTag: x"));
+        assert!(text.contains("Date: "));
+    }
+
+    /// 3) 404 with headers but EOF before CRLFCRLF.
+    /// Expectation: method normalizes on EOF and returns.
+    #[tokio::test]
+    async fn error_404_headers_then_eof_before_double_crlf() {
+        let (mut client, server) = connect_pair().await;
+
+        // Status + one header + CRLF, then EOF (socket close)
+        let wire = b"ICAP/1.0 404 ICAP Service not found\r\nISTag: y\r\n";
+        tokio::spawn(server_write_and_optionally_hang(server, wire, 0)); // close immediately
+
+        let (code, buf) = timeout(Duration::from_millis(300), read_icap_headers(&mut client))
+            .await
+            .expect("client hung on 404 with EOF")
+            .expect("read_icap_headers failed");
+
+        assert_eq!(code, 404);
+        assert!(
+            buf.ends_with(b"\r\n\r\n"),
+            "buffer should be normalized to CRLFCRLF on EOF"
+        );
+        let text = String::from_utf8(buf.clone()).unwrap();
+        assert!(
+            text.contains("ISTag: y"),
+            "header bytes should be preserved"
+        );
+    }
+
+    /// 4) Non-error: 200 OK + single CRLF, connection kept open.
+    /// Expectation: in strict mode for non-errors, method should NOT return quickly (we expect timeout).
+    #[tokio::test]
+    async fn non_error_200_single_crlf_kept_open_times_out() {
+        let (mut client, server) = connect_pair().await;
+
+        tokio::spawn(server_write_and_optionally_hang(
+            server,
+            b"ICAP/1.0 200 OK\r\n",
+            1200, // keep open; client should wait for \r\n\r\n and thus time out in test
+        ));
+
+        // We expect timeout here because the parser should wait for CRLFCRLF on non-error.
+        let res = timeout(Duration::from_millis(250), read_icap_headers(&mut client)).await;
+        assert!(
+            res.is_err(),
+            "non-error single-CRLF should not complete; expected timeout"
+        );
     }
 }
