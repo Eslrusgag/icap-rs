@@ -32,7 +32,7 @@
 //! ```
 
 use crate::error::IcapResult;
-use crate::icap::find_double_crlf;
+use crate::find_double_crlf;
 use http::{
     HeaderMap, HeaderName, HeaderValue, Request as HttpRequest, Response as HttpResponse,
     StatusCode as HttpStatus, Version,
@@ -198,7 +198,7 @@ pub(crate) fn parse_icap_request(data: &[u8]) -> IcapResult<Request> {
     let rest = &data[hdr_end..];
     let embedded = if rest.is_empty() {
         None
-    } else if let Some(http_hdr_end) = crate::parser::icap::find_double_crlf(rest) {
+    } else if let Some(http_hdr_end) = find_double_crlf(rest) {
         let http_head = &rest[..http_hdr_end];
         let http_head_str = std::str::from_utf8(http_head)?;
         let mut hlines = http_head_str.split("\r\n");
@@ -290,4 +290,230 @@ pub(crate) fn parse_icap_request(data: &[u8]) -> IcapResult<Request> {
         allow_206,
         preview_ieof: false,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http::{Request as HttpRequest, Response as HttpResponse, StatusCode, Version};
+
+    fn icap_bytes(s: &str) -> Vec<u8> {
+        s.as_bytes().to_vec()
+    }
+
+    #[test]
+    fn builder_creates_basic_requests() {
+        let o = Request::options("icap/test");
+        assert!(o.method.eq_ignore_ascii_case("OPTIONS"));
+        assert_eq!(o.service, "icap/test");
+        assert!(!o.is_mod());
+
+        let r = Request::reqmod("svc");
+        assert!(r.method.eq_ignore_ascii_case("REQMOD"));
+        assert!(r.is_mod());
+
+        let s = Request::respmod("svc");
+        assert!(s.method.eq_ignore_ascii_case("RESPMOD"));
+        assert!(s.is_mod());
+    }
+
+    #[test]
+    fn builder_flags_preview_allow() {
+        let req = Request::reqmod("icap/test")
+            .allow_204(true)
+            .allow_206(true)
+            .preview(16)
+            .preview_ieof(true);
+
+        assert!(req.allow_204);
+        assert!(req.allow_206);
+        assert_eq!(req.preview_size, Some(16));
+        assert!(req.preview_ieof);
+    }
+
+    #[test]
+    fn builder_sets_and_overrides_headers() {
+        let req = Request::options("icap/test")
+            .icap_header("Host", "icap.example.org")
+            .icap_header("Host", "icap2.example.org");
+
+        assert_eq!(
+            req.icap_headers.get("Host").unwrap(),
+            &HeaderValue::from_static("icap2.example.org")
+        );
+    }
+
+    #[test]
+    fn builder_embeds_http_req_and_resp() {
+        let http_req = HttpRequest::builder()
+            .method("POST")
+            .uri("/x")
+            .version(Version::HTTP_11)
+            .body(Vec::<u8>::new())
+            .unwrap();
+
+        let req = Request::reqmod("svc").with_http_request(http_req);
+        matches!(req.embedded, Some(EmbeddedHttp::Req(_)));
+
+        let http_resp = HttpResponse::builder()
+            .status(StatusCode::OK)
+            .version(Version::HTTP_11)
+            .body(Vec::<u8>::new())
+            .unwrap();
+
+        let req2 = Request::respmod("svc").with_http_response(http_resp);
+        matches!(req2.embedded, Some(EmbeddedHttp::Resp(_)));
+    }
+
+    #[test]
+    fn parse_minimal_options_without_http() {
+        let raw = icap_bytes(
+            "OPTIONS icap://icap.example.org/icap/test ICAP/1.0\r\n\
+             Host: icap.example.org\r\n\
+             \r\n",
+        );
+        let r = parse_icap_request(&raw).expect("parse");
+        assert!(r.method.eq_ignore_ascii_case("OPTIONS"));
+        assert_eq!(r.service, "test");
+        assert_eq!(
+            r.icap_headers.get("Host").unwrap(),
+            &HeaderValue::from_static("icap.example.org")
+        );
+        assert!(r.embedded.is_none());
+        assert!(!r.allow_204);
+        assert!(!r.allow_206);
+        assert_eq!(r.preview_size, None);
+    }
+
+    #[test]
+    fn parse_reqmod_with_allow_and_preview() {
+        let raw = icap_bytes(
+            "REQMOD icap://icap.example.org/icap/test ICAP/1.0\r\n\
+             Host: icap.example.org\r\n\
+             Allow: 204, 206\r\n\
+             Preview: 128\r\n\
+             \r\n",
+        );
+        let r = parse_icap_request(&raw).expect("parse");
+        assert!(r.method.eq_ignore_ascii_case("REQMOD"));
+        assert!(r.allow_204);
+        assert!(r.allow_206);
+        assert_eq!(r.preview_size, Some(128));
+    }
+
+    #[test]
+    fn parse_reqmod_with_embedded_http_request_and_body() {
+        let raw = icap_bytes(
+            "REQMOD icap://icap.example.org/icap/test ICAP/1.0\r\n\
+             Host: icap.example.org\r\n\
+             Encapsulated: req-hdr=0\r\n\
+             \r\n\
+             GET / HTTP/1.1\r\n\
+             Host: example.com\r\n\
+             \r\n\
+             body...",
+        );
+        let r = parse_icap_request(&raw).expect("parse");
+        match r.embedded {
+            Some(EmbeddedHttp::Req(ref req)) => {
+                assert_eq!(req.method(), "GET");
+                assert_eq!(req.uri(), "/");
+                assert_eq!(
+                    req.headers().get("Host").unwrap(),
+                    &HeaderValue::from_static("example.com")
+                );
+                assert_eq!(req.body(), b"body...");
+            }
+            _ => panic!("expected embedded HTTP request"),
+        }
+    }
+
+    #[test]
+    fn parse_respmod_with_embedded_http_response_and_body() {
+        let raw = icap_bytes(
+            "RESPMOD icap://icap.example.org/icap/test ICAP/1.0\r\n\
+             Host: icap.example.org\r\n\
+             Encapsulated: res-hdr=0\r\n\
+             \r\n\
+             HTTP/1.1 200 OK\r\n\
+             Content-Type: text/plain\r\n\
+             \r\n\
+             hello",
+        );
+        let r = parse_icap_request(&raw).expect("parse");
+        match r.embedded {
+            Some(EmbeddedHttp::Resp(ref resp)) => {
+                assert_eq!(resp.status(), StatusCode::OK);
+                assert_eq!(
+                    resp.headers().get("Content-Type").unwrap(),
+                    &HeaderValue::from_static("text/plain")
+                );
+                assert_eq!(resp.body(), b"hello");
+            }
+            _ => panic!("expected embedded HTTP response"),
+        }
+    }
+
+    #[test]
+    fn parse_errors_on_incomplete_headers() {
+        let raw = icap_bytes("REQMOD icap://h/s ICAP/1.0\r\nHost: h\r\n"); // no \r\n\r\n
+        let err = parse_icap_request(&raw).unwrap_err();
+        assert!(
+            err.to_string().contains("not complete"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_errors_on_bad_request_line() {
+        // Missing icap-uri and version
+        let raw = icap_bytes("REQMOD\r\n\r\n");
+        let err = parse_icap_request(&raw).unwrap_err();
+        assert!(
+            err.to_string().contains("Invalid request line")
+                || err.to_string().contains("Empty request"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_ignores_malformed_header_line_without_colon() {
+        let raw = icap_bytes(
+            "OPTIONS icap://icap.example.org/icap/test ICAP/1.0\r\n\
+             Host: icap.example.org\r\n\
+             ThisIsBadHeader\r\n\
+             \r\n",
+        );
+        let r = parse_icap_request(&raw).expect("parse");
+        assert_eq!(
+            r.icap_headers.get("Host").unwrap(),
+            &HeaderValue::from_static("icap.example.org")
+        );
+        // Just ensure we didn't panic and header map remains valid.
+    }
+
+    #[test]
+    fn parse_preview_not_a_number_is_ignored() {
+        let raw = icap_bytes(
+            "REQMOD icap://icap.example.org/icap/test ICAP/1.0\r\n\
+             Host: icap.example.org\r\n\
+             Preview: notanumber\r\n\
+             \r\n",
+        );
+        let r = parse_icap_request(&raw).expect("parse");
+        assert_eq!(r.preview_size, None);
+    }
+
+    #[test]
+    fn parse_allow_whitespace_variants() {
+        let raw = icap_bytes(
+            "REQMOD icap://icap.example.org/icap/test ICAP/1.0\r\n\
+             Host: icap.example.org\r\n\
+             Allow:   204 ,    206 \r\n\
+             \r\n",
+        );
+        let r = parse_icap_request(&raw).expect("parse");
+        assert!(r.allow_204);
+        assert!(r.allow_206);
+    }
 }

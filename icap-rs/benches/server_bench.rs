@@ -61,9 +61,6 @@ async fn benchmark_handler(_req: icap_rs::request::Request) -> Result<Response, 
         .add_header("ISTag", "\"benchmark-server-v1.0\""))
 }
 
-// ----------------------------------------------------------------------------
-// helpers
-
 fn make_runtime() -> tokio::runtime::Runtime {
     Builder::new_multi_thread().enable_all().build().unwrap()
 }
@@ -76,8 +73,6 @@ fn make_client() -> Client {
         .default_header("User-Agent", "rs-icap-bench/0.1.0")
         .build()
 }
-
-// benches
 
 fn bench_server_throughput(c: &mut Criterion) {
     let rt = make_runtime();

@@ -3,11 +3,6 @@ use std::io::Write;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-/// Find end of ICAP header block (position after CRLFCRLF).
-pub fn headers_end(buf: &[u8]) -> Option<usize> {
-    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4)
-}
-
 /// Parse a single chunk: returns (next_pos, is_final_zero, size).
 pub fn parse_one_chunk(buf: &[u8], from: usize) -> Option<(usize, bool, usize)> {
     let mut i = from;

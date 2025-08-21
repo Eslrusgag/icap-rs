@@ -48,23 +48,6 @@ pub fn parse_encapsulated_header(headers_text: &str) -> Encapsulated {
     enc
 }
 
-#[inline]
-pub(crate) fn find_double_crlf(buf: &[u8]) -> Option<usize> {
-    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4)
-}
-
-pub fn extract_service_name(uri: &str) -> IcapResult<String> {
-    let s = uri
-        .rsplit('/')
-        .next()
-        .ok_or("Invalid ICAP URI (no /service)")?;
-    if s.is_empty() {
-        Err("Empty service name".into())
-    } else {
-        Ok(s.to_string())
-    }
-}
-
 pub fn http_version_str(v: Version) -> &'static str {
     match v {
         Version::HTTP_09 => "HTTP/0.9",
