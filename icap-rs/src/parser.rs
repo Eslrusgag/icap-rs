@@ -378,25 +378,23 @@ pub fn serialize_icap_response(resp: &Response) -> IcapResult<Vec<u8>> {
 
     let is_http_embedded = encapsulated.contains("req-hdr=") || encapsulated.contains("res-hdr=");
 
-    if is_http_embedded {
-        if let Some(pos) = resp.body.windows(4).position(|w| w == b"\r\n\r\n") {
-            let http_hdr_end = pos + 4;
+    if is_http_embedded && let Some(pos) = resp.body.windows(4).position(|w| w == b"\r\n\r\n") {
+        let http_hdr_end = pos + 4;
 
-            // 1) raw HTTP headers
-            out.extend_from_slice(&resp.body[..http_hdr_end]);
+        // 1) raw HTTP headers
+        out.extend_from_slice(&resp.body[..http_hdr_end]);
 
-            // 2) HTTP body → ICAP chunked
-            let http_body = &resp.body[http_hdr_end..];
-            if !http_body.is_empty() {
-                let size_line = format!("{:X}\r\n", http_body.len());
-                out.extend_from_slice(size_line.as_bytes());
-                out.extend_from_slice(http_body);
-                out.extend_from_slice(b"\r\n0\r\n\r\n");
-            } else {
-                out.extend_from_slice(b"0\r\n\r\n");
-            }
-            return Ok(out);
+        // 2) HTTP body → ICAP chunked
+        let http_body = &resp.body[http_hdr_end..];
+        if !http_body.is_empty() {
+            let size_line = format!("{:X}\r\n", http_body.len());
+            out.extend_from_slice(size_line.as_bytes());
+            out.extend_from_slice(http_body);
+            out.extend_from_slice(b"\r\n0\r\n\r\n");
+        } else {
+            out.extend_from_slice(b"0\r\n\r\n");
         }
+        return Ok(out);
     }
 
     out.extend_from_slice(&resp.body);

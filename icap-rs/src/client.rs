@@ -28,6 +28,11 @@ use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tracing::{debug, trace};
 
+/// High-level ICAP client with connection reuse and Preview negotiation.
+///
+/// Construct via [`Client::builder()`] and send requests using [`Client::send`]
+/// or [`Client::send_streaming`]. You can also generate the exact wire bytes
+/// without sending using [`Client::get_request`] / [`Client::get_request_wire`].
 #[derive(Debug, Clone)]
 pub struct Client {
     inner: Arc<ClientRef>,
@@ -44,13 +49,21 @@ struct ClientRef {
     idle_conn: Mutex<Option<TcpStream>>,
 }
 
+/// Policy for connection lifetime management.
+///
+/// - [`ConnectionPolicy::Close`] — close the TCP connection after every request.
+/// - [`ConnectionPolicy::KeepAlive`] — keep a single idle connection and reuse it.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub enum ConnectionPolicy {
+    /// Close the connection after each request (no reuse).
     #[default]
     Close,
+    /// Reuse a single idle connection when possible.
     KeepAlive,
 }
 
+/// Builder for [`Client`]. Use it to configure host/port, headers, keep-alive,
+/// read timeouts, and other options before creating a client instance.
 #[derive(Debug)]
 pub struct ClientBuilder {
     host: Option<String>,
@@ -62,27 +75,53 @@ pub struct ClientBuilder {
 }
 
 impl ClientBuilder {
+    /// Create a new `ClientBuilder` with default settings.
+    ///
+    /// By default:
+    /// - `ConnectionPolicy` is `Close`;
+    /// - `User-Agent` header is set during `build()` if not provided;
+    /// - no host/port are set until you call [`ClientBuilder::host`] / [`ClientBuilder::port`]
+    ///   or [`ClientBuilder::from_uri`].
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Set ICAP server host (hostname or IP).
     pub fn host(mut self, host: &str) -> Self {
         self.host = Some(host.to_string());
         self
     }
+
+    /// Set ICAP server TCP port (default 1344 if not set).
     pub fn port(mut self, port: u16) -> Self {
         self.port = Some(port);
         self
     }
+
+    /// Override the `Host:` header value sent in ICAP requests.
+    ///
+    /// This does not change the actual remote address used for the TCP connection,
+    /// only the value of the `Host` ICAP header.
     pub fn host_override(mut self, host: &str) -> Self {
         self.host_override = Some(host.to_string());
         self
     }
+
+    /// Insert a default ICAP header that will be sent with every request.
+    ///
+    /// If the same header is set later on a particular request, that per-request
+    /// value takes precedence.
     pub fn default_header(mut self, name: &str, value: &str) -> Self {
         let n: HeaderName = name.parse().expect("invalid header name");
         let v: HeaderValue = HeaderValue::from_str(value).expect("invalid header value");
         self.default_headers.insert(n, v);
         self
     }
+
+    /// Enable or disable connection reuse (keep-alive).
+    ///
+    /// When enabled, the client will store a single idle connection and reuse it
+    /// for subsequent requests, reducing handshake overhead.
     pub fn keep_alive(mut self, yes: bool) -> Self {
         self.connection_policy = if yes {
             ConnectionPolicy::KeepAlive
@@ -91,21 +130,35 @@ impl ClientBuilder {
         };
         self
     }
+
+    /// Set a read timeout for network operations.
+    ///
+    /// If `None`, operations have no explicit read timeout and rely on OS defaults.
     pub fn read_timeout(mut self, dur: Option<Duration>) -> Self {
         self.read_timeout = dur;
         self
     }
+
+    /// Configure the builder from an ICAP authority URI (`icap://host[:port]`).
+    ///
+    /// This extracts `host` and `port` for use in the TCP connection. The service path,
+    /// if present in the URI, is ignored here and should be set on the request itself.
     pub fn from_uri(mut self, uri: &str) -> IcapResult<Self> {
         let (host, port) = parse_authority(uri)?;
         self.host = Some(host);
         self.port = Some(port);
         Ok(self)
     }
+
+    /// Build a [`Client`] from this builder.
+    ///
+    /// # Panics
+    /// Panics if the host is not set prior to calling `build()`.
     pub fn build(self) -> Client {
         let host = self.host.expect("ClientBuilder: host is required");
         let port = self.port.unwrap_or(1344);
         let mut default_headers = self.default_headers;
-        //ToDo set version on CARGO_PKG
+        // ToDo: set version from CARGO_PKG_* MB
         if !default_headers.contains_key("user-agent") {
             default_headers.insert(
                 HeaderName::from_static("user-agent"),
@@ -145,17 +198,26 @@ impl Default for ClientBuilder {
 }
 
 impl Client {
+    /// Create a new [`ClientBuilder`] to configure and build a [`Client`].
     pub fn builder() -> ClientBuilder {
         ClientBuilder::default()
     }
 
-    /// Returns raw ICAP request bytes (for debugging).
+    /// Return the raw ICAP request as wire-format bytes (no I/O).
+    ///
+    /// Useful for debugging or for printing what would be sent without
+    /// actually opening a connection.
     pub fn get_request(&self, req: &Request) -> IcapResult<Vec<u8>> {
         let built = self.build_icap_request_bytes(req, false, req.preview_ieof)?;
         Ok(built.bytes)
     }
 
-    /// Send an ICAP request with full in-memory body (embedded HTTP).
+    /// Send an ICAP request with a embedded HTTP message.
+    ///
+    /// This method:
+    /// - writes ICAP headers and the embedded HTTP headers/body,
+    /// - handles `Preview` and `100 Continue` negotiation when applicable,
+    /// - and returns the parsed ICAP [`Response`].
     pub async fn send(&self, req: &Request) -> IcapResult<Response> {
         trace!(
             "client.send: method={}, service={}",
@@ -190,7 +252,7 @@ impl Client {
         // Handle 100-Continue for Preview
         if built.expect_continue {
             let (code, hdr_buf) = read_icap_headers(&mut stream).await?;
-            if code == 100 {
+            return if code == 100 {
                 if let Some(rest) = built.remaining_body
                     && !rest.is_empty()
                 {
@@ -202,14 +264,14 @@ impl Client {
                 let (_code2, mut response) = read_icap_headers(&mut stream).await?;
                 read_icap_body_if_any(&mut stream, &mut response).await?;
                 maybe_put_back(self.inner.connection_policy, &self.inner.idle_conn, stream).await;
-                return parser::parse_icap_response(&response);
+                parser::parse_icap_response(&response)
             } else {
                 // server decided final without continue (e.g., 204)
                 let mut response = hdr_buf;
                 read_icap_body_if_any(&mut stream, &mut response).await?;
                 maybe_put_back(self.inner.connection_policy, &self.inner.idle_conn, stream).await;
-                return parser::parse_icap_response(&response);
-            }
+                parser::parse_icap_response(&response)
+            };
         }
 
         // No preview — read final
@@ -219,7 +281,10 @@ impl Client {
         parser::parse_icap_response(&response)
     }
 
-    /// Send ICAP request with streaming body (file → chunks after 100 Continue).
+    /// Send an ICAP request where the embedded HTTP body is streamed from disk.
+    ///
+    /// Use this for large payloads: the file is sent in chunks after a `100 Continue`
+    /// is received from the server.
     pub async fn send_streaming<P: AsRef<Path>>(
         &self,
         req: &Request,
@@ -287,9 +352,10 @@ impl Client {
         }
     }
 
-    /// Build ICAP request as it would appear on the wire.
-    /// If `streaming=true` or `Preview:0`, Encapsulated contains `*-body`
-    /// and a leading zero-chunk is appended to close the preview.
+    /// Return the full ICAP request as it would appear on the wire (no I/O).
+    ///
+    /// If `streaming` is `true` or the request uses `Preview: 0`, the `Encapsulated`
+    /// header will include `*-body`, and a zero-chunk will be appended.
     pub fn get_request_wire(&self, req: &Request, streaming: bool) -> IcapResult<Vec<u8>> {
         let built = self.build_icap_request_bytes(
             req,
@@ -309,8 +375,9 @@ impl Client {
 
     /// Build ICAP request bytes (headers + embedded HTTP + initial preview/chunks).
     ///
-    /// - `force_has_body=true` → Encapsulated will contain `*-body` even if body is currently empty.
-    /// - `preview0_ieof=true` → when `Preview: 0`, use `0; ieof` (fast-204 hint).
+    /// - `force_has_body = true` → `Encapsulated` will contain `*-body`
+    ///   even if the current body is empty.
+    /// - `preview0_ieof = true` → when `Preview: 0`, use `0; ieof` (fast-204 hint).
     fn build_icap_request_bytes(
         &self,
         req: &Request,
@@ -501,7 +568,9 @@ fn split_http_bytes(raw: &[u8]) -> (Vec<u8>, Option<Vec<u8>>) {
     }
 }
 
-pub fn serialize_http_request(req: &HttpRequest<Vec<u8>>) -> Vec<u8> {
+/// Serialize an HTTP request (from `http` crate) into bytes suitable
+/// for embedding inside an ICAP message (start-line, headers, CRLFCRLF, body).
+fn serialize_http_request(req: &HttpRequest<Vec<u8>>) -> Vec<u8> {
     let mut out = String::new();
     write!(
         out,
@@ -522,6 +591,8 @@ pub fn serialize_http_request(req: &HttpRequest<Vec<u8>>) -> Vec<u8> {
     bytes
 }
 
+/// Serialize an HTTP response (from `http` crate) into bytes suitable
+/// for embedding inside an ICAP message (status-line, headers, CRLFCRLF, body).
 pub fn serialize_http_response(resp: &HttpResponse<Vec<u8>>) -> Vec<u8> {
     let mut out = String::new();
     let code: StatusCode = resp.status();
@@ -591,7 +662,7 @@ fn build_preview_and_chunks(
 
 async fn write_chunk(stream: &mut TcpStream, data: &[u8]) -> IcapResult<()> {
     let mut buf = Vec::with_capacity(16 + data.len() + 2);
-    write!(&mut buf, "{:X}\r\n", data.len()).unwrap();
+    write!(&mut buf, "{:X}\r\n", data.len())?;
     if !data.is_empty() {
         buf.extend_from_slice(data);
     }
@@ -853,8 +924,8 @@ mod tests {
 
     #[test]
     fn trim_leading_slash_works() {
-        assert_eq!(trim_leading_slash("/icap/full"), "icap/full");
-        assert_eq!(trim_leading_slash("icap/full"), "icap/full");
+        assert_eq!(trim_leading_slash("/icap/test"), "icap/test");
+        assert_eq!(trim_leading_slash("icap/test"), "icap/test");
     }
 
     #[test]
@@ -1029,7 +1100,7 @@ mod tests {
             .body(b"PAYLOAD".to_vec())
             .unwrap();
 
-        let req = Request::reqmod("icap/full")
+        let req = Request::reqmod("icap/test")
             .preview(4)
             .allow_204(true)
             .icap_header("x-foo", "bar")
@@ -1062,7 +1133,7 @@ mod tests {
             .body(Vec::<u8>::new())
             .unwrap();
 
-        let req = Request::reqmod("icap/full")
+        let req = Request::reqmod("icap/test")
             .preview(0)
             .with_http_request(http);
 
@@ -1101,7 +1172,7 @@ mod tests {
             .body(Vec::<u8>::new())
             .unwrap();
 
-        let req = Request::reqmod("icap/full")
+        let req = Request::reqmod("icap/test")
             .preview(0)
             .with_http_request(http);
 

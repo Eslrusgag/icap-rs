@@ -21,7 +21,7 @@
 //!     .body(Vec::new())
 //!     .unwrap();
 //!
-//! let icap_req = Request::reqmod("icap/full")
+//! let icap_req = Request::reqmod("icap/test")
 //!     .allow_204(true)
 //!     .preview(4)
 //!     .with_http_request(http_req);
@@ -50,7 +50,7 @@ pub enum EmbeddedHttp {
 pub struct Request {
     /// ICAP method: `"OPTIONS" | "REQMOD" | "RESPMOD"`.
     pub method: String,
-    /// Service path like `"icap/full"` or `"respmod"`. Leading slash is allowed.
+    /// Service path like `"icap/test"` or `"respmod"`. Leading slash is allowed.
     pub service: String,
     /// ICAP headers (case-insensitive).
     pub icap_headers: HeaderMap,
@@ -68,10 +68,10 @@ pub struct Request {
 
 impl Request {
     /// Create a new ICAP request.
-    pub fn new(method: &str, service: &str) -> Self {
+    pub fn new(method: impl Into<String>, service: impl Into<String>) -> Self {
         Self {
-            method: method.to_string(),
-            service: service.to_string(),
+            method: method.into(),
+            service: service.into(),
             icap_headers: HeaderMap::new(),
             embedded: None,
             preview_size: None,
@@ -81,14 +81,16 @@ impl Request {
         }
     }
 
-    /// Convenience constructors.
-    pub fn options(service: &str) -> Self {
+    ///Construct Options Request.
+    pub fn options(service: impl Into<String>) -> Self {
         Self::new("OPTIONS", service)
     }
-    pub fn reqmod(service: &str) -> Self {
+    ///Construct ReqMod Request.
+    pub fn reqmod(service: impl Into<String>) -> Self {
         Self::new("REQMOD", service)
     }
-    pub fn respmod(service: &str) -> Self {
+    ///Construct RespMod Request.
+    pub fn respmod(service: impl Into<String>) -> Self {
         Self::new("RESPMOD", service)
     }
 
