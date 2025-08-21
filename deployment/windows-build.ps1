@@ -7,7 +7,7 @@ $buildProfile = "release"
 $deploymentDir = $scriptDir
 $buildedDir = Join-Path $deploymentDir "builded"
 $deploymentSenderPath = "C:\Users\warka\Desktop\rust\bins\deployment-sender.exe"
-$logFile = Join-Path $deploymentDir "build-output.log"
+$logFile = Join-Path $buildedDir "build-output.log"
 
 function Get-CargoRoot([string]$startDir)
 {
