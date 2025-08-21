@@ -10,7 +10,7 @@
 use crate::error::IcapResult;
 use crate::parser::parse_encapsulated_header;
 use crate::parser::{
-    canon_icap_header, headers_end, read_chunked_to_end, serialize_http_request,
+    canon_icap_header, find_double_crlf, read_chunked_to_end, serialize_http_request,
     serialize_http_response, split_http_bytes, write_chunk, write_chunk_into,
 };
 use crate::request::{EmbeddedHttp, Request};
@@ -534,7 +534,7 @@ struct BuiltIcap {
 }
 
 async fn read_icap_body_if_any(stream: &mut TcpStream, buf: &mut Vec<u8>) -> IcapResult<()> {
-    let Some(h_end) = headers_end(buf) else {
+    let Some(h_end) = find_double_crlf(buf) else {
         return Err("Corrupted ICAP headers".into());
     };
 

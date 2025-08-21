@@ -98,7 +98,7 @@ fn bench_wire_building(c: &mut Criterion) {
                 .body(b"PAYLOAD".to_vec())
                 .unwrap();
 
-            let icap = IcapRequest::reqmod("icap/full")
+            let icap = IcapRequest::reqmod("icap/test")
                 .preview(4)
                 .allow_204(true)
                 .icap_header("x-foo", "bar")
@@ -120,7 +120,7 @@ fn bench_wire_building(c: &mut Criterion) {
                 .body(Vec::<u8>::new())
                 .unwrap();
 
-            let icap = IcapRequest::reqmod("icap/full")
+            let icap = IcapRequest::reqmod("icap/test")
                 .preview(0)
                 .with_http_request(http);
 

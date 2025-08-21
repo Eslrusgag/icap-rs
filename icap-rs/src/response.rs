@@ -27,7 +27,7 @@
 //! ```
 
 use crate::error::IcapResult;
-use crate::headers_end;
+use crate::find_double_crlf;
 use http::{HeaderMap, HeaderName, HeaderValue};
 use std::fmt;
 use std::str::FromStr;
@@ -299,7 +299,7 @@ pub fn parse_icap_response(raw: &[u8]) -> IcapResult<Response> {
         return Err("Empty response".into());
     }
 
-    let hdr_end = headers_end(raw).ok_or("ICAP response headers not complete")?;
+    let hdr_end = find_double_crlf(raw).ok_or("ICAP response headers not complete")?;
     let head = &raw[..hdr_end];
     let head_str = std::str::from_utf8(head)?;
     let mut lines = head_str.split("\r\n");
@@ -357,4 +357,212 @@ pub fn parse_icap_response(raw: &[u8]) -> IcapResult<Response> {
         headers,
         body,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http::HeaderValue;
+
+    fn icap_bytes(s: &str) -> Vec<u8> {
+        s.as_bytes().to_vec()
+    }
+
+    #[test]
+    fn statuscode_display_and_from() {
+        assert_eq!(StatusCode::Ok200.to_string(), "200");
+        assert_eq!(StatusCode::NoContent204.to_string(), "204");
+
+        assert_eq!(StatusCode::from_str("200").unwrap(), StatusCode::Ok200);
+        assert_eq!(
+            StatusCode::from_str("204").unwrap(),
+            StatusCode::NoContent204
+        );
+        assert!(StatusCode::from_str("777").is_err());
+
+        assert_eq!(
+            StatusCode::try_from(206).unwrap(),
+            StatusCode::PartialContent206
+        );
+        assert!(StatusCode::try_from(777u16).is_err());
+    }
+
+    #[test]
+    fn response_no_content_and_headers() {
+        let resp = Response::no_content()
+            .add_header("ISTag", "policy-123")
+            .with_body_string("optional");
+
+        assert_eq!(resp.version, "ICAP/1.0");
+        assert_eq!(resp.status_code, StatusCode::NoContent204);
+        assert_eq!(resp.status_text, "No Content");
+        assert_eq!(
+            resp.get_header("ISTag").unwrap(),
+            &HeaderValue::from_static("policy-123")
+        );
+        assert_eq!(resp.body, b"optional");
+        assert!(resp.is_success());
+        assert!(!resp.is_error());
+    }
+
+    #[test]
+    fn response_add_get_remove_header() {
+        let mut resp = Response::new(StatusCode::Ok200, "OK").add_header("Service", "Mailfilter");
+        assert!(resp.has_header("Service"));
+        assert_eq!(
+            resp.get_header("Service").unwrap(),
+            &HeaderValue::from_static("Mailfilter")
+        );
+
+        let removed = resp.remove_header("Service");
+        assert!(removed.is_some());
+        assert!(!resp.has_header("Service"));
+    }
+
+    #[test]
+    fn response_builder_fluent() {
+        let resp =
+            ResponseBuilder::new(StatusCode::InternalServerError500, "Internal Server Error")
+                .header("Date", "Wed, 20 Aug 2025 14:00:00 GMT")
+                .body_string("oops")
+                .build();
+
+        assert_eq!(resp.status_code, StatusCode::InternalServerError500);
+        assert_eq!(resp.status_text, "Internal Server Error");
+        assert_eq!(
+            resp.get_header("Date").unwrap(),
+            &HeaderValue::from_static("Wed, 20 Aug 2025 14:00:00 GMT")
+        );
+        assert_eq!(resp.body, b"oops");
+        assert!(resp.is_error());
+        assert!(!resp.is_success());
+    }
+
+    #[test]
+    #[ignore]
+    //DisCus: Should Icap headers be capitalized?
+    fn response_display_includes_status_and_headers() {
+        let resp = Response::new(StatusCode::Ok200, "OK")
+            .add_header("ISTag", "x")
+            .with_body_string("B");
+
+        let s = format!("{resp}");
+        println!("{:?}", &s);
+        assert!(s.contains("ICAP/1.0 200 OK"));
+        assert!(s.contains("ISTag: x"));
+        assert!(s.contains("\nB"));
+    }
+
+    #[test]
+    fn parse_minimal_200_without_body() {
+        let raw = icap_bytes(
+            "ICAP/1.0 200 OK\r\n\
+             Service: Mailfilter ICAP service\r\n\
+             ISTag: policy.123\r\n\
+             \r\n",
+        );
+        let r = parse_icap_response(&raw).expect("parse");
+        assert_eq!(r.version, "ICAP/1.0");
+        assert_eq!(r.status_code, StatusCode::Ok200);
+        assert_eq!(r.status_text, "OK");
+        assert_eq!(
+            r.get_header("Service").unwrap(),
+            &HeaderValue::from_static("Mailfilter ICAP service")
+        );
+        assert_eq!(
+            r.get_header("ISTag").unwrap(),
+            &HeaderValue::from_static("policy.123")
+        );
+        assert!(r.body.is_empty());
+    }
+
+    #[test]
+    fn parse_204_with_body_and_headers() {
+        let raw = icap_bytes(
+            "ICAP/1.0 204 No Content\r\n\
+             Date: Wed Aug 20 17:00:16 MSK 2025\r\n\
+             Encapsulated: null-body=0\r\n\
+             \r\n\
+             ",
+        );
+        let r = parse_icap_response(&raw).expect("parse");
+        assert_eq!(r.status_code, StatusCode::NoContent204);
+        assert_eq!(r.status_text, "No Content");
+        assert_eq!(
+            r.get_header("Encapsulated").unwrap(),
+            &HeaderValue::from_static("null-body=0")
+        );
+        assert_eq!(r.body, b"");
+    }
+
+    #[test]
+    fn parse_allows_multiword_status_text() {
+        let raw = icap_bytes(
+            "ICAP/1.0 405 Method Not Allowed\r\n\
+             Service: X\r\n\
+             \r\n",
+        );
+        let r = parse_icap_response(&raw).expect("parse");
+        assert_eq!(r.status_code, StatusCode::MethodNotAllowed405);
+        assert_eq!(r.status_text, "Method Not Allowed");
+    }
+
+    #[test]
+    fn last_duplicate_header_wins() {
+        let raw = icap_bytes(
+            "ICAP/1.0 200 OK\r\n\
+             ISTag: a\r\n\
+             ISTag: b\r\n\
+             \r\n",
+        );
+        let r = parse_icap_response(&raw).expect("parse");
+        assert_eq!(
+            r.get_header("ISTag").unwrap(),
+            &HeaderValue::from_static("b")
+        );
+    }
+
+    #[test]
+    fn parse_errors_on_empty() {
+        let err = parse_icap_response(b"").unwrap_err();
+        assert!(err.to_string().contains("Empty response"));
+    }
+
+    #[test]
+    fn parse_errors_on_incomplete_headers() {
+        let raw = icap_bytes("ICAP/1.0 200 OK\r\nService: X\r\n");
+        let err = parse_icap_response(&raw).unwrap_err();
+        assert!(err.to_string().contains("headers not complete"));
+    }
+
+    #[test]
+    fn parse_errors_on_bad_status_line_shape() {
+        let raw = icap_bytes(
+            "ICAP/1.0\r\n\
+             Service: X\r\n\
+             \r\n",
+        );
+        let err = parse_icap_response(&raw).unwrap_err();
+        assert!(err.to_string().contains("Invalid status line"));
+    }
+
+    #[test]
+    fn parse_errors_on_invalid_status_code_token() {
+        let raw = icap_bytes(
+            "ICAP/1.0 ABC OK\r\n\
+             \r\n",
+        );
+        let err = parse_icap_response(&raw).unwrap_err();
+        assert!(err.to_string().contains("Invalid status code"));
+    }
+
+    #[test]
+    fn parse_errors_on_unknown_numeric_status_code() {
+        let raw = icap_bytes(
+            "ICAP/1.0 777 Weird\r\n\
+             \r\n",
+        );
+        let err = parse_icap_response(&raw).unwrap_err();
+        assert!(err.to_string().contains("Unknown ICAP status code: 777"));
+    }
 }
