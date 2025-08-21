@@ -11,7 +11,7 @@ use std::fmt::Write;
 /// Offsets are **relative to the start of the encapsulated area**
 /// (i.e., immediately after the ICAP headers CRLFCRLF).
 #[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct Encapsulated {
+pub struct Encapsulated {
     pub(crate) req_hdr: Option<usize>,
     pub(crate) res_hdr: Option<usize>,
     pub(crate) req_body: Option<usize>,
