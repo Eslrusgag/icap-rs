@@ -13,13 +13,54 @@ use tracing::{debug, error, info, warn};
 
 use chrono::Local;
 use std::collections::HashSet;
+use std::time::Duration;
+
+pub fn cli_styles() -> clap::builder::Styles {
+    clap::builder::Styles::styled()
+        .usage(
+            anstyle::Style::new()
+                .bold()
+                .underline()
+                .fg_color(Some(anstyle::Color::Ansi(anstyle::AnsiColor::Green))),
+        )
+        .header(
+            anstyle::Style::new()
+                .bold()
+                .underline()
+                .fg_color(Some(anstyle::Color::Ansi(anstyle::AnsiColor::Green))),
+        )
+        .literal(
+            anstyle::Style::new()
+                .fg_color(Some(anstyle::Color::Ansi(anstyle::AnsiColor::BrightCyan))),
+        )
+        .invalid(
+            anstyle::Style::new()
+                .bold()
+                .fg_color(Some(anstyle::Color::Ansi(anstyle::AnsiColor::Red))),
+        )
+        .error(
+            anstyle::Style::new()
+                .bold()
+                .fg_color(Some(anstyle::Color::Ansi(anstyle::AnsiColor::Red))),
+        )
+        .valid(
+            anstyle::Style::new()
+                .bold()
+                .underline()
+                .fg_color(Some(anstyle::Color::Ansi(anstyle::AnsiColor::BrightCyan))),
+        )
+        .placeholder(
+            anstyle::Style::new()
+                .fg_color(Some(anstyle::Color::Ansi(anstyle::AnsiColor::BrightBlue))),
+        )
+}
 
 #[derive(Parser, Debug)]
 #[command(
     name = "rs-icap-client",
     about = "Rust ICAP client implementation",
+    styles=cli_styles(),
     disable_version_flag = true,
-    long_about = "A Rust implementation of an ICAP client with a c-icap-client-like CLI"
 )]
 struct Args {
     /// Full ICAP URI like icap://host[:port]/service
@@ -34,8 +75,12 @@ struct Args {
     #[arg(short = 'o', long)]
     output: Option<String>,
 
+    /// Read timeout in seconds (client-side). Default: no timeout (like c-icap-client).
+    #[arg(short, long)]
+    timeout: Option<u64>,
+
     /// ICAP method: OPTIONS|REQMOD|RESPMOD
-    #[arg(long = "method")]
+    #[arg(short, long)]
     method: Option<String>,
 
     /// Send REQMOD with the given request URL (origin-form or absolute URI)
@@ -51,15 +96,15 @@ struct Args {
     debug_level: Option<u8>,
 
     /// No-op compatibility flag (kept for parity with c-icap-client)
-    #[arg(long = "noreshdr", action = clap::ArgAction::SetTrue)]
+    #[arg(long, action = clap::ArgAction::SetTrue)]
     noreshdr: bool,
 
     /// Force c-icap semantics: Preview: 0 (no ieof). Server replies 100, then stream the body.
-    #[arg(long = "nopreview", action = clap::ArgAction::SetTrue)]
+    #[arg(long, action = clap::ArgAction::SetTrue)]
     nopreview: bool,
 
     /// Do not allow 204 outside preview
-    #[arg(long = "no204", action = clap::ArgAction::SetTrue)]
+    #[arg(long, action = clap::ArgAction::SetTrue)]
     no204: bool,
 
     /// Advertise/accept 206
@@ -83,23 +128,23 @@ struct Args {
     preview_size: Option<usize>,
 
     /// Fast 204: with preview-size 0 send ieof immediately
-    #[arg(long = "ieof", action = clap::ArgAction::SetTrue)]
+    #[arg(long, action = clap::ArgAction::SetTrue)]
     ieof: bool,
 
     /// Use HTTP/1.0 for the embedded HTTP message
-    #[arg(long = "http10", action = clap::ArgAction::SetTrue)]
+    #[arg(long, action = clap::ArgAction::SetTrue)]
     http10: bool,
 
     /// Stream body from file (do not buffer in memory)
-    #[arg(long = "stream-io", action = clap::ArgAction::SetTrue)]
+    #[arg(long, action = clap::ArgAction::SetTrue)]
     stream_io: bool,
 
     /// Print ICAP response headers (c-icap-client style)
     #[arg(short = 'v', long, action = clap::ArgAction::SetTrue)]
     verbose: bool,
 
-    /// Print the generated ICAP request (raw wire) without sending it
-    #[arg(long = "print-request", action = clap::ArgAction::SetTrue)]
+    /// Print the generated ICAP request
+    #[arg(short, long, action = clap::ArgAction::SetTrue)]
     print_request: bool,
 }
 
@@ -155,8 +200,10 @@ async fn main() -> IcapResult<()> {
         .map(|sa| sa.ip().to_string())
         .unwrap_or_else(|| "?".into());
 
-    // Client and service path
-    let client = Client::builder().from_uri(&args.uri)?.build();
+    let client = Client::builder()
+        .from_uri(&args.uri)?
+        .read_timeout(args.timeout.map(Duration::from_secs))
+        .build();
     let service = service_from_uri(&args.uri).unwrap_or_else(|| "/".to_string());
 
     // Negotiate capabilities unless we're doing a dry-run print
@@ -272,8 +319,8 @@ async fn main() -> IcapResult<()> {
                 match parse_header_line(h) {
                     Ok((k, v)) => {
                         builder = builder.header(
-                            HeaderName::from_bytes(k.as_bytes()).unwrap(),
-                            HeaderValue::from_str(&v).unwrap(),
+                            HeaderName::from_bytes(k.as_bytes())?,
+                            HeaderValue::from_str(&v)?,
                         );
                     }
                     Err(e) => warn!("Bad --hx header '{}': {}", h, e),

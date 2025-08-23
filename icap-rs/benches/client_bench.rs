@@ -2,6 +2,7 @@ use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use http::{Request as HttpReq, Version, header};
 use icap_rs::{
     client::Client,
+    find_double_crlf, parse_encapsulated_header,
     request::Request as IcapRequest,
     response::{Response, StatusCode},
 };
@@ -28,21 +29,21 @@ fn bench_request_parsing(c: &mut Criterion) {
                         \r\n\
                         test data";
 
-    group.throughput(Throughput::Bytes(test_request.len() as u64));
-    group.bench_function("split_headers_kv", |b| {
+    let headers = extract_headers_text(test_request.as_bytes());
+    group.throughput(Throughput::Bytes(headers.len() as u64));
+
+    group.bench_function("icap_parse_encapsulated", |b| {
         b.iter(|| {
-            // Primitive, allocation-light parsing used just for baseline
-            let mut it = test_request.split("\r\n");
-            let _start_line = it.next().unwrap();
-            let mut _map = std::collections::HashMap::new();
-            for line in it.by_ref() {
-                if line.is_empty() {
-                    break;
-                }
-                if let Some((k, v)) = line.split_once(':') {
-                    _map.insert(k.trim(), v.trim());
-                }
-            }
+            let enc = parse_encapsulated_header(std::hint::black_box(headers));
+            std::hint::black_box(enc);
+        });
+    });
+
+    group.bench_function("icap_find_double_crlf", |b| {
+        let buf = test_request.as_bytes().to_vec();
+        b.iter(|| {
+            let pos = find_double_crlf(std::hint::black_box(&buf));
+            std::hint::black_box(pos);
         });
     });
 

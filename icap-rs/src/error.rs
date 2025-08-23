@@ -1,4 +1,4 @@
-//! Error handling for the ICAP library.
+//! Error handling
 //!
 //! This module defines:
 //! - [`IcapError`]: the main error type for ICAP operations.
@@ -7,19 +7,21 @@
 //!
 //! It covers network errors, parsing/serialization, configuration issues, and unexpected failures.
 use http::header::{InvalidHeaderName, InvalidHeaderValue};
-use std::error::{Error as StdError, Error};
+use std::error::Error as StdError;
 use std::str::Utf8Error;
+use std::time::Duration;
 use thiserror::Error;
 
-/// Main error type for the ICAP library.
-///
 /// It covers network issues, parsing/serialization errors, invalid protocol fields,
 /// configuration/service/handler failures, and unexpected runtime errors.
 #[derive(Error, Debug)]
-pub enum IcapError {
+pub enum Error {
     /// Network-level error (TCP connection, timeout, etc.).
     #[error("Network error: {0}")]
     Network(#[from] std::io::Error),
+
+    #[error("Network timeout after {0:?}")]
+    ClientTimeout(Duration),
 
     /// Failed to parse an ICAP message.
     #[error("ICAP parsing error: {0}")]
@@ -78,7 +80,7 @@ pub enum IcapError {
     Unexpected(String),
 }
 
-impl IcapError {
+impl Error {
     /// Create a parsing error.
     pub fn parse(message: impl Into<String>) -> Self {
         Self::Parse(message.into())
@@ -130,26 +132,26 @@ impl IcapError {
     }
 }
 
-impl From<String> for IcapError {
+impl From<String> for Error {
     fn from(err: String) -> Self {
         Self::Unexpected(err)
     }
 }
 
-impl From<&str> for IcapError {
+impl From<&str> for Error {
     fn from(err: &str) -> Self {
         Self::Unexpected(err.to_string())
     }
 }
 
-impl From<Box<dyn Error + Send + Sync>> for IcapError {
-    fn from(err: Box<dyn Error + Send + Sync>) -> Self {
+impl From<Box<dyn StdError + Send + Sync>> for Error {
+    fn from(err: Box<dyn StdError + Send + Sync>) -> Self {
         Self::Unexpected(err.to_string())
     }
 }
 
 /// Convenient alias for results in the ICAP library.
-pub type IcapResult<T> = Result<T, IcapError>;
+pub type IcapResult<T> = Result<T, Error>;
 
 /// Converts a generic `Result<T, E>` into an `IcapResult<T>`.
 ///
@@ -163,22 +165,22 @@ where
     E: StdError + Send + Sync + 'static,
 {
     fn to_icap_result(self) -> IcapResult<T> {
-        self.map_err(|e| IcapError::Unexpected(e.to_string()))
+        self.map_err(|e| Error::Unexpected(e.to_string()))
     }
 }
 
-impl From<Utf8Error> for IcapError {
+impl From<Utf8Error> for Error {
     fn from(e: Utf8Error) -> Self {
-        IcapError::HttpParse(e.to_string())
+        Error::HttpParse(e.to_string())
     }
 }
-impl From<InvalidHeaderName> for IcapError {
+impl From<InvalidHeaderName> for Error {
     fn from(e: InvalidHeaderName) -> Self {
-        IcapError::HttpParse(e.to_string())
+        Error::HttpParse(e.to_string())
     }
 }
-impl From<InvalidHeaderValue> for IcapError {
+impl From<InvalidHeaderValue> for Error {
     fn from(e: InvalidHeaderValue) -> Self {
-        IcapError::HttpParse(e.to_string())
+        Error::HttpParse(e.to_string())
     }
 }
