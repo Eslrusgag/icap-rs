@@ -1,10 +1,7 @@
 // Minimal ICAP server with several services:
-// - echo:      returns 200 OK, no body
-// - test:      echoes some request fields in ICAP headers
 // - reqmod:    demonstrates REQMOD flow and 204 handling
 // - respmod:   demonstrates RESPMOD flow and 204 handling
 // - blocker:   returns ICAP 200 with an encapsulated HTTP 403 "Blocked!" page
-//
 
 use http::HeaderMap;
 use icap_rs::options::{IcapMethod, OptionsConfig};
@@ -18,18 +15,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::TRACE)
         .init();
-
-    let echo_opts = OptionsConfig::new(vec![IcapMethod::ReqMod, IcapMethod::RespMod], "echo-1.0")
-        .with_service("Echo ICAP Service")
-        .with_options_ttl(3600)
-        .with_max_connections(100)
-        .add_allow("204");
-
-    let test_opts = OptionsConfig::new(vec![IcapMethod::ReqMod, IcapMethod::RespMod], "test-1.0")
-        .with_service("Test ICAP Service")
-        .with_options_ttl(3600)
-        .with_max_connections(100)
-        .add_allow("204");
 
     let reqmod_opts = OptionsConfig::new(vec![IcapMethod::ReqMod], "reqmod-1.0")
         .with_service("Request Modifier")
@@ -54,30 +39,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let server = Server::builder()
         .bind("127.0.0.1:1344")
-        // echo: simple 200 OK without body
-        .add_service("echo", |request: Request| async move {
-            info!(
-                "echo: method={} service={}",
-                request.method, request.service
-            );
-            Ok(Response::new(StatusCode::Ok200, "OK")
-                .add_header("Content-Length", "0")
-                .add_header("Server", "icap-rs/0.1.0"))
-        })
-        .add_options_config("echo", echo_opts)
-        // test: echo some fields to ICAP response headers
-        .add_service("test", |request: Request| async move {
-            info!(
-                "test: method={} service={}",
-                request.method, request.service
-            );
-            Ok(Response::new(StatusCode::Ok200, "OK")
-                .add_header("Content-Length", "0")
-                .add_header("Server", "icap-rs/0.1.0")
-                .add_header("X-Request-Method", &request.method)
-                .add_header("X-Request-Service", &request.service))
-        })
-        .add_options_config("test", test_opts)
         // reqmod: if client allows 204 and no changes required, return 204
         .add_service("reqmod", |request: Request| async move {
             info!("REQMOD called: {}", request.service);
@@ -163,7 +124,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .build()
         .await?;
 
-    info!("ICAP server started on 127.0.0.1:1344 (services: echo, test, reqmod, respmod, blocker)");
+    info!("ICAP server started on 127.0.0.1:1344 (services: reqmod, respmod, blocker)");
     if let Err(e) = server.run().await {
         error!("server error: {e}");
         return Err(e.into());

@@ -7,7 +7,7 @@
 //! - ICAP Preview (including `ieof`) and streaming upload.
 //! - Keep-Alive reuse of a single idle connection.
 //! - Encapsulated header calculation and chunked bodies.
-use crate::error::IcapResult;
+use crate::error::{Error, IcapResult};
 use crate::parser::parse_encapsulated_header;
 use crate::parser::{
     canon_icap_header, find_double_crlf, read_chunked_to_end, serialize_http_request,
@@ -24,6 +24,7 @@ use tokio::fs::File as TokioFile;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
+use tokio::time::timeout;
 use tracing::trace;
 
 const MAX_HDR_BYTES: usize = 64 * 1024;
@@ -243,15 +244,21 @@ impl Client {
 
         // OPTIONS is always final (no preview/body)
         if req.method.eq_ignore_ascii_case("OPTIONS") {
-            let (_code, mut buf) = read_icap_headers(&mut stream).await?;
-            read_icap_body_if_any(&mut stream, &mut buf).await?;
+            let (_code, mut buf) =
+                Self::with_timeout(self.inner.read_timeout, read_icap_headers(&mut stream)).await?;
+            Self::with_timeout(
+                self.inner.read_timeout,
+                read_icap_body_if_any(&mut stream, &mut buf),
+            )
+            .await?;
             maybe_put_back(self.inner.connection_policy, &self.inner.idle_conn, stream).await;
             return parse_icap_response(&buf);
         }
 
         // Handle 100-Continue for Preview
         if built.expect_continue {
-            let (code, hdr_buf) = read_icap_headers(&mut stream).await?;
+            let (code, hdr_buf) =
+                Self::with_timeout(self.inner.read_timeout, read_icap_headers(&mut stream)).await?;
             return if code == 100 {
                 if let Some(rest) = built.remaining_body
                     && !rest.is_empty()
@@ -261,22 +268,37 @@ impl Client {
                 stream.write_all(b"0\r\n\r\n").await?;
                 stream.flush().await?;
 
-                let (_code2, mut response) = read_icap_headers(&mut stream).await?;
-                read_icap_body_if_any(&mut stream, &mut response).await?;
+                let (_code2, mut response) =
+                    Self::with_timeout(self.inner.read_timeout, read_icap_headers(&mut stream))
+                        .await?;
+                Self::with_timeout(
+                    self.inner.read_timeout,
+                    read_icap_body_if_any(&mut stream, &mut response),
+                )
+                .await?;
                 maybe_put_back(self.inner.connection_policy, &self.inner.idle_conn, stream).await;
                 parse_icap_response(&response)
             } else {
                 // server decided final without continue (e.g., 204)
                 let mut response = hdr_buf;
-                read_icap_body_if_any(&mut stream, &mut response).await?;
+                Self::with_timeout(
+                    self.inner.read_timeout,
+                    read_icap_body_if_any(&mut stream, &mut response),
+                )
+                .await?;
                 maybe_put_back(self.inner.connection_policy, &self.inner.idle_conn, stream).await;
                 parse_icap_response(&response)
             };
         }
 
         // No preview — read final
-        let (_code, mut response) = read_icap_headers(&mut stream).await?;
-        read_icap_body_if_any(&mut stream, &mut response).await?;
+        let (_code, mut response) =
+            Self::with_timeout(self.inner.read_timeout, read_icap_headers(&mut stream)).await?;
+        Self::with_timeout(
+            self.inner.read_timeout,
+            read_icap_body_if_any(&mut stream, &mut response),
+        )
+        .await?;
         maybe_put_back(self.inner.connection_policy, &self.inner.idle_conn, stream).await;
         parse_icap_response(&response)
     }
@@ -325,7 +347,8 @@ impl Client {
             stream.flush().await?;
         }
 
-        let (code, hdr_buf) = read_icap_headers(&mut stream).await?;
+        let (code, hdr_buf) =
+            Self::with_timeout(self.inner.read_timeout, read_icap_headers(&mut stream)).await?;
         if code == 100 {
             let mut f = TokioFile::open(file_path).await?;
             let mut buf = vec![0u8; 64 * 1024];
@@ -339,14 +362,23 @@ impl Client {
             stream.write_all(b"0\r\n\r\n").await?;
             stream.flush().await?;
 
-            let (_code2, mut response) = read_icap_headers(&mut stream).await?;
-            read_icap_body_if_any(&mut stream, &mut response).await?;
+            let (_code2, mut response) =
+                Self::with_timeout(self.inner.read_timeout, read_icap_headers(&mut stream)).await?;
+            Self::with_timeout(
+                self.inner.read_timeout,
+                read_icap_body_if_any(&mut stream, &mut response),
+            )
+            .await?;
             maybe_put_back(self.inner.connection_policy, &self.inner.idle_conn, stream).await;
             parse_icap_response(&response)
         } else {
             // final immediately (e.g., 204)
             let mut response = hdr_buf;
-            read_icap_body_if_any(&mut stream, &mut response).await?;
+            Self::with_timeout(
+                self.inner.read_timeout,
+                read_icap_body_if_any(&mut stream, &mut response),
+            )
+            .await?;
             maybe_put_back(self.inner.connection_policy, &self.inner.idle_conn, stream).await;
             parse_icap_response(&response)
         }
@@ -371,6 +403,20 @@ impl Client {
             }
         }
         Ok(out)
+    }
+
+    async fn with_timeout<T, F>(dur: Option<Duration>, fut: F) -> Result<T, Error>
+    where
+        F: std::future::Future<Output = Result<T, Error>>,
+    {
+        if let Some(d) = dur {
+            match timeout(d, fut).await {
+                Ok(res) => res,
+                Err(_) => Err(Error::ClientTimeout(d)),
+            }
+        } else {
+            fut.await
+        }
     }
 
     /// Build ICAP request bytes (headers + embedded HTTP + initial preview/chunks).
