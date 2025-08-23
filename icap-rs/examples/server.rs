@@ -19,14 +19,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let reqmod_opts = OptionsConfig::new(vec![IcapMethod::ReqMod], "reqmod-1.0")
         .with_service("Request Modifier")
         .with_options_ttl(3600)
-        .with_max_connections(500)
         .add_allow("204")
         .with_preview(1024);
 
     let respmod_opts = OptionsConfig::new(vec![IcapMethod::RespMod], "respmod-1.0")
         .with_service("Response Modifier")
         .with_options_ttl(3600)
-        .with_max_connections(500)
         .add_allow("204")
         .with_preview(2048);
 
@@ -34,11 +32,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let blocker_opts = OptionsConfig::new(vec![IcapMethod::ReqMod], "blocker-1.0")
         .with_service("Request Blocker")
         .with_options_ttl(3600)
-        .with_max_connections(200)
         .with_preview(0);
 
     let server = Server::builder()
         .bind("127.0.0.1:1344")
+        .with_max_connections(1)
         // reqmod: if client allows 204 and no changes required, return 204
         .add_service("reqmod", |request: Request| async move {
             info!("REQMOD called: {}", request.service);

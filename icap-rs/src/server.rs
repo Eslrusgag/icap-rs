@@ -14,11 +14,11 @@ use std::sync::Arc;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Semaphore};
 use tracing::{error, trace, warn};
 
 use crate::error::IcapResult;
-use crate::parser::{read_chunked_to_end, serialize_icap_response};
+use crate::parser::{find_double_crlf, read_chunked_to_end, serialize_icap_response};
 use crate::request::parse_icap_request;
 use crate::{IcapMethod, OptionsConfig, Request, Response, StatusCode};
 
@@ -37,6 +37,8 @@ pub struct Server {
     listener: TcpListener,
     services: Arc<RwLock<HashMap<String, RequestHandler>>>,
     options_configs: Arc<RwLock<HashMap<String, OptionsConfig>>>,
+    conn_limit: Option<Arc<Semaphore>>,
+    advertised_max_conn: Option<u32>,
 }
 
 impl Server {
@@ -51,13 +53,46 @@ impl Server {
         trace!("ICAP server started on {}", local_addr);
 
         loop {
-            let (socket, addr) = self.listener.accept().await?;
+            let (mut socket, addr) = self.listener.accept().await?;
             trace!("New connection from {}", addr);
+
+            let maybe_permit = if let Some(sem) = &self.conn_limit {
+                match sem.clone().try_acquire_owned() {
+                    Ok(p) => Some(p),
+                    Err(_) => {
+                        warn!(
+                            "Refusing connection from {}: too many concurrent connections",
+                            addr
+                        );
+
+                        let resp =
+                            Response::new(StatusCode::ServiceUnavailable503, "Service Unavailable")
+                                .add_header("Encapsulated", "null-body=0")
+                                .add_header("Content-Length", "0");
+
+                        if let Ok(bytes) = serialize_icap_response(&resp) {
+                            if let Err(e) = socket.write_all(&bytes).await {
+                                warn!("Failed to send 503 to {}: {}", addr, e);
+                            }
+                            // по желанию: явное закрытие полудуплекса записи
+                            let _ = socket.shutdown().await;
+                        }
+
+                        continue; // не спавним таск, соединение закрыто
+                    }
+                }
+            } else {
+                None
+            };
 
             let services = Arc::clone(&self.services);
             let options_configs = Arc::clone(&self.options_configs);
+            let advertised_max = self.advertised_max_conn;
             tokio::spawn(async move {
-                if let Err(e) = Self::handle_connection(socket, services, options_configs).await {
+                let _permit = maybe_permit;
+                if let Err(e) =
+                    Self::handle_connection(socket, services, options_configs, advertised_max).await
+                {
                     error!("Error handling connection {}: {}", addr, e);
                 }
             });
@@ -82,19 +117,18 @@ impl Server {
         mut socket: TcpStream,
         services: Arc<RwLock<HashMap<String, RequestHandler>>>,
         options_configs: Arc<RwLock<HashMap<String, OptionsConfig>>>,
+        advertised_max_conn: Option<u32>,
     ) -> IcapResult<()> {
         let mut buf: Vec<u8> = Vec::with_capacity(16 * 1024);
         let mut tmp = [0u8; 8192];
 
         loop {
-            // Ensure we have at least ICAP headers (up to CRLFCRLF).
             let h_end = loop {
-                if let Some(end) = headers_end(&buf) {
+                if let Some(end) = find_double_crlf(&buf) {
                     break end;
                 }
                 let n = socket.read(&mut tmp).await?;
                 if n == 0 {
-                    // Peer closed; if nothing buffered, just exit.
                     return if buf.is_empty() {
                         Ok(())
                     } else {
@@ -104,20 +138,13 @@ impl Server {
                 buf.extend_from_slice(&tmp[..n]);
             };
 
-            // Parse Encapsulated from the headers block.
             let hdr_text =
                 std::str::from_utf8(&buf[..h_end]).map_err(|_| "Invalid ICAP headers utf8")?;
             let enc = crate::parser::parse_encapsulated_header(hdr_text);
-
-            // Compute the end of this ICAP message in `buf`.
-            // Start with the headers-only case; extend if there is a chunked body.
             let mut msg_end = h_end;
 
             if let Some(body_rel) = enc.req_body.or(enc.res_body) {
-                // Absolute position where ICAP chunked body starts (immediately after embedded HTTP headers).
                 let body_abs = h_end + body_rel;
-
-                // Make sure we have reached at least the beginning of the chunk stream.
                 while buf.len() < body_abs {
                     let n = socket.read(&mut tmp).await?;
                     if n == 0 {
@@ -125,17 +152,12 @@ impl Server {
                     }
                     buf.extend_from_slice(&tmp[..n]);
                 }
-
-                // Drain the whole ICAP-chunked body to the terminating zero chunk.
-                // The function returns absolute offset right *after* the final CRLF.
                 msg_end = read_chunked_to_end(&mut socket, &mut buf, body_abs).await?;
             }
 
-            // We now have one full ICAP message in buf[..msg_end].
             let req = parse_icap_request(&buf[..msg_end])?;
             trace!("Received {} to service '{}'", req.method, req.service);
 
-            // Determine service name (last segment).
             let service_name = req
                 .service
                 .rsplit('/')
@@ -143,17 +165,20 @@ impl Server {
                 .unwrap_or(&req.service)
                 .to_string();
 
-            // Dispatch: OPTIONS or service handler.
             let resp = if req.method.eq_ignore_ascii_case("OPTIONS") {
                 let options_guard = options_configs.read().await;
                 if let Some(cfg) = options_guard.get(&service_name) {
-                    cfg.build_response()
+                    let mut c = cfg.clone();
+                    if let (Some(n), None) = (advertised_max_conn, c.max_connections) {
+                        c.with_max_connections(n);
+                    }
+                    c.build_response()
                 } else {
                     warn!(
                         "OPTIONS config for '{}' not found, using default",
                         service_name
                     );
-                    Self::build_default_options_response(&service_name)
+                    Self::build_default_options_response(&service_name, advertised_max_conn)
                 }
             } else {
                 let services_guard = services.read().await;
@@ -166,31 +191,29 @@ impl Server {
                 }
             };
 
-            // Send ICAP response. (ICAP connections are persistent by default.)
             let bytes = serialize_icap_response(&resp)?;
             socket.write_all(&bytes).await?;
             socket.flush().await?;
             trace!("Response sent for service: {}", service_name);
 
-            // Remove the processed ICAP message from the buffer.
             buf.drain(..msg_end);
-
-            // If there's already pipelined data for the next request in `buf`,
-            // the loop will parse it immediately in the next iteration.
-            // Otherwise we'll read more from the socket above.
         }
     }
 
     /// Default OPTIONS response for services without an explicit config.
-    fn build_default_options_response(service_name: &str) -> Response {
-        let cfg = OptionsConfig::new(
+    fn build_default_options_response(service_name: &str, advertised_max: Option<u32>) -> Response {
+        let mut cfg = OptionsConfig::new(
             vec![IcapMethod::RespMod],
             &format!("{}-default-1.0", service_name),
         )
         .with_service(&format!("Default ICAP Service for {}", service_name))
-        .with_max_connections(100)
         .with_options_ttl(3600)
         .add_allow("204");
+
+        if let Some(n) = advertised_max {
+            cfg.with_max_connections(n);
+        }
+
         cfg.build_response()
     }
 }
@@ -200,6 +223,7 @@ pub struct ServerBuilder {
     bind_addr: Option<String>,
     services: HashMap<String, RequestHandler>,
     options_configs: HashMap<String, OptionsConfig>,
+    max_connections_global: Option<usize>,
 }
 
 impl ServerBuilder {
@@ -208,11 +232,17 @@ impl ServerBuilder {
             bind_addr: None,
             services: HashMap::new(),
             options_configs: HashMap::new(),
+            max_connections_global: None,
         }
     }
 
     pub fn bind(mut self, addr: &str) -> Self {
         self.bind_addr = Some(addr.to_string());
+        self
+    }
+
+    pub fn with_max_connections(mut self, n: usize) -> Self {
+        self.max_connections_global = Some(n.max(1));
         self
     }
 
@@ -236,10 +266,18 @@ impl ServerBuilder {
             .bind_addr
             .unwrap_or_else(|| "127.0.0.1:1344".to_string());
         let listener = TcpListener::bind(&bind_addr).await?;
+
+        let conn_limit = self
+            .max_connections_global
+            .map(|n| Arc::new(Semaphore::new(n)));
+        let advertised_max_conn = self.max_connections_global.map(|n| n as u32);
+
         Ok(Server {
             listener,
             services: Arc::new(RwLock::new(self.services)),
             options_configs: Arc::new(RwLock::new(self.options_configs)),
+            conn_limit,
+            advertised_max_conn,
         })
     }
 }
@@ -248,9 +286,4 @@ impl Default for ServerBuilder {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// Find the end of the ICAP header block.
-fn headers_end(buf: &[u8]) -> Option<usize> {
-    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4)
 }

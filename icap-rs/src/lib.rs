@@ -82,7 +82,6 @@
 //!             OptionsConfig::new(vec![IcapMethod::ReqMod], "example-reqmod-1.0")
 //!                 .with_service("Example REQMOD Service")
 //!                 .with_options_ttl(600)
-//!                 .with_max_connections(100)
 //!                 .add_allow("204"),
 //!         )
 //!         .add_options_config(
@@ -90,7 +89,6 @@
 //!             OptionsConfig::new(vec![IcapMethod::RespMod], "example-respmod-1.0")
 //!                 .with_service("Example RESPMOD Service")
 //!                 .with_options_ttl(600)
-//!                 .with_max_connections(100)
 //!                 .add_allow("204"),
 //!         )
 //!         .build()

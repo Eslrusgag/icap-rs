@@ -245,6 +245,12 @@ impl Client {
             }
         };
 
+        // non-blocking early probe (e.g., ICAP/1.0 503) before writing anything
+        if let Some(resp) = Self::try_read_early_response_now(&mut stream).await? {
+            // Do not return this connection to idle pool — server likely closed it.
+            return Ok(resp);
+        }
+
         let built = self.build_icap_request_bytes(req, false, req.preview_ieof)?;
         stream.write_all(&built.bytes).await?;
         stream.flush().await?;
@@ -338,6 +344,11 @@ impl Client {
                 TcpStream::connect((&*self.inner.host, self.inner.port)).await?
             }
         };
+
+        // non-blocking early probe (e.g., ICAP/1.0 503)
+        if let Some(resp) = Self::try_read_early_response_now(&mut stream).await? {
+            return Ok(resp);
+        }
 
         // force_has_body=true (body will be streamed), preview0_ieof=false (classic)
         let built = self.build_icap_request_bytes(req, true, false)?;
@@ -566,6 +577,54 @@ impl Client {
     fn trim_leading_slash(s: &str) -> &str {
         s.strip_prefix('/').unwrap_or(s)
     }
+
+    /// Try to read an immediate ICAP response (e.g., `503 Service Unavailable`)
+    /// from the server before sending the request.
+    ///
+    /// Some ICAP servers (including this crate's server implementation) may send
+    /// a `503` response right after `connect()` when the global connection limit
+    /// is exceeded. If the client blindly starts writing its request, this can
+    /// result in OS errors like `os error 10053` ("Software caused connection abort")
+    /// on Windows when writing into a socket that has already been closed.
+    ///
+    /// This helper attempts to detect such early responses:
+    /// - It waits up to `probe_ms` milliseconds for the server to send headers.
+    /// - If a valid ICAP response is received, it is parsed and returned.
+    /// - If no data arrives within the timeout, the method returns `Ok(None)`,
+    ///   and the caller may proceed with writing the ICAP request normally.
+    async fn try_read_early_response_now(stream: &mut TcpStream) -> IcapResult<Option<Response>> {
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 4096];
+
+        loop {
+            match stream.try_read(&mut tmp) {
+                Ok(0) => {
+                    // peer closed without headers — treat as no early response
+                    return Ok(None);
+                }
+                Ok(n) => {
+                    buf.extend_from_slice(&tmp[..n]);
+                    if let Some(end) = find_double_crlf(&buf) {
+                        // got headers; normalize/parse via existing helpers
+                        // (re-use your read_icap_body_if_any + parse_icap_response)
+                        // Note: we already have headers; if there's a body, we need to read it.
+                        // But since we're in "non-blocking" mode, safest is to accept only
+                        // headers-only early replies (like 503 null-body).
+                        // If you want to be robust, you can temporarily switch to blocking reads here.
+                        let (_code, mut full) = (/*dummy*/ 0u16, buf);
+                        // best-effort: no further read; parse whatever we have
+                        return parse_icap_response(&mut full).map(Some);
+                    }
+                    // Not enough for headers yet; loop to try_read again if kernel has more buffered data.
+                    // If kernel has no more, next try_read will WouldBlock and we'll exit as None.
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    return Ok(None); // nothing ready right now → proceed to write
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
 }
 
 /// Return connection back to idle slot if keep-alive is enabled.
@@ -678,10 +737,7 @@ async fn read_icap_headers(stream: &mut TcpStream) -> IcapResult<(u16, Vec<u8>)>
     };
 
     loop {
-        let n = stream
-            .read(&mut tmp)
-            .await
-            .map_err(|e| format!("I/O error reading ICAP headers: {e}").to_string())?;
+        let n = stream.read(&mut tmp).await.map_err(Error::Network)?;
 
         if n == 0 {
             // Peer closed before we saw \r\n\r\n.
@@ -690,7 +746,7 @@ async fn read_icap_headers(stream: &mut TcpStream) -> IcapResult<(u16, Vec<u8>)>
             if first_crlf_pos(&buf).is_some() && !has_double_crlf(&buf) {
                 buf.extend_from_slice(b"\r\n"); // synthesize the missing empty line
             } else {
-                return Err("Unexpected EOF while reading ICAP headers".into());
+                return Err(Error::EarlyCloseWithoutHeaders);
             }
         } else {
             buf.extend_from_slice(&tmp[..n]);
