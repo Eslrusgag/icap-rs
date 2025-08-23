@@ -27,8 +27,6 @@ use tokio::sync::Mutex;
 use tokio::time::timeout;
 use tracing::trace;
 
-const MAX_HDR_BYTES: usize = 64 * 1024;
-
 /// High-level ICAP client with connection reuse and Preview negotiation.
 ///
 /// Construct via [`Client::builder()`] and send requests using [`Client::send`]
@@ -119,6 +117,28 @@ impl ClientBuilder {
         self
     }
 
+    /// Sets the ICAP `User-Agent` header for all requests created by this client.
+    ///
+    /// A per-request override via `Request::icap_header("User-Agent", "...")`
+    /// takes precedence over the value set here.
+    ///
+    /// # Example
+    /// ```
+    /// use icap_rs::Client;
+    /// let client = Client::builder()
+    ///     .host("icap.example")
+    ///     .port(1344)
+    ///     .user_agent("my-app/1.2.3")
+    ///     .build();
+    /// ```
+    pub fn user_agent(mut self, user_agent: &str) -> Self {
+        self.default_headers.insert(
+            HeaderName::from_static("user-agent"),
+            HeaderValue::from_str(user_agent).expect("invalid User-Agent header value"),
+        );
+        self
+    }
+
     /// Enable or disable connection reuse (keep-alive).
     ///
     /// When enabled, the client will store a single idle connection and reuse it
@@ -158,20 +178,12 @@ impl ClientBuilder {
     pub fn build(self) -> Client {
         let host = self.host.expect("ClientBuilder: host is required");
         let port = self.port.unwrap_or(1344);
-        let mut default_headers = self.default_headers;
-        // ToDo: set version from CARGO_PKG_* MB
-        if !default_headers.contains_key("user-agent") {
-            default_headers.insert(
-                HeaderName::from_static("user-agent"),
-                HeaderValue::from_static("rs-icap-client/0.1.0"),
-            );
-        }
         Client {
             inner: Arc::new(ClientRef {
                 host,
                 port,
                 host_override: self.host_override,
-                default_headers,
+                default_headers: self.default_headers,
                 connection_policy: self.connection_policy,
                 read_timeout: self.read_timeout,
                 idle_conn: Mutex::new(None),
@@ -182,19 +194,14 @@ impl ClientBuilder {
 
 impl Default for ClientBuilder {
     fn default() -> Self {
-        let mut b = Self {
+        Self {
             host: None,
             port: None,
             host_override: None,
             default_headers: HeaderMap::new(),
             connection_policy: ConnectionPolicy::Close,
             read_timeout: None,
-        };
-        b.default_headers.insert(
-            HeaderName::from_static("user-agent"),
-            HeaderValue::from_static("rs-icap-client/0.1.0"),
-        );
-        b
+        }
     }
 }
 
@@ -710,16 +717,16 @@ async fn read_icap_headers(stream: &mut TcpStream) -> IcapResult<(u16, Vec<u8>)>
         // some servers send only one CRLF and keep the connection open.
         // To avoid hanging forever, accept a single-CRLF terminator for error responses
         // by normalizing it to \r\n\r\n and returning immediately.
-        if let Some(code) = parse_status_if_possible(&buf).map_err(|e| e.to_string())? {
-            if code >= 400 && code <= 599 {
-                if !has_double_crlf(&buf) {
-                    buf.extend_from_slice(b"\r\n"); // synthesize the missing empty line
-                }
-                return Ok((code, buf));
+        if let Some(code) = parse_status_if_possible(&buf).map_err(|e| e.to_string())?
+            && (400..=599).contains(&code)
+        {
+            if !has_double_crlf(&buf) {
+                buf.extend_from_slice(b"\r\n"); // synthesize the missing empty line
             }
+            return Ok((code, buf));
         }
 
-        if buf.len() > MAX_HDR_BYTES {
+        if buf.len() > crate::MAX_HDR_BYTES {
             // Defensive bound: prevent unbounded growth if peer never terminates headers.
             return Err("ICAP headers too large".into());
         }
@@ -911,7 +918,6 @@ mod tests {
         let head = extract_headers_text(&wire);
         assert!(head.starts_with("OPTIONS icap://icap.example:1344/options ICAP/1.0\r\n"));
         assert!(find_header_line(&head, "Host").is_some());
-        assert!(find_header_line(&head, "User-Agent").is_some());
         assert!(find_header_line(&head, "X-Trace-Id").is_some());
         let enc = find_header_line(&head, "Encapsulated").unwrap();
         assert!(enc.contains("null-body=0"));
@@ -1027,15 +1033,6 @@ mod tests {
         let head = extract_headers_text(&wire);
         let host_line = find_header_line(&head, "Host").unwrap();
         assert!(host_line.contains("icap.external.name"));
-    }
-
-    #[test]
-    fn user_agent_is_present_by_default() {
-        let c = Client::builder().host("h").port(1344).build();
-        let req = Request::options("s");
-        let wire = c.get_request_wire(&req, false).unwrap();
-        let head = extract_headers_text(&wire);
-        assert!(find_header_line(&head, "User-Agent").is_some());
     }
 
     async fn connect_pair() -> (TcpStream, TcpStream) {

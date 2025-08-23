@@ -27,7 +27,7 @@
 //! ```
 
 use crate::error::IcapResult;
-use crate::find_double_crlf;
+use crate::parser::find_double_crlf;
 use http::{HeaderMap, HeaderName, HeaderValue};
 use std::fmt;
 use std::str::FromStr;

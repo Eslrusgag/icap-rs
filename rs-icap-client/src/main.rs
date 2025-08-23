@@ -15,6 +15,9 @@ use chrono::Local;
 use std::collections::HashSet;
 use std::time::Duration;
 
+const BIN_NAME: &str = env!("CARGO_PKG_NAME");
+const BIN_VER: &str = env!("CARGO_PKG_VERSION");
+
 pub fn cli_styles() -> clap::builder::Styles {
     clap::builder::Styles::styled()
         .usage(
@@ -174,7 +177,10 @@ async fn main() -> IcapResult<()> {
             .init();
     }
 
-    info!("Starting rs-icap-client");
+    info!(
+        "Starting {BIN_NAME} v{BIN_VER} (using icap-rs v{})",
+        icap_rs::VERSION
+    );
     debug!("Arguments: {:?}", args);
 
     // Pick method: with -f default to RESPMOD like c-icap-client
@@ -200,9 +206,17 @@ async fn main() -> IcapResult<()> {
         .map(|sa| sa.ip().to_string())
         .unwrap_or_else(|| "?".into());
 
+    let ua = format!(
+        "{}/{} (lib: icap-rs/{})",
+        BIN_NAME,
+        BIN_VER,
+        icap_rs::VERSION
+    );
+
     let client = Client::builder()
         .from_uri(&args.uri)?
         .read_timeout(args.timeout.map(Duration::from_secs))
+        .user_agent(&ua)
         .build();
     let service = service_from_uri(&args.uri).unwrap_or_else(|| "/".to_string());
 
