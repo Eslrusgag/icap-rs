@@ -131,13 +131,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 }
 
 fn can_return_204(h: &HeaderMap) -> bool {
-    let allow_204 = h
-        .get("Allow")
+    h.get("Allow")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.split(',').any(|p| p.trim() == "204"))
-        .unwrap_or(false);
-    let is_preview = h.contains_key("Preview");
-    allow_204 || is_preview
+        .unwrap_or(false)
 }
 
 /// Returns (HTTP-headers length, HTTP-body length) for raw HTTP bytes.
