@@ -136,7 +136,11 @@ pub mod server;
 
 pub use client::Client;
 pub use options::{IcapMethod, IcapOptionsBuilder, OptionsConfig, TransferBehavior};
-pub use parser::*;
 pub use request::{EmbeddedHttp, Request};
 pub use response::{Response, ResponseBuilder, StatusCode};
 pub use server::{RequestHandler, Server, ServerBuilder};
+
+///Lib version
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+///Max Header size
+pub const MAX_HDR_BYTES: usize = 64 * 1024;

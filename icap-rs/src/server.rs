@@ -18,11 +18,9 @@ use tokio::sync::RwLock;
 use tracing::{error, trace, warn};
 
 use crate::error::IcapResult;
+use crate::parser::{read_chunked_to_end, serialize_icap_response};
 use crate::request::parse_icap_request;
-use crate::{
-    IcapMethod, OptionsConfig, Request, Response, StatusCode, read_chunked_to_end,
-    serialize_icap_response,
-};
+use crate::{IcapMethod, OptionsConfig, Request, Response, StatusCode};
 
 /// Per-service ICAP handler.
 pub type RequestHandler = Box<

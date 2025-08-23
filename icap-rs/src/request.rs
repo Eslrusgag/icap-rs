@@ -32,7 +32,7 @@
 //! ```
 
 use crate::error::IcapResult;
-use crate::find_double_crlf;
+use crate::parser::find_double_crlf;
 use http::{
     HeaderMap, HeaderName, HeaderValue, Request as HttpRequest, Response as HttpResponse,
     StatusCode as HttpStatus, Version,
