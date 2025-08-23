@@ -23,6 +23,9 @@ pub enum Error {
     #[error("Network timeout after {0:?}")]
     ClientTimeout(Duration),
 
+    #[error("Peer closed before ICAP headers")]
+    EarlyCloseWithoutHeaders,
+
     /// Failed to parse an ICAP message.
     #[error("ICAP parsing error: {0}")]
     Parse(String),

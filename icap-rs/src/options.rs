@@ -102,10 +102,9 @@ impl OptionsConfig {
         self
     }
 
-    /// Set maximum connections hint.
-    pub fn with_max_connections(mut self, max_connections: u32) -> Self {
-        self.max_connections = Some(max_connections);
-        self
+    //ToDo Destroy it maybe
+    pub(crate) fn with_max_connections(&mut self, n: u32) {
+        self.max_connections = Some(n);
     }
 
     /// Set `Options-TTL` (seconds).
@@ -191,38 +190,30 @@ impl OptionsConfig {
         if let Some(ref service) = self.service {
             response = response.add_header("Service", service);
         }
-
         if let Some(max_conn) = self.max_connections {
             response = response.add_header("Max-Connections", &max_conn.to_string());
         }
-
         if let Some(ttl) = self.options_ttl {
             response = response.add_header("Options-TTL", &ttl.to_string());
         }
-
         if let Some(date) = self.date {
             response = response.add_header(
                 "Date",
                 &date.format("%a, %d %b %Y %H:%M:%S GMT").to_string(),
             );
         }
-
         if let Some(ref service_id) = self.service_id {
             response = response.add_header("Service-ID", service_id);
         }
-
         if !self.allow.is_empty() {
             response = response.add_header("Allow", &self.allow.join(", "));
         }
-
         if let Some(preview) = self.preview {
             response = response.add_header("Preview", &preview.to_string());
         }
-
         if let Some(ref opt_body_type) = self.opt_body_type {
             response = response.add_header("Opt-body-type", opt_body_type);
         }
-
         // Transfer-* headers
         if !self.transfer_rules.is_empty() {
             let mut preview_extensions = Vec::new();
@@ -236,16 +227,13 @@ impl OptionsConfig {
                     TransferBehavior::Complete => complete_extensions.push(ext.clone()),
                 }
             }
-
-            // Default behavior marker as "*"
             if let Some(ref default_behavior) = self.default_transfer_behavior {
                 match default_behavior {
-                    TransferBehavior::Preview => preview_extensions.push("*".to_string()),
-                    TransferBehavior::Ignore => ignore_extensions.push("*".to_string()),
-                    TransferBehavior::Complete => complete_extensions.push("*".to_string()),
+                    TransferBehavior::Preview => preview_extensions.push("*".into()),
+                    TransferBehavior::Ignore => ignore_extensions.push("*".into()),
+                    TransferBehavior::Complete => complete_extensions.push("*".into()),
                 }
             }
-
             if !preview_extensions.is_empty() {
                 response = response.add_header("Transfer-Preview", &preview_extensions.join(", "));
             }
@@ -257,17 +245,14 @@ impl OptionsConfig {
                     response.add_header("Transfer-Complete", &complete_extensions.join(", "));
             }
         }
-
         // Custom headers
         for (name, value) in &self.custom_headers {
             response = response.add_header(name, value);
         }
-
         // Optional body
         if let Some(ref opt_body) = self.opt_body {
             response = response.with_body(opt_body);
         }
-
         response
     }
 
@@ -316,12 +301,6 @@ impl IcapOptionsBuilder {
     /// Set service description.
     pub fn service(mut self, service: &str) -> Self {
         self.config = self.config.with_service(service);
-        self
-    }
-
-    /// Set max connections.
-    pub fn max_connections(mut self, max_connections: u32) -> Self {
-        self.config = self.config.with_max_connections(max_connections);
         self
     }
 
