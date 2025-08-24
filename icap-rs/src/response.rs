@@ -407,11 +407,11 @@ mod tests {
 
     #[test]
     fn response_add_get_remove_header() {
-        let mut resp = Response::new(StatusCode::Ok200, "OK").add_header("Service", "Mailfilter");
+        let mut resp = Response::new(StatusCode::Ok200, "OK").add_header("Service", "Test");
         assert!(resp.has_header("Service"));
         assert_eq!(
             resp.get_header("Service").unwrap(),
-            &HeaderValue::from_static("Mailfilter")
+            &HeaderValue::from_static("Test")
         );
 
         let removed = resp.remove_header("Service");
@@ -457,7 +457,7 @@ mod tests {
     fn parse_minimal_200_without_body() {
         let raw = icap_bytes(
             "ICAP/1.0 200 OK\r\n\
-             Service: Mailfilter ICAP service\r\n\
+             Service: Test ICAP service\r\n\
              ISTag: policy.123\r\n\
              \r\n",
         );
@@ -467,7 +467,7 @@ mod tests {
         assert_eq!(r.status_text, "OK");
         assert_eq!(
             r.get_header("Service").unwrap(),
-            &HeaderValue::from_static("Mailfilter ICAP service")
+            &HeaderValue::from_static("Test ICAP service")
         );
         assert_eq!(
             r.get_header("ISTag").unwrap(),
