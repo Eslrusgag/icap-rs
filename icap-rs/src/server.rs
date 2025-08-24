@@ -24,16 +24,23 @@
 //! async fn main() -> IcapResult<()> {
 //!     let server = Server::builder()
 //!         .bind("127.0.0.1:1344")
-//!         // One handler serves both REQMOD and RESPMOD for service "spool".
-//!         .route("spool", [Method::ReqMod, Method::RespMod], |req: Request| async move {
-//!             if req.method.eq_ignore_ascii_case("REQMOD") {
-//!                 // handle request modification
-//!             } else {
-//!                 // handle response modification
+//!         // One handler for REQMOD and RESPMOD of the "scan" service.
+//!         .route("scan", [Method::ReqMod, Method::RespMod], |req: Request| async move {
+//!             match req.method {
+//!                 Method::ReqMod => {
+//!                     // handle request modification
+//!                     Ok(Response::new(StatusCode::Ok200, "OK")
+//!                         .add_header("Encapsulated", "null-body=0")
+//!                         .add_header("Content-Length", "0"))
+//!                 }
+//!                 Method::RespMod => {
+//!                     // handle response modification
+//!                     Ok(Response::new(StatusCode::Ok200, "OK")
+//!                         .add_header("Encapsulated", "null-body=0")
+//!                         .add_header("Content-Length", "0"))
+//!                 }
+//!                 Method::Options => unreachable!("OPTIONS is handled automatically by the server"),
 //!             }
-//!             Ok(Response::new(StatusCode::Ok200, "OK")
-//!                 .add_header("Encapsulated", "null-body=0")
-//!                 .add_header("Content-Length", "0"))
 //!         })
 //!         .with_max_connections(128)
 //!         .build()
@@ -43,7 +50,7 @@
 //! }
 //! ```
 //!
-//! When a client sends `OPTIONS icap://host/spool`, the server responds with
+//! When a client sends `OPTIONS icap://host/scan`, the server responds with
 //! `Methods: REQMOD, RESPMOD` based on the registration above. If a method not in
 //! the list is used, `405 Method Not Allowed` is returned; unknown services yield `404`.
 
@@ -230,8 +237,7 @@ impl Server {
                 .unwrap_or(&req.service)
                 .to_string();
 
-            let method =
-                parse_method(&req.method).ok_or_else(|| "Unknown ICAP method".to_string())?;
+            let method = req.method;
 
             let resp = {
                 let routes_guard = routes.read().await;
@@ -309,18 +315,6 @@ impl Server {
             cfg.with_max_connections(n);
         }
         cfg.build_response()
-    }
-}
-
-fn parse_method(s: &str) -> Option<Method> {
-    if s.eq_ignore_ascii_case("OPTIONS") {
-        Some(Method::Options)
-    } else if s.eq_ignore_ascii_case("REQMOD") {
-        Some(Method::ReqMod)
-    } else if s.eq_ignore_ascii_case("RESPMOD") {
-        Some(Method::RespMod)
-    } else {
-        None
     }
 }
 

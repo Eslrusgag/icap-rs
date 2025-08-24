@@ -83,7 +83,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             "blocker",
             [Method::ReqMod, Method::RespMod],
             |request: Request| async move {
-                if request.method.eq_ignore_ascii_case("REQMOD") {
+                if request.method == Method::ReqMod {
                     if let Some(EmbeddedHttp::Req(http_req)) = &request.embedded {
                         info!(
                             "BLOCKER REQMOD for {} {}",
@@ -93,7 +93,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     } else {
                         warn!("BLOCKER: REQMOD without embedded HTTP request");
                     }
-                } else {
+                } else if request.method == Method::RespMod {
                     if let Some(EmbeddedHttp::Resp(http_resp)) = &request.embedded {
                         info!("BLOCKER RESPMOD, upstream status {}", http_resp.status());
                     } else {

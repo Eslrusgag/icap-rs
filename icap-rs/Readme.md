@@ -162,19 +162,25 @@ async fn main() -> icap_rs::error::IcapResult<()> {
 You can route by **strings** (case-insensitive) or enums. The same handler can handle both `REQMOD` and `RESPMOD`:
 
 ```rust,no_run
-use icap_rs::{Server, Request, Response, StatusCode};
+use icap_rs::{Server, Method, Request, Response, StatusCode};
+use icap_rs::error::IcapResult;
 
 #[tokio::main]
-async fn main() -> icap_rs::error::IcapResult<()> {
+async fn main() -> IcapResult<()> {
     let server = Server::builder()
         .bind("127.0.0.1:1344")
-        // Accept both REQMOD and RESPMOD using strings
+        // Accept both REQMOD and RESPMOD using strings (case-insensitive)
         .route("spool", ["REQMOD", "respmod"], |req: Request| async move {
-            if req.method.eq_ignore_ascii_case("REQMOD") {
-                // request logic
-            } else {
-                // response logic
+            match req.method {
+                Method::ReqMod => {
+                    // request logic
+                }
+                Method::RespMod => {
+                    // response logic
+                }
+                Method::Options => unreachable!("OPTIONS is handled automatically"),
             }
+
             Ok(Response::new(StatusCode::Ok200, "OK")
                 .add_header("Encapsulated", "null-body=0")
                 .add_header("Content-Length", "0"))

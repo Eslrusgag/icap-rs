@@ -10,12 +10,12 @@
 use crate::error::{Error, IcapResult};
 use crate::parser::parse_encapsulated_header;
 use crate::parser::{
-    canon_icap_header, find_double_crlf, read_chunked_to_end, serialize_http_request,
-    serialize_http_response, split_http_bytes, write_chunk, write_chunk_into,
+    canon_icap_header, find_double_crlf, read_chunked_to_end, write_chunk, write_chunk_into,
 };
-use crate::request::{EmbeddedHttp, Request};
+use crate::request::{Request, serialize_embedded_http};
 use crate::response::{Response, parse_icap_response};
 
+use crate::Method;
 use http::{HeaderMap, HeaderName, HeaderValue};
 use std::path::Path;
 use std::sync::Arc;
@@ -63,6 +63,11 @@ pub enum ConnectionPolicy {
 
 /// Builder for [`Client`]. Use it to configure host/port, headers, keep-alive,
 /// read timeouts, and other options before creating a client instance.
+///
+/// By default:
+/// - `ConnectionPolicy` is `Close`;
+/// - no host/port are set until you call [`ClientBuilder::host`] / [`ClientBuilder::port`]
+///   or [`ClientBuilder::from_uri`].
 #[derive(Debug)]
 pub struct ClientBuilder {
     host: Option<String>,
@@ -75,12 +80,6 @@ pub struct ClientBuilder {
 
 impl ClientBuilder {
     /// Create a new `ClientBuilder` with default settings.
-    ///
-    /// By default:
-    /// - `ConnectionPolicy` is `Close`;
-    /// - `User-Agent` header is set during `build()` if not provided;
-    /// - no host/port are set until you call [`ClientBuilder::host`] / [`ClientBuilder::port`]
-    ///   or [`ClientBuilder::from_uri`].
     pub fn new() -> Self {
         Self::default()
     }
@@ -255,8 +254,7 @@ impl Client {
         stream.write_all(&built.bytes).await?;
         stream.flush().await?;
 
-        // OPTIONS is always final (no preview/body)
-        if req.method.eq_ignore_ascii_case("OPTIONS") {
+        if req.method == Method::Options {
             let (_code, mut buf) =
                 Self::with_timeout(self.inner.read_timeout, read_icap_headers(&mut stream)).await?;
             Self::with_timeout(
@@ -587,11 +585,11 @@ impl Client {
     /// result in OS errors like `os error 10053` ("Software caused connection abort")
     /// on Windows when writing into a socket that has already been closed.
     ///
-    /// This helper attempts to detect such early responses:
-    /// - It waits up to `probe_ms` milliseconds for the server to send headers.
-    /// - If a valid ICAP response is received, it is parsed and returned.
-    /// - If no data arrives within the timeout, the method returns `Ok(None)`,
-    ///   and the caller may proceed with writing the ICAP request normally.
+    /// This helper performs a **non-blocking** best-effort probe:
+    /// - If kernel buffers already contain a full header block (`\r\n\r\n`),
+    ///   it finishes reading the body if present (chunked) and returns the parsed response.
+    /// - If there are no bytes ready (`WouldBlock`), it returns `Ok(None)` immediately,
+    ///   and the caller proceeds with writing the ICAP request.
     async fn try_read_early_response_now(stream: &mut TcpStream) -> IcapResult<Option<Response>> {
         let mut buf = Vec::new();
         let mut tmp = [0u8; 4096];
@@ -599,27 +597,22 @@ impl Client {
         loop {
             match stream.try_read(&mut tmp) {
                 Ok(0) => {
-                    // peer closed without headers — treat as no early response
+                    // Peer closed without headers — treat as no early response.
                     return Ok(None);
                 }
                 Ok(n) => {
                     buf.extend_from_slice(&tmp[..n]);
-                    if let Some(end) = find_double_crlf(&buf) {
-                        // got headers; normalize/parse via existing helpers
-                        // (re-use your read_icap_body_if_any + parse_icap_response)
-                        // Note: we already have headers; if there's a body, we need to read it.
-                        // But since we're in "non-blocking" mode, safest is to accept only
-                        // headers-only early replies (like 503 null-body).
-                        // If you want to be robust, you can temporarily switch to blocking reads here.
-                        let (_code, mut full) = (/*dummy*/ 0u16, buf);
-                        // best-effort: no further read; parse whatever we have
-                        return parse_icap_response(&mut full).map(Some);
+                    if find_double_crlf(&buf).is_some() {
+                        // There are headers. We'll finish reading the body if Encapsulated points to it.
+                        // read_icap_body_if_any will only wait if there really is a body.
+                        let _ = read_icap_body_if_any(stream, &mut buf).await;
+                        return parse_icap_response(&buf).map(Some);
                     }
-                    // Not enough for headers yet; loop to try_read again if kernel has more buffered data.
-                    // If kernel has no more, next try_read will WouldBlock and we'll exit as None.
+                    // Continue reading while the core gives out data in one fell swoop.
+                    continue;
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    return Ok(None); // nothing ready right now → proceed to write
+                    return Ok(None); // Nothing ready - we write a request.
                 }
                 Err(e) => return Err(e.into()),
             }
@@ -667,7 +660,6 @@ async fn read_icap_body_if_any(stream: &mut TcpStream, buf: &mut Vec<u8>) -> Ica
             buf.extend_from_slice(&tmp[..n]);
         }
 
-        // read_chunked_to_end возвращает usize → мапим в ().
         read_chunked_to_end(stream, buf, body_abs).await.map(|_| ())
     } else {
         Ok(())
@@ -786,13 +778,6 @@ async fn read_icap_headers(stream: &mut TcpStream) -> IcapResult<(u16, Vec<u8>)>
             // Defensive bound: prevent unbounded growth if peer never terminates headers.
             return Err("ICAP headers too large".into());
         }
-    }
-}
-
-fn serialize_embedded_http(e: &EmbeddedHttp) -> (Vec<u8>, Option<Vec<u8>>) {
-    match e {
-        EmbeddedHttp::Req(r) => split_http_bytes(&serialize_http_request(r)),
-        EmbeddedHttp::Resp(r) => split_http_bytes(&serialize_http_response(r)),
     }
 }
 
