@@ -12,7 +12,7 @@
 //! # Example (REQMOD with embedded HTTP request)
 //! ```rust
 //! use http::Request as HttpRequest;
-//! use icap_rs::Request; // re-exported from icap_rs::request
+//! use icap_rs::{Method, Request};
 //!
 //! let http_req = HttpRequest::builder()
 //!     .method("GET")
@@ -26,13 +26,15 @@
 //!     .preview(4)
 //!     .with_http_request(http_req);
 //!
-//! assert!(icap_req.method.eq_ignore_ascii_case("REQMOD"));
+//!assert_eq!(icap_req.method, Method::ReqMod);
 //! assert!(icap_req.allow_204);
 //! assert_eq!(icap_req.preview_size, Some(4));
 //! ```
 
 use crate::error::IcapResult;
-use crate::parser::find_double_crlf;
+use crate::parser::{
+    find_double_crlf, serialize_http_request, serialize_http_response, split_http_bytes,
+};
 use http::{
     HeaderMap, HeaderName, HeaderValue, Request as HttpRequest, Response as HttpResponse,
     StatusCode as HttpStatus, Version,
@@ -83,12 +85,22 @@ impl fmt::Display for Method {
     }
 }
 
+impl Method {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Method::ReqMod => "REQMOD",
+            Method::RespMod => "RESPMOD",
+            Method::Options => "OPTIONS",
+        }
+    }
+}
+
 impl From<&str> for Method {
     fn from(s: &str) -> Self {
         match s.trim().to_ascii_uppercase().as_str() {
             "REQMOD" => Method::ReqMod,
             "RESPMOD" => Method::RespMod,
-            "OPTIONS" => panic!("OPTIONS is answered automatically; do not route it explicitly"),
+            "OPTIONS" => Method::Options,
             other => panic!("Unknown ICAP method string: {other}"),
         }
     }
@@ -109,6 +121,13 @@ pub enum EmbeddedHttp {
     Resp(HttpResponse<Vec<u8>>),
 }
 
+pub(crate) fn serialize_embedded_http(e: &EmbeddedHttp) -> (Vec<u8>, Option<Vec<u8>>) {
+    match e {
+        EmbeddedHttp::Req(r) => split_http_bytes(&serialize_http_request(r)),
+        EmbeddedHttp::Resp(r) => split_http_bytes(&serialize_http_response(r)),
+    }
+}
+
 /// Single public ICAP request type used by the client.
 ///
 /// This structure carries ICAP method/service and flags that influence how
@@ -116,7 +135,7 @@ pub enum EmbeddedHttp {
 #[derive(Debug, Clone)]
 pub struct Request {
     /// ICAP method: `"OPTIONS" | "REQMOD" | "RESPMOD"`.
-    pub method: String,
+    pub method: Method,
     /// Service path like `"icap/test"` or `"respmod"`. Leading slash is allowed.
     pub service: String,
     /// ICAP headers (case-insensitive).
@@ -135,7 +154,7 @@ pub struct Request {
 
 impl Request {
     /// Create a new ICAP request.
-    pub fn new(method: impl Into<String>, service: impl Into<String>) -> Self {
+    pub fn new<M: Into<Method>>(method: M, service: impl Into<String>) -> Self {
         Self {
             method: method.into(),
             service: service.into(),
@@ -150,15 +169,15 @@ impl Request {
 
     ///Construct Options Request.
     pub fn options(service: impl Into<String>) -> Self {
-        Self::new("OPTIONS", service)
+        Self::new(Method::Options, service)
     }
     ///Construct ReqMod Request.
     pub fn reqmod(service: impl Into<String>) -> Self {
-        Self::new("REQMOD", service)
+        Self::new(Method::ReqMod, service)
     }
     ///Construct RespMod Request.
     pub fn respmod(service: impl Into<String>) -> Self {
-        Self::new("RESPMOD", service)
+        Self::new(Method::RespMod, service)
     }
 
     /// Set/override an ICAP header.
@@ -192,7 +211,7 @@ impl Request {
     /// True for REQMOD/RESPMOD.
     #[inline]
     pub fn is_mod(&self) -> bool {
-        self.method.eq_ignore_ascii_case("REQMOD") || self.method.eq_ignore_ascii_case("RESPMOD")
+        matches!(self.method, Method::ReqMod | Method::RespMod)
     }
 
     /// Attach embedded HTTP.
@@ -216,7 +235,8 @@ pub(crate) fn parse_icap_request(data: &[u8]) -> IcapResult<Request> {
     let mut lines = head_str.split("\r\n");
     let request_line = lines.next().ok_or("Empty request")?;
     let mut parts = request_line.split_whitespace();
-    let method = parts.next().ok_or("Invalid request line")?.to_string();
+    let method_str = parts.next().ok_or("Invalid request line")?;
+    let method = Method::from(method_str);
     let icap_uri = parts.next().ok_or("Invalid request line")?.to_string();
     let _version = parts.next().ok_or("Invalid request line")?.to_string();
     debug!("parse_icap_request: {} {}", method, icap_uri);
@@ -365,16 +385,16 @@ mod tests {
     #[test]
     fn builder_creates_basic_requests() {
         let o = Request::options("icap/test");
-        assert!(o.method.eq_ignore_ascii_case("OPTIONS"));
+        assert_eq!(o.method, Method::Options);
         assert_eq!(o.service, "icap/test");
         assert!(!o.is_mod());
 
         let r = Request::reqmod("svc");
-        assert!(r.method.eq_ignore_ascii_case("REQMOD"));
+        assert_eq!(r.method, Method::ReqMod);
         assert!(r.is_mod());
 
         let s = Request::respmod("svc");
-        assert!(s.method.eq_ignore_ascii_case("RESPMOD"));
+        assert_eq!(s.method, Method::RespMod);
         assert!(s.is_mod());
     }
 
@@ -430,11 +450,11 @@ mod tests {
     fn parse_minimal_options_without_http() {
         let raw = icap_bytes(
             "OPTIONS icap://icap.example.org/icap/test ICAP/1.0\r\n\
-             Host: icap.example.org\r\n\
-             \r\n",
+         Host: icap.example.org\r\n\
+         \r\n",
         );
         let r = parse_icap_request(&raw).expect("parse");
-        assert!(r.method.eq_ignore_ascii_case("OPTIONS"));
+        assert_eq!(r.method, Method::Options);
         assert_eq!(r.service, "test");
         assert_eq!(
             r.icap_headers.get("Host").unwrap(),
@@ -450,13 +470,13 @@ mod tests {
     fn parse_reqmod_with_allow_and_preview() {
         let raw = icap_bytes(
             "REQMOD icap://icap.example.org/icap/test ICAP/1.0\r\n\
-             Host: icap.example.org\r\n\
-             Allow: 204, 206\r\n\
-             Preview: 128\r\n\
-             \r\n",
+         Host: icap.example.org\r\n\
+         Allow: 204, 206\r\n\
+         Preview: 128\r\n\
+         \r\n",
         );
         let r = parse_icap_request(&raw).expect("parse");
-        assert!(r.method.eq_ignore_ascii_case("REQMOD"));
+        assert_eq!(r.method, Method::ReqMod);
         assert!(r.allow_204);
         assert!(r.allow_206);
         assert_eq!(r.preview_size, Some(128));
