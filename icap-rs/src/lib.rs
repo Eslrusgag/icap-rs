@@ -15,7 +15,7 @@ pub use response::{Response, StatusCode};
 pub use server::{RequestHandler, Server, ServerBuilder};
 
 ///Lib version
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const LIB_VERSION: &str = env!("CARGO_PKG_VERSION");
 ///Max Header size
 pub const MAX_HDR_BYTES: usize = 64 * 1024;
 /// Supported ICAP protocol version.
