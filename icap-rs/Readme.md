@@ -123,19 +123,21 @@ A minimal server exposing two services (`reqmod`, `respmod`) and replying `204 N
 use icap_rs::{Server, Request, Response, StatusCode};
 use icap_rs::options::OptionsConfig;
 
+const ISTAG: &str = "example-1.0";
+
 #[tokio::main]
 async fn main() -> icap_rs::error::IcapResult<()> {
     let server = Server::builder()
         .bind("127.0.0.1:1344")
-        // REQMOD → 204 (no changes)
+        // REQMOD → 204 (no changes). Encapsulated will be set automatically (null-body=0).
         .route_reqmod("reqmod", |_req: Request| async move {
-            Ok(Response::no_content().add_header("Content-Length", "0"))
+            Ok(Response::no_content().try_set_istag(ISTAG)?)
         })
-        // RESPMOD → 204 as well
+        // RESPMOD → 204 (also without body).
         .route_respmod("respmod", |_req: Request| async move {
-            Ok(Response::no_content().add_header("Content-Length", "0"))
+            Ok(Response::no_content().try_set_istag(ISTAG)?)
         })
-        // Per-service OPTIONS config (no need to list Methods — router injects them)
+        // Per-service OPTIONS config (Methods do not need to be specified - the router will supply them automatically)
         .set_options(
             "reqmod",
             OptionsConfig::new("example-reqmod-1.0")
@@ -164,32 +166,48 @@ You can route by **strings** (case-insensitive) or enums. The same handler can h
 ```rust,no_run
 use icap_rs::{Server, Method, Request, Response, StatusCode};
 use icap_rs::error::IcapResult;
+use http::{Response as HttpResponse, StatusCode as HttpStatus, Version};
+
+const ISTAG: &str = "test-1.0";
+
+fn make_http(body: &str) -> HttpResponse<Vec<u8>> {
+    HttpResponse::builder()
+        .status(HttpStatus::OK)
+        .version(Version::HTTP_11)
+        .header("Content-Length", body.len().to_string())
+        .body(body.as_bytes().to_vec())
+        .unwrap()
+}
 
 #[tokio::main]
 async fn main() -> IcapResult<()> {
     let server = Server::builder()
         .bind("127.0.0.1:1344")
-        // Accept both REQMOD and RESPMOD using strings (case-insensitive)
-        .route("spool", ["REQMOD", "respmod"], |req: Request| async move {
-            match req.method {
+        // One handler handles both REQMOD and RESPMOD (strings are case-insensitive)
+        .route("test", ["REQMOD", "respmod"], |req: Request| async move {
+            let resp = match req.method {
                 Method::ReqMod => {
-                    // request logic
+                    // We don't change anything → 204
+                    Response::no_content().try_set_istag(ISTAG)?
                 }
                 Method::RespMod => {
-                    // response logic
+                    // Return 200 with embedded HTTP.
+                    // Encapsulated (res-hdr[, res-body]) will be set automatically.
+                    let http = make_http("hello from icap");
+                    Response::new(StatusCode::Ok200, "OK")
+                        .try_set_istag(ISTAG)?
+                        .with_http_response(&http)?
                 }
                 Method::Options => unreachable!("OPTIONS is handled automatically"),
-            }
-
-            Ok(Response::new(StatusCode::Ok200, "OK")
-                .add_header("Encapsulated", "null-body=0")
-                .add_header("Content-Length", "0"))
+            };
+            Ok(resp)
         })
         .build()
         .await?;
 
     server.run().await
 }
+
 ```
 
 ---

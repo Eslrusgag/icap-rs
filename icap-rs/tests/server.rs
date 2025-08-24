@@ -8,7 +8,9 @@ use icap_rs::server::Server;
 use tokio::time::{Duration, sleep};
 
 async fn always_204_handler(_req: Request) -> IcapResult<Response> {
-    Ok(Response::no_content().add_header("Server", "icap-rs/test"))
+    Ok(Response::no_content()
+        .add_header("Server", "icap-rs/test")
+        .try_set_istag("test")?)
 }
 
 async fn start_server_on(port: u16) {
@@ -52,7 +54,7 @@ async fn respmod_no_allow_with_preview_may_be_204() {
 
     let req = Request::respmod("respmod")
         .allow_204(false)
-        .preview(0) // отправляем Preview
+        .preview(0)
         .preview_ieof(true)
         .with_http_response(make_embedded_http("hello"));
 
@@ -76,7 +78,7 @@ async fn respmod_allow_present_may_be_204() {
     let client = Client::builder().host("127.0.0.1").port(port).build();
 
     let req = Request::respmod("respmod")
-        .allow_204(true) // разрешаем 204
+        .allow_204(true)
         .with_http_response(make_embedded_http("hello"));
 
     let resp = client.send(&req).await.expect("icap send");

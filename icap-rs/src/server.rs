@@ -256,15 +256,12 @@ impl Server {
                                     .add_allow("204")
                             };
 
-                            // Впрыскиваем Methods (скрытый API)
                             cfg.set_methods(allowed);
 
-                            // Дефолтный Service, если не задан пользователем
                             if cfg.service.is_none() {
                                 cfg = cfg.with_service(&format!("ICAP Service {}", service_name));
                             }
 
-                            // Проставляем глобальный лимит, если в cfg не задан
                             if let (Some(n), None) = (advertised_max_conn, cfg.max_connections) {
                                 cfg.with_max_connections(n);
                             }
@@ -293,7 +290,7 @@ impl Server {
             };
 
             // === Write response and continue (keep-alive) ===
-            let bytes = serialize_icap_response(&resp)?;
+            let bytes = resp.to_raw()?;
             socket.write_all(&bytes).await?;
             socket.flush().await?;
             trace!("Response sent for service: {}", service_name);
