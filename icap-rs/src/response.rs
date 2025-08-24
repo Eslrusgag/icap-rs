@@ -149,9 +149,9 @@ impl Response {
     pub fn no_content_with_headers(headers: HeaderMap) -> IcapResult<Self> {
         let istag = headers
             .get("ISTag")
-            .ok_or_else(|| Error::InvalidISTag("missing ISTag header".into()))?
+            .ok_or(Error::MissingHeader("ISTag"))?
             .to_str()
-            .map_err(|e| Error::Header(e.to_string()))?;
+            .map_err(|e| Error::Unexpected(e.to_string()))?;
         validate_istag(istag)?;
 
         Ok(Self {
@@ -209,9 +209,9 @@ impl Response {
         let istag = self
             .headers
             .get("ISTag")
-            .ok_or_else(|| Error::InvalidISTag("missing ISTag header".into()))?
+            .ok_or(Error::MissingHeader("ISTag"))?
             .to_str()
-            .map_err(|e| Error::Header(e.to_string()))?;
+            .map_err(|e| Error::Unexpected(e.to_string()))?;
         validate_istag(istag)?;
 
         if matches!(self.status_code, StatusCode::NoContent204) {
@@ -383,7 +383,7 @@ pub(crate) fn parse_icap_response(raw: &[u8]) -> IcapResult<Response> {
 
     if !headers.contains_key("ISTag") {
         if require_istag {
-            return Err(Error::InvalidISTag("missing ISTag header".into()));
+            return Err(Error::MissingHeader("ISTag"));
         } else {
             tracing::warn!(
                 code = %status_code,
@@ -554,7 +554,7 @@ mod tests {
     fn to_raw_errors_if_istag_missing() {
         let resp = Response::new(StatusCode::Ok200, "OK").add_header("Service", "X");
         let err = resp.to_raw().unwrap_err();
-        assert!(matches!(err, Error::InvalidISTag(_)));
+        assert!(matches!(err, Error::MissingHeader(h) if h == "ISTag"));
     }
 
     #[test]

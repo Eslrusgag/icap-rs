@@ -54,6 +54,10 @@ pub enum Error {
     #[error("Invalid ISTag: {0}")]
     InvalidISTag(String),
 
+    /// Missing required ICAP header (e.g. Host / Encapsulated, IStag).
+    #[error("Missing required header: {0}")]
+    MissingHeader(&'static str),
+
     /// Invalid or malformed header.
     #[error("Header error: {0}")]
     Header(String),

@@ -179,7 +179,7 @@ async fn main() -> IcapResult<()> {
 
     info!(
         "Starting {BIN_NAME} v{BIN_VER} (using icap-rs v{})",
-        icap_rs::VERSION
+        icap_rs::LIB_VERSION
     );
     debug!("Arguments: {:?}", args);
 
@@ -210,7 +210,7 @@ async fn main() -> IcapResult<()> {
         "{}/{} (lib: icap-rs/{})",
         BIN_NAME,
         BIN_VER,
-        icap_rs::VERSION
+        icap_rs::LIB_VERSION
     );
 
     let client = Client::builder()
