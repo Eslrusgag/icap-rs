@@ -5,9 +5,7 @@ use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
 
-use icap_rs::IcapMethod;
 use icap_rs::client::Client;
-use icap_rs::options::OptionsConfig;
 use icap_rs::request::Request;
 use icap_rs::response::{Response, StatusCode};
 
@@ -21,16 +19,14 @@ async fn spawn_server_with_limit(limit: usize) -> (String, JoinHandle<()>) {
     let port = find_free_port();
     let addr = format!("127.0.0.1:{port}");
 
-    let opts = OptionsConfig::new(vec![IcapMethod::ReqMod, IcapMethod::RespMod], "itest-1.0")
-        .with_service("Integration Test ICAP Service")
-        .add_allow("204")
-        .with_options_ttl(60);
-
     let server = icap_rs::server::Server::builder()
         .bind(&addr)
         .with_max_connections(limit)
-        // можно задать options для конкретного сервиса, но нам не критично
-        .add_options_config("svc-options", opts)
+        .route_reqmod("svc-options", |_: Request| async move {
+            Ok(Response::new(StatusCode::Ok200, "OK")
+                .add_header("Encapsulated", "null-body=0")
+                .add_header("Content-Length", "0"))
+        })
         .build()
         .await
         .expect("server build failed");
@@ -39,9 +35,7 @@ async fn spawn_server_with_limit(limit: usize) -> (String, JoinHandle<()>) {
         let _ = server.run().await;
     });
 
-    // подождать, чтобы bind точно состоялся
     wait_port_ready(&addr).await;
-
     (addr, h)
 }
 

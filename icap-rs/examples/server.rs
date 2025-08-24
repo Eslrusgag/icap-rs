@@ -1,7 +1,7 @@
 // Minimal ICAP server with several services:
 // - reqmod:    demonstrates REQMOD flow and 204 handling
 // - respmod:   demonstrates RESPMOD flow and 204 handling
-// - blocker:   returns ICAP 200 with an encapsulated HTTP 403 "Blocked!" page
+// - blocker:   returns ICAP 200 with an encapsulated HTTP 403 "Blocked!" page (for REQMOD & RESPMOD)
 
 use http::HeaderMap;
 use icap_rs::options::{IcapMethod, OptionsConfig};
@@ -16,37 +16,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .with_max_level(tracing::Level::TRACE)
         .init();
 
-    let reqmod_opts = OptionsConfig::new(vec![IcapMethod::ReqMod], "reqmod-1.0")
+    // OPTIONS configs (SmallVec-based)
+    let reqmod_opts = OptionsConfig::new("reqmod-1.0")
         .with_service("Request Modifier")
         .with_options_ttl(3600)
         .add_allow("204")
         .with_preview(1024);
 
-    let respmod_opts = OptionsConfig::new(vec![IcapMethod::RespMod], "respmod-1.0")
+    let respmod_opts = OptionsConfig::new("respmod-1.0")
         .with_service("Response Modifier")
         .with_options_ttl(3600)
         .add_allow("204")
         .with_preview(2048);
 
-    // New service: always returns ICAP 200 with encapsulated HTTP 403 "Blocked!"
-    let blocker_opts = OptionsConfig::new(vec![IcapMethod::ReqMod], "blocker-1.0")
-        .with_service("Request Blocker")
+    // Blocker: announce BOTH methods in OPTIONS
+    let blocker_opts = OptionsConfig::new("blocker-1.0")
+        .with_service("Request/Response Blocker")
         .with_options_ttl(3600)
         .with_preview(0);
 
     let server = Server::builder()
         .bind("127.0.0.1:1344")
-        .with_max_connections(1)
-        // reqmod: if client allows 204 and no changes required, return 204
-        .add_service("reqmod", |request: Request| async move {
+        // ---------- REQMOD demo ----------
+        .route_reqmod("reqmod", |request: Request| async move {
             info!("REQMOD called: {}", request.service);
-
-            if !request.method.eq_ignore_ascii_case("REQMOD") {
-                return Ok(
-                    Response::new(StatusCode::MethodNotAllowed405, "Method Not Allowed")
-                        .add_header("Content-Length", "0"),
-                );
-            }
 
             if let Some(EmbeddedHttp::Req(http_req)) = &request.embedded {
                 info!("HTTP {} {}", http_req.method(), http_req.uri());
@@ -59,20 +52,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
 
             Ok(Response::new(StatusCode::Ok200, "OK")
+                .add_header("Encapsulated", "null-body=0")
                 .add_header("Content-Length", "0")
                 .add_header("Server", "icap-rs/0.1.0"))
         })
-        .add_options_config("reqmod", reqmod_opts)
-        // respmod: demonstrate access to embedded HTTP response
-        .add_service("respmod", |request: Request| async move {
+        .set_options("reqmod", reqmod_opts)
+        // ---------- RESPMOD demo ----------
+        .route_respmod("respmod", |request: Request| async move {
             info!("RESPMOD called: {}", request.service);
-
-            if !request.method.eq_ignore_ascii_case("RESPMOD") {
-                return Ok(
-                    Response::new(StatusCode::MethodNotAllowed405, "Method Not Allowed")
-                        .add_header("Content-Length", "0"),
-                );
-            }
 
             if let Some(EmbeddedHttp::Resp(http_resp)) = &request.embedded {
                 info!("HTTP status: {}", http_resp.status());
@@ -85,40 +72,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
 
             Ok(Response::new(StatusCode::Ok200, "OK")
+                .add_header("Encapsulated", "null-body=0")
                 .add_header("Content-Length", "0")
                 .add_header("Server", "icap-rs/0.1.0"))
         })
-        .add_options_config("respmod", respmod_opts)
-        // blocker: return ICAP 200 with encapsulated HTTP 403 "Blocked!"
-        .add_service("blocker", |request: Request| async move {
-            info!("BLOCKER (REQMOD): {}", request.service);
+        .set_options("respmod", respmod_opts)
+        // ---------- Blocker (REQMOD & RESPMOD) ----------
+        .route(
+            "blocker",
+            [IcapMethod::ReqMod, IcapMethod::RespMod],
+            |request: Request| async move {
+                if request.method.eq_ignore_ascii_case("REQMOD") {
+                    if let Some(EmbeddedHttp::Req(http_req)) = &request.embedded {
+                        info!(
+                            "BLOCKER REQMOD for {} {}",
+                            http_req.method(),
+                            http_req.uri()
+                        );
+                    } else {
+                        warn!("BLOCKER: REQMOD without embedded HTTP request");
+                    }
+                } else {
+                    if let Some(EmbeddedHttp::Resp(http_resp)) = &request.embedded {
+                        info!("BLOCKER RESPMOD, upstream status {}", http_resp.status());
+                    } else {
+                        warn!("BLOCKER: RESPMOD without embedded HTTP response");
+                    }
+                }
 
-            if !request.method.eq_ignore_ascii_case("REQMOD") {
-                return Ok(
-                    Response::new(StatusCode::MethodNotAllowed405, "Method Not Allowed")
-                        .add_header("Content-Length", "0"),
-                );
-            }
+                let reason = "Blocked!";
+                let body = create_block_403(reason);
+                let (hdr_len, _) = split_http_bytes(&body); // res-hdr=0, res-body=<offset>
 
-            if let Some(EmbeddedHttp::Req(http_req)) = &request.embedded {
-                info!("BLOCKER saw HTTP {} {}", http_req.method(), http_req.uri());
-            } else {
-                warn!("BLOCKER: REQMOD without embedded HTTP request");
-            }
-
-            // Build a block page (encapsulated HTTP response)
-            let reason = "Blocked!";
-            let body = create_block_403(reason);
-
-            // Encapsulated: res-hdr=0, res-body=<offset of the HTTP body>
-            let (hdr_len, _) = split_http_bytes(&body);
-
-            Ok(Response::new(StatusCode::Ok200, "OK")
-                .add_header("ISTag", "\"blocker-1.0\"")
-                .add_header("Encapsulated", &format!("res-hdr=0, res-body={}", hdr_len))
-                .with_body(&body))
-        })
-        .add_options_config("blocker", blocker_opts)
+                Ok(Response::new(StatusCode::Ok200, "OK")
+                    .add_header("ISTag", "\"blocker-1.0\"")
+                    .add_header("Encapsulated", &format!("res-hdr=0, res-body={}", hdr_len))
+                    .with_body(&body))
+            },
+        )
+        .set_options("blocker", blocker_opts)
         .build()
         .await?;
 

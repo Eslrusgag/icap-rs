@@ -2,7 +2,7 @@
 //!
 //! This module provides types to build an ICAP `OPTIONS` response for a given
 //! service. It includes:
-//! - [`IcapMethod`] — methods supported by a service
+//! - [`IcapMethod`] — ICAP methods
 //! - [`TransferBehavior`] — per-extension transfer hints (Preview/Ignore/Complete)
 //! - [`OptionsConfig`] — a builder-like struct that serializes to an ICAP response
 //! - [`IcapOptionsBuilder`] — fluent builder that validates the config
@@ -12,14 +12,16 @@
 
 use crate::response::{Response, StatusCode};
 use chrono::{DateTime, Utc};
+use smallvec::SmallVec;
 use std::collections::HashMap;
 use std::fmt;
 
 /// ICAP methods supported by a service.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
 pub enum IcapMethod {
     ReqMod,
     RespMod,
+    Options,
 }
 
 impl fmt::Display for IcapMethod {
@@ -27,6 +29,7 @@ impl fmt::Display for IcapMethod {
         match self {
             IcapMethod::ReqMod => write!(f, "REQMOD"),
             IcapMethod::RespMod => write!(f, "RESPMOD"),
+            IcapMethod::Options => write!(f, "OPTIONS"),
         }
     }
 }
@@ -45,8 +48,8 @@ pub enum TransferBehavior {
 /// Configuration for generating an ICAP `OPTIONS` response.
 #[derive(Debug, Clone)]
 pub struct OptionsConfig {
-    /// Supported ICAP methods (REQUIRED).
-    pub methods: Vec<IcapMethod>,
+    /// Supported ICAP methods
+    pub(crate) methods: SmallVec<IcapMethod, 2>,
     /// Human-readable service description (optional).
     pub service: Option<String>,
     /// Service tag (REQUIRED). A unique identifier for the service configuration.
@@ -77,9 +80,9 @@ pub struct OptionsConfig {
 
 impl OptionsConfig {
     /// Create a new OPTIONS config with required fields.
-    pub fn new(methods: Vec<IcapMethod>, istag: &str) -> Self {
+    pub fn new(istag: &str) -> Self {
         Self {
-            methods,
+            methods: SmallVec::new(),
             service: None,
             istag: istag.to_string(),
             max_connections: None,
@@ -102,7 +105,7 @@ impl OptionsConfig {
         self
     }
 
-    //ToDo Destroy it maybe
+    /// Router-only: set Max-Connections from global advertised limit if not set.
     pub(crate) fn with_max_connections(&mut self, n: u32) {
         self.max_connections = Some(n);
     }
@@ -163,7 +166,17 @@ impl OptionsConfig {
         self
     }
 
+    /// Router-only: inject the supported ICAP methods.
+    pub(crate) fn set_methods<M>(&mut self, methods: M)
+    where
+        M: Into<SmallVec<IcapMethod, 2>>,
+    {
+        self.methods = methods.into();
+    }
+
     /// Build an ICAP `OPTIONS` response from this config.
+    ///
+    /// Assumes the router injected a non-empty `methods` list.
     pub fn build_response(&self) -> Response {
         let mut response = Response::new(StatusCode::Ok200, "OK");
 
@@ -257,10 +270,10 @@ impl OptionsConfig {
     }
 
     /// Validate invariants for this configuration.
+    ///
+    /// `methods` may be empty here — the router will inject them before
+    /// `build_response()` is called.
     pub fn validate(&self) -> Result<(), String> {
-        if self.methods.is_empty() {
-            return Err("Methods list cannot be empty".to_string());
-        }
         if self.istag.is_empty() {
             return Err("ISTag cannot be empty".to_string());
         }
@@ -276,12 +289,6 @@ impl OptionsConfig {
     }
 }
 
-impl Default for OptionsConfig {
-    fn default() -> Self {
-        Self::new(vec![IcapMethod::RespMod], "default-service-tag-1.0")
-    }
-}
-
 /// Fluent builder for [`OptionsConfig`].
 ///
 /// Prefer using this builder over constructing [`OptionsConfig`] directly when
@@ -291,10 +298,10 @@ pub struct IcapOptionsBuilder {
 }
 
 impl IcapOptionsBuilder {
-    /// Start a new builder with required fields.
-    pub fn new(methods: Vec<IcapMethod>, istag: &str) -> Self {
+    /// Start a new builder (methods will be injected by the router).
+    pub fn new(istag: &str) -> Self {
         Self {
-            config: OptionsConfig::new(methods, istag),
+            config: OptionsConfig::new(istag),
         }
     }
 
