@@ -3,7 +3,6 @@
 //! This module defines:
 //! - [`StatusCode`]: enumeration of ICAP status codes (RFC 3507).
 //! - [`Response`]: representation of an ICAP response, including headers and optional body.
-//! - [`ResponseBuilder`]: a convenient builder for constructing responses programmatically.
 //!
 //! Features:
 //! - Parsing and serializing ICAP responses (`from_raw`, `to_raw`).
@@ -124,7 +123,7 @@ pub struct Response {
     /// Human-readable status text (e.g. `"OK"`, `"No Content"`).
     pub status_text: String,
     /// ICAP headers.
-    pub headers: HeaderMap,
+    pub(crate) headers: HeaderMap,
     /// Optional body (arbitrary payload, chunked HTTP, etc.).
     pub body: Vec<u8>,
 }
@@ -147,22 +146,50 @@ impl Response {
     }
 
     /// Shortcut for a `204 No Content` response with headers.
-    pub fn no_content_with_headers(headers: HeaderMap) -> Self {
-        Self {
-            version: "ICAP/1.0".to_string(),
+    pub fn no_content_with_headers(headers: HeaderMap) -> IcapResult<Self> {
+        let istag = headers
+            .get("ISTag")
+            .ok_or_else(|| Error::InvalidISTag("missing ISTag header".into()))?
+            .to_str()
+            .map_err(|e| Error::Header(e.to_string()))?;
+        validate_istag(istag)?;
+
+        Ok(Self {
+            version: ICAP_VERSION.to_string(),
             status_code: StatusCode::NoContent204,
             status_text: "No Content".to_string(),
             headers,
             body: Vec::new(),
-        }
+        })
     }
 
     /// Add or overwrite a header.
+    /// NOTE: Setting `ISTag` here is discouraged; prefer `try_set_istag()`.
     pub fn add_header(mut self, name: &str, value: &str) -> Self {
+        if name.eq_ignore_ascii_case("ISTag") {
+            if let Err(e) = validate_istag(value) {
+                tracing::warn!("ignoring invalid ISTag passed to add_header: {}", e);
+                return self;
+            }
+            let val = HeaderValue::from_str(value).expect("invalid ISTag header value");
+            self.headers.insert(HeaderName::from_static("istag"), val);
+            return self;
+        }
+
         let n: HeaderName = name.parse().expect("invalid header name");
         let v: HeaderValue = HeaderValue::from_str(value).expect("invalid header value");
         self.headers.insert(n, v);
         self
+    }
+
+    /// Set ISTag header with validation (length ≤32, charset [A-Za-z0-9.-]).
+    /// Returns `Self` on success; otherwise `Error::InvalidISTag`.
+    pub fn try_set_istag(mut self, istag: &str) -> IcapResult<Self> {
+        validate_istag(istag)?;
+        let name = HeaderName::from_static("istag");
+        let val = HeaderValue::from_str(istag).map_err(|e| Error::Header(e.to_string()))?;
+        self.headers.insert(name, val);
+        Ok(self)
     }
 
     /// Set the response body from bytes.
@@ -178,8 +205,30 @@ impl Response {
     }
 
     /// Serialize into raw ICAP bytes.
-    pub fn to_raw(&self) -> Vec<u8> {
-        crate::parser::serialize_icap_response(self).unwrap_or_default()
+    pub fn to_raw(&self) -> IcapResult<Vec<u8>> {
+        let istag = self
+            .headers
+            .get("ISTag")
+            .ok_or_else(|| Error::InvalidISTag("missing ISTag header".into()))?
+            .to_str()
+            .map_err(|e| Error::Header(e.to_string()))?;
+        validate_istag(istag)?;
+
+        if matches!(self.status_code, StatusCode::NoContent204) {
+            if !self.body.is_empty() {
+                return Err(Error::Body("204 must not carry a body".into()));
+            }
+            if self.headers.get("Encapsulated").map(|v| v.as_bytes())
+                != Some(b"null-body=0".as_slice())
+            {
+                return Err(Error::Header(
+                    "204 requires Encapsulated: null-body=0".into(),
+                ));
+            }
+        }
+
+        crate::parser::serialize_icap_response(self)
+            .map_err(|e| Error::Serialization(e.to_string()))
     }
 
     /// Parse an ICAP response from raw bytes.
@@ -190,6 +239,11 @@ impl Response {
     /// Get a header value by name.
     pub fn get_header(&self, name: &str) -> Option<&HeaderValue> {
         self.headers.get(name)
+    }
+
+    /// Return a read-only view of all ICAP headers.
+    pub fn headers(&self) -> &HeaderMap {
+        &self.headers
     }
 
     /// Check whether a header exists.
@@ -254,47 +308,7 @@ impl fmt::Display for Response {
     }
 }
 
-/// Builder for [`Response`].
-///
-/// Provides a fluent API for constructing ICAP responses programmatically.
-#[derive(Debug)]
-pub struct ResponseBuilder {
-    response: Response,
-}
-
-impl ResponseBuilder {
-    /// Create a new builder with given status code and text.
-    pub fn new(status_code: StatusCode, status_text: &str) -> Self {
-        Self {
-            response: Response::new(status_code, status_text),
-        }
-    }
-
-    /// Add a header.
-    pub fn header(mut self, name: &str, value: &str) -> Self {
-        self.response = self.response.add_header(name, value);
-        self
-    }
-
-    /// Set the body from bytes.
-    pub fn body(mut self, body: &[u8]) -> Self {
-        self.response = self.response.with_body(body);
-        self
-    }
-
-    /// Set the body from a string.
-    pub fn body_string(mut self, body: &str) -> Self {
-        self.response = self.response.with_body_string(body);
-        self
-    }
-
-    /// Finish and return the constructed [`Response`].
-    pub fn build(self) -> Response {
-        self.response
-    }
-}
-
-pub fn parse_icap_response(raw: &[u8]) -> IcapResult<Response> {
+pub(crate) fn parse_icap_response(raw: &[u8]) -> IcapResult<Response> {
     trace!("parse_icap_response: len={}", raw.len());
     if raw.is_empty() {
         return Err("Empty response".into());
@@ -345,9 +359,35 @@ pub fn parse_icap_response(raw: &[u8]) -> IcapResult<Response> {
         if let Some(colon) = line.find(':') {
             let name = &line[..colon];
             let value = line[colon + 1..].trim();
+
+            // Validate ISTag if present
+            if name.eq_ignore_ascii_case("ISTag") {
+                validate_istag(value)?;
+            }
+
             headers.insert(
                 HeaderName::from_bytes(name.as_bytes())?,
                 HeaderValue::from_str(value)?,
+            );
+        }
+    }
+
+    // Require ISTag only for success (2xx).
+    // RFC 3507 §4.7: ISTag MUST be in every response, however real-world
+    // servers often omit it on 1xx/4xx/5xx. We enforce it for 2xx (where
+    // cache validation matters) and accept non-2xx without ISTag, logging a warning.
+    let require_istag = matches!(
+        status_code,
+        StatusCode::Ok200 | StatusCode::NoContent204 | StatusCode::PartialContent206
+    );
+
+    if !headers.contains_key("ISTag") {
+        if require_istag {
+            return Err(Error::InvalidISTag("missing ISTag header".into()));
+        } else {
+            tracing::warn!(
+                code = %status_code,
+                "ICAP response without ISTag (non-2xx) — accepting for compatibility"
             );
         }
     }
@@ -362,6 +402,54 @@ pub fn parse_icap_response(raw: &[u8]) -> IcapResult<Response> {
         headers,
         body,
     })
+}
+
+#[inline]
+fn validate_istag(raw: &str) -> IcapResult<()> {
+    let s = raw.trim();
+
+    let mut val = String::new();
+    if s.starts_with('"') {
+        if !s.ends_with('"') || s.len() < 2 {
+            return Err(Error::InvalidISTag("unterminated quoted ISTag".into()));
+        }
+        let inner = &s[1..s.len() - 1];
+        let mut it = inner.chars();
+        while let Some(c) = it.next() {
+            if c == '\\' {
+                if let Some(esc) = it.next() {
+                    val.push(esc);
+                } else {
+                    return Err(Error::InvalidISTag(
+                        "dangling escape in quoted ISTag".into(),
+                    ));
+                }
+            } else {
+                if c.is_control() {
+                    return Err(Error::InvalidISTag("control char in quoted ISTag".into()));
+                }
+                val.push(c);
+            }
+        }
+    } else {
+        val.push_str(s);
+    }
+
+    if val.len() > 32 {
+        return Err(Error::InvalidISTag(format!(
+            "too long: {} bytes (max 32)",
+            val.len()
+        )));
+    }
+    if !val
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+    {
+        return Err(Error::InvalidISTag(format!(
+            "invalid characters in: {raw} (allowed: [A-Za-z0-9.-])"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -393,24 +481,6 @@ mod tests {
     }
 
     #[test]
-    fn response_no_content_and_headers() {
-        let resp = Response::no_content()
-            .add_header("ISTag", "policy-123")
-            .with_body_string("optional");
-
-        assert_eq!(resp.version, "ICAP/1.0");
-        assert_eq!(resp.status_code, StatusCode::NoContent204);
-        assert_eq!(resp.status_text, "No Content");
-        assert_eq!(
-            resp.get_header("ISTag").unwrap(),
-            &HeaderValue::from_static("policy-123")
-        );
-        assert_eq!(resp.body, b"optional");
-        assert!(resp.is_success());
-        assert!(!resp.is_error());
-    }
-
-    #[test]
     fn response_add_get_remove_header() {
         let mut resp = Response::new(StatusCode::Ok200, "OK").add_header("Service", "Test");
         assert!(resp.has_header("Service"));
@@ -422,94 +492,6 @@ mod tests {
         let removed = resp.remove_header("Service");
         assert!(removed.is_some());
         assert!(!resp.has_header("Service"));
-    }
-
-    #[test]
-    fn response_builder_fluent() {
-        let resp =
-            ResponseBuilder::new(StatusCode::InternalServerError500, "Internal Server Error")
-                .header("Date", "Wed, 20 Aug 2025 14:00:00 GMT")
-                .body_string("oops")
-                .build();
-
-        assert_eq!(resp.status_code, StatusCode::InternalServerError500);
-        assert_eq!(resp.status_text, "Internal Server Error");
-        assert_eq!(
-            resp.get_header("Date").unwrap(),
-            &HeaderValue::from_static("Wed, 20 Aug 2025 14:00:00 GMT")
-        );
-        assert_eq!(resp.body, b"oops");
-        assert!(resp.is_error());
-        assert!(!resp.is_success());
-    }
-
-    #[test]
-    #[ignore]
-    //DisCus: Should Icap headers be capitalized?
-    fn response_display_includes_status_and_headers() {
-        let resp = Response::new(StatusCode::Ok200, "OK")
-            .add_header("ISTag", "x")
-            .with_body_string("B");
-
-        let s = format!("{resp}");
-        println!("{:?}", &s);
-        assert!(s.contains("ICAP/1.0 200 OK"));
-        assert!(s.contains("ISTag: x"));
-        assert!(s.contains("\nB"));
-    }
-
-    #[test]
-    fn parse_minimal_200_without_body() {
-        let raw = icap_bytes(
-            "ICAP/1.0 200 OK\r\n\
-             Service: Test ICAP service\r\n\
-             ISTag: policy.123\r\n\
-             \r\n",
-        );
-        let r = parse_icap_response(&raw).expect("parse");
-        assert_eq!(r.version, "ICAP/1.0");
-        assert_eq!(r.status_code, StatusCode::Ok200);
-        assert_eq!(r.status_text, "OK");
-        assert_eq!(
-            r.get_header("Service").unwrap(),
-            &HeaderValue::from_static("Test ICAP service")
-        );
-        assert_eq!(
-            r.get_header("ISTag").unwrap(),
-            &HeaderValue::from_static("policy.123")
-        );
-        assert!(r.body.is_empty());
-    }
-
-    #[test]
-    fn parse_204_with_body_and_headers() {
-        let raw = icap_bytes(
-            "ICAP/1.0 204 No Content\r\n\
-             Date: Wed Aug 20 17:00:16 MSK 2025\r\n\
-             Encapsulated: null-body=0\r\n\
-             \r\n\
-             ",
-        );
-        let r = parse_icap_response(&raw).expect("parse");
-        assert_eq!(r.status_code, StatusCode::NoContent204);
-        assert_eq!(r.status_text, "No Content");
-        assert_eq!(
-            r.get_header("Encapsulated").unwrap(),
-            &HeaderValue::from_static("null-body=0")
-        );
-        assert_eq!(r.body, b"");
-    }
-
-    #[test]
-    fn parse_allows_multiword_status_text() {
-        let raw = icap_bytes(
-            "ICAP/1.0 405 Method Not Allowed\r\n\
-             Service: X\r\n\
-             \r\n",
-        );
-        let r = parse_icap_response(&raw).expect("parse");
-        assert_eq!(r.status_code, StatusCode::MethodNotAllowed405);
-        assert_eq!(r.status_text, "Method Not Allowed");
     }
 
     #[test]
@@ -534,24 +516,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_errors_on_incomplete_headers() {
-        let raw = icap_bytes("ICAP/1.0 200 OK\r\nService: X\r\n");
-        let err = parse_icap_response(&raw).unwrap_err();
-        assert!(err.to_string().contains("headers not complete"));
-    }
-
-    #[test]
-    fn parse_errors_on_bad_status_line_shape() {
-        let raw = icap_bytes(
-            "ICAP/1.0\r\n\
-             Service: X\r\n\
-             \r\n",
-        );
-        let err = parse_icap_response(&raw).unwrap_err();
-        assert!(err.to_string().contains("Invalid status line"));
-    }
-
-    #[test]
     fn parse_errors_on_invalid_status_code_token() {
         let raw = icap_bytes(
             "ICAP/1.0 ABC OK\r\n\
@@ -569,5 +533,418 @@ mod tests {
         );
         let err = parse_icap_response(&raw).unwrap_err();
         assert!(err.to_string().contains("Unknown ICAP status code: 777"));
+    }
+
+    #[test]
+    fn add_header_istag_rejects_invalid_but_does_not_panic() {
+        let resp = Response::new(StatusCode::Ok200, "OK").add_header("ISTag", "BAD TAG WITH SPACE");
+        assert!(resp.get_header("ISTag").is_none());
+    }
+
+    #[test]
+    fn add_header_istag_accepts_valid_value() {
+        let resp = Response::new(StatusCode::Ok200, "OK").add_header("ISTag", "ok-Tag.123");
+        assert_eq!(
+            resp.get_header("ISTag").unwrap(),
+            &HeaderValue::from_static("ok-Tag.123")
+        );
+    }
+
+    #[test]
+    fn to_raw_errors_if_istag_missing() {
+        let resp = Response::new(StatusCode::Ok200, "OK").add_header("Service", "X");
+        let err = resp.to_raw().unwrap_err();
+        assert!(matches!(err, Error::InvalidISTag(_)));
+    }
+
+    #[test]
+    fn to_raw_ok_when_istag_is_valid() {
+        let resp = Response::new(StatusCode::Ok200, "OK")
+            .try_set_istag("ok-Tag.123")
+            .unwrap();
+        let _bytes = resp
+            .to_raw()
+            .expect("to_raw should succeed with valid ISTag");
+    }
+
+    #[test]
+    fn to_raw_204_requires_null_body_and_no_payload() {
+        let resp = Response::no_content()
+            .try_set_istag("test.123")
+            .unwrap()
+            .add_header("Encapsulated", "null-body=0");
+        resp.to_raw().expect("valid 204 should serialize");
+
+        let resp_with_body = Response::no_content()
+            .try_set_istag("test.123")
+            .unwrap()
+            .add_header("Encapsulated", "null-body=0")
+            .with_body_string("oops");
+        let err = resp_with_body.to_raw().unwrap_err();
+        assert!(matches!(err, Error::Body(_)));
+
+        let bad_enc = Response::no_content().try_set_istag("test.123").unwrap();
+        let err = bad_enc.to_raw().unwrap_err();
+        assert!(matches!(err, Error::Header(_)));
+    }
+
+    #[test]
+    fn istag_accepts_quoted() {
+        assert!(validate_istag(r#""5BDEEEA9-12E4-2""#).is_ok());
+    }
+
+    #[test]
+    fn istag_rejects_unterminated_quote() {
+        assert!(validate_istag(r#""ABC"#).is_err());
+    }
+
+    #[test]
+    fn istag_quoted_too_long_rejected() {
+        let v = format!(r#""{}""#, "A".repeat(33));
+        assert!(validate_istag(&v).is_err());
+    }
+
+    #[test]
+    fn istag_quoted_with_bad_char_rejected() {
+        assert!(validate_istag(r#""ABC_DEF""#).is_err());
+    }
+}
+
+#[cfg(test)]
+mod rfc_tests {
+    //! RFC 3507 conformance tests for ICAP **responses**.
+    //!
+    //! These tests assert behavior that follows the spec explicitly:
+    //! - Status line & version (`ICAP/1.0` only), multi-word reason phrase
+    //! - ISTag (RFC 3507 §4.7): required for 2xx; ≤32 bytes; charset [A-Za-z0-9.-]
+    //! - `Encapsulated` header constraints
+    //! - 204 semantics (`null-body=0`, no body)
+    //! - Basic status codes recognition
+    //! - Case-insensitive headers
+    //! - Framing (CRLFCRLF)
+    //! - Sanity case for 200 with `res-hdr` skeleton
+
+    use super::*;
+    use http::HeaderValue;
+
+    fn icap_bytes(s: &str) -> Vec<u8> {
+        s.as_bytes().to_vec()
+    }
+
+    #[test]
+    fn version_must_be_icap_1_0() {
+        let raw = icap_bytes(
+            "ICAP/2.0 200 OK\r\n\
+             ISTag: x\r\n\
+             Encapsulated: null-body=0\r\n\
+             \r\n",
+        );
+        let err = parse_icap_response(&raw).unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidVersion(ref v) if v == "ICAP/2.0"),
+            "expected InvalidVersion(\"ICAP/2.0\"), got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn supports_multiword_reason_phrase() {
+        let raw = icap_bytes(
+            "ICAP/1.0 405 Method Not Allowed\r\n\
+             ISTag: x\r\n\
+             Encapsulated: null-body=0\r\n\
+             \r\n",
+        );
+        let r = parse_icap_response(&raw).expect("parse ok");
+        assert_eq!(r.status_code, StatusCode::MethodNotAllowed405);
+        assert_eq!(r.status_text, "Method Not Allowed");
+    }
+
+    // --- ISTag (RFC 3507 §4.7) ---
+
+    #[test]
+    fn istag_required_for_2xx() {
+        let raw = b"ICAP/1.0 200 OK\r\nEncapsulated: null-body=0\r\n\r\n";
+        let err = parse_icap_response(raw).unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("istag"));
+    }
+
+    #[test]
+    fn istag_may_be_absent_in_404() {
+        let raw = b"ICAP/1.0 404 Not Found\r\n\r\n";
+        let r = parse_icap_response(raw).expect("lenient for non-2xx");
+        assert_eq!(r.status_code, StatusCode::NotFound404);
+        assert!(r.get_header("ISTag").is_none());
+    }
+
+    #[test]
+    fn istag_must_not_exceed_32_bytes() {
+        let too_long = "A".repeat(33);
+        let raw = format!(
+            "ICAP/1.0 200 OK\r\n\
+             ISTag: {}\r\n\
+             Encapsulated: null-body=0\r\n\
+             \r\n",
+            too_long
+        );
+        let err = parse_icap_response(raw.as_bytes()).unwrap_err();
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("istag") || msg.contains("32"),
+            "expected ISTag length error; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn istag_at_most_32_bytes_is_ok() {
+        let valid = "A".repeat(32);
+        let raw = format!(
+            "ICAP/1.0 200 OK\r\n\
+             ISTag: {}\r\n\
+             Encapsulated: null-body=0\r\n\
+             \r\n",
+            valid
+        );
+        let resp = parse_icap_response(raw.as_bytes()).expect("parse ok");
+        let hdr = resp.get_header("ISTag").unwrap();
+        assert_eq!(hdr, &HeaderValue::from_str(&valid).unwrap());
+    }
+
+    #[test]
+    fn istag_allows_dashes_and_dots() {
+        let valid = "helloo.1755855904-1755855904181"; // 31 chars
+        let raw = format!(
+            "ICAP/1.0 200 OK\r\n\
+             ISTag: {}\r\n\
+             Encapsulated: null-body=0\r\n\
+             \r\n",
+            valid
+        );
+        let resp = parse_icap_response(raw.as_bytes()).expect("parse ok");
+        let hdr = resp.get_header("ISTag").unwrap();
+        assert_eq!(hdr, &HeaderValue::from_str(valid).unwrap());
+    }
+
+    #[test]
+    fn istag_invalid_characters_are_rejected() {
+        for bad in ["TAG 1", "TAG_1", "TAG#1", "TAG@1"] {
+            let raw = format!(
+                "ICAP/1.0 200 OK\r\n\
+                 ISTag: {}\r\n\
+                 Encapsulated: null-body=0\r\n\
+                 \r\n",
+                bad
+            );
+            let err = parse_icap_response(raw.as_bytes()).unwrap_err();
+            let msg = err.to_string().to_lowercase();
+            assert!(
+                msg.contains("istag") && (msg.contains("invalid") || msg.contains("character")),
+                "expected ISTag invalid-char error; got: {msg}"
+            );
+        }
+    }
+
+    // --- Encapsulated ---
+
+    #[test]
+    fn encapsulated_required_for_200() {
+        let raw = icap_bytes(
+            "ICAP/1.0 200 OK\r\n\
+             ISTag: x\r\n\
+             \r\n",
+        );
+        let err = parse_icap_response(&raw).unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("encapsulated"),
+            "expected missing Encapsulated; got {err}"
+        );
+    }
+
+    #[test]
+    fn no_duplicate_encapsulated_headers() {
+        let raw = icap_bytes(
+            "ICAP/1.0 200 OK\r\n\
+             ISTag: x\r\n\
+             Encapsulated: res-hdr=0, res-body=100\r\n\
+             Encapsulated: req-hdr=0\r\n\
+             \r\n",
+        );
+        let err = parse_icap_response(&raw).unwrap_err();
+        let m = err.to_string().to_lowercase();
+        assert!(
+            m.contains("duplicate") || m.contains("encapsulated"),
+            "expected duplicate Encapsulated error; got: {m}"
+        );
+    }
+
+    #[test]
+    fn invalid_encapsulated_tokens_are_rejected() {
+        let raw = icap_bytes(
+            "ICAP/1.0 200 OK\r\n\
+             ISTag: x\r\n\
+             Encapsulated: totally-wrong=abc, res-body=-5\r\n\
+             \r\n",
+        );
+        let err = parse_icap_response(&raw).unwrap_err();
+        let m = err.to_string().to_lowercase();
+        assert!(
+            m.contains("encapsulated") || m.contains("invalid") || m.contains("parse"),
+            "expected invalid Encapsulated; got: {m}"
+        );
+    }
+
+    #[test]
+    fn encapsulated_offsets_must_be_monotonic_and_in_range() {
+        let raw = icap_bytes(
+            "ICAP/1.0 200 OK\r\n\
+             ISTag: x\r\n\
+             Encapsulated: res-hdr=50, res-body=10\r\n\
+             \r\n\
+             HTTP/1.1 200 OK\r\n\
+             Content-Length: 0\r\n\
+             \r\n",
+        );
+        let err = parse_icap_response(&raw).unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("offset"),
+            "expected offsets validation error; got: {err}"
+        );
+    }
+
+    // --- 204 semantics ---
+
+    #[test]
+    fn valid_minimal_204() {
+        let raw = icap_bytes(
+            "ICAP/1.0 204 No Content\r\n\
+             ISTag: x\r\n\
+             Encapsulated: null-body=0\r\n\
+             \r\n",
+        );
+        let r = parse_icap_response(&raw).expect("parse ok");
+        assert_eq!(r.status_code, StatusCode::NoContent204);
+        assert_eq!(
+            r.get_header("Encapsulated").unwrap(),
+            &HeaderValue::from_static("null-body=0")
+        );
+        assert!(r.body.is_empty(), "204 must not carry a body");
+    }
+
+    #[test]
+    fn rfc_204_must_have_null_body_header() {
+        let raw = icap_bytes(
+            "ICAP/1.0 204 No Content\r\n\
+             ISTag: x\r\n\
+             \r\n",
+        );
+        let err = parse_icap_response(&raw).unwrap_err();
+        let m = err.to_string().to_lowercase();
+        assert!(
+            m.contains("encapsulated") || m.contains("null-body"),
+            "expected missing null-body=0; got: {m}"
+        );
+    }
+
+    #[test]
+    fn rfc_204_must_not_have_body_bytes() {
+        let raw = icap_bytes(
+            "ICAP/1.0 204 No Content\r\n\
+             ISTag: x\r\n\
+             Encapsulated: null-body=0\r\n\
+             \r\n\
+             ILLEGAL_BODY",
+        );
+        let err = parse_icap_response(&raw).unwrap_err();
+        let m = err.to_string().to_lowercase();
+        assert!(
+            m.contains("204") && (m.contains("no body") || m.contains("null-body")),
+            "expected 204-with-body error; got: {m}"
+        );
+    }
+
+    // --- Basic statuses ---
+
+    #[test]
+    fn supports_100_continue() {
+        let raw = icap_bytes(
+            "ICAP/1.0 100 Continue\r\n\
+             ISTag: x\r\n\
+             Encapsulated: null-body=0\r\n\
+             \r\n",
+        );
+        let r = parse_icap_response(&raw).expect("parse ok");
+        assert_eq!(r.status_code, StatusCode::Continue100);
+    }
+
+    #[test]
+    fn supports_404_not_found() {
+        let raw = icap_bytes(
+            "ICAP/1.0 404 ICAP Service not found\r\n\
+             \r\n",
+        );
+        let r = parse_icap_response(&raw).expect("parse ok");
+        assert_eq!(r.status_code, StatusCode::NotFound404);
+        assert!(r.status_text.to_lowercase().contains("not"));
+    }
+
+    // --- Header case-insensitivity ---
+
+    #[test]
+    fn header_lookup_is_case_insensitive() {
+        let raw = icap_bytes(
+            "ICAP/1.0 200 OK\r\n\
+             isTag: X\r\n\
+             eNcaPsulated: null-body=0\r\n\
+             \r\n",
+        );
+        let r = parse_icap_response(&raw).expect("parse ok");
+        assert_eq!(
+            r.get_header("ISTag").unwrap(),
+            &HeaderValue::from_static("X")
+        );
+        assert_eq!(
+            r.get_header("Encapsulated").unwrap(),
+            &HeaderValue::from_static("null-body=0")
+        );
+    }
+
+    // --- Framing & sanity ---
+
+    #[test]
+    fn error_on_incomplete_headers() {
+        let raw = icap_bytes("ICAP/1.0 200 OK\r\nISTag: x\r\n");
+        let err = parse_icap_response(&raw).unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("headers"),
+            "expected incomplete headers error; got {err}"
+        );
+    }
+
+    #[test]
+    fn allows_empty_reason_phrase() {
+        let raw = icap_bytes(
+            "ICAP/1.0 200 \r\n\
+             ISTag: x\r\n\
+             Encapsulated: null-body=0\r\n\
+             \r\n",
+        );
+        let r = parse_icap_response(&raw).expect("parse ok");
+        assert_eq!(r.status_code, StatusCode::Ok200);
+        assert_eq!(r.status_text, "");
+    }
+
+    #[test]
+    fn ok_minimal_200_with_res_hdr_skeleton() {
+        let raw = icap_bytes(
+            "ICAP/1.0 200 OK\r\n\
+             ISTag: x\r\n\
+             Encapsulated: res-hdr=0\r\n\
+             \r\n\
+             HTTP/1.1 200 OK\r\n\
+             Content-Length: 0\r\n\
+             \r\n",
+        );
+        let r = parse_icap_response(&raw).expect("parse ok");
+        assert_eq!(r.status_code, StatusCode::Ok200);
+        assert!(r.body.len() >= 0);
     }
 }

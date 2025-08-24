@@ -462,7 +462,7 @@ async fn output_response(
             "\t{} {} {}",
             response.version, response.status_code, response.status_text
         );
-        for (name, value) in &response.headers {
+        for (name, value) in response.headers() {
             let v = value.to_str().unwrap_or("<binary>");
             println!("\t{}: {}", name.as_str(), v);
         }
@@ -539,9 +539,9 @@ async fn negotiate_caps(client: &Client, service: &str) -> IcapResult<IcapCaps> 
     let resp: IcapResponse = client.send(&opt_req).await?;
 
     let get = |name: &str| -> Option<String> {
-        resp.headers
+        resp.headers()
             .get(name)
-            .or_else(|| resp.headers.get(name.to_ascii_lowercase()))
+            .or_else(|| resp.headers().get(name.to_ascii_lowercase()))
             .and_then(|v| v.to_str().ok())
             .map(|s| s.trim().to_string())
     };

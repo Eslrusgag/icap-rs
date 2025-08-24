@@ -24,6 +24,8 @@ async fn spawn_server_with_limit(limit: usize) -> (String, JoinHandle<()>) {
         .with_max_connections(limit)
         .route_reqmod("svc-options", |_: Request| async move {
             Ok(Response::new(StatusCode::Ok200, "OK")
+                .try_set_istag("x")
+                .unwrap()
                 .add_header("Encapsulated", "null-body=0")
                 .add_header("Content-Length", "0"))
         })
