@@ -64,29 +64,28 @@
 //!
 //! #[tokio::main]
 //! async fn main() -> IcapResult<()> {
-//!     let server = Server::builder()
+//!     use icap_rs::Request;
+//! let server = Server::builder()
 //!         .bind("127.0.0.1:1344")
 //!         // REQMOD → 204 (no modification)
-//!         .add_service("reqmod", |_req| async move {
-//!             Ok(Response::new(StatusCode::NoContent204, "No Modifications")
-//!                 .add_header("Content-Length", "0"))
+//!         .route_reqmod("reqmod", |_req: Request| async move {
+//!             Ok(Response::no_content().add_header("Content-Length", "0"))
 //!         })
 //!         // RESPMOD → 204 (no modification)
-//!         .add_service("respmod", |_req| async move {
-//!             Ok(Response::new(StatusCode::NoContent204, "No Modifications")
-//!                 .add_header("Content-Length", "0"))
+//!         .route_respmod("respmod", |_req: Request| async move {
+//!             Ok(Response::no_content().add_header("Content-Length", "0"))
 //!         })
 //!         // OPTIONS for each service
-//!         .add_options_config(
+//!         .set_options(
 //!             "reqmod",
-//!             OptionsConfig::new(vec![IcapMethod::ReqMod], "example-reqmod-1.0")
+//!             OptionsConfig::new("example-reqmod-1.0")
 //!                 .with_service("Example REQMOD Service")
 //!                 .with_options_ttl(600)
 //!                 .add_allow("204"),
 //!         )
-//!         .add_options_config(
+//!         .set_options(
 //!             "respmod",
-//!             OptionsConfig::new(vec![IcapMethod::RespMod], "example-respmod-1.0")
+//!             OptionsConfig::new("example-respmod-1.0")
 //!                 .with_service("Example RESPMOD Service")
 //!                 .with_options_ttl(600)
 //!                 .add_allow("204"),
