@@ -227,7 +227,7 @@ async fn main() -> IcapResult<()> {
         debug!("Negotiated caps: {:?}", caps);
     }
 
-    let mut icap_req = Request::new(&icap_method, &service);
+    let mut icap_req = Request::new(icap_method.as_str(), &service);
     if !args.no204 {
         icap_req = icap_req.allow_204(true);
     }
