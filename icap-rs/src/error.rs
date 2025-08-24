@@ -50,6 +50,10 @@ pub enum Error {
     #[error("Invalid protocol version: {0}")]
     InvalidVersion(String),
 
+    /// Invalid ISTag header (length/charset).
+    #[error("Invalid ISTag: {0}")]
+    InvalidISTag(String),
+
     /// Invalid or malformed header.
     #[error("Header error: {0}")]
     Header(String),

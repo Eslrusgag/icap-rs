@@ -11,7 +11,7 @@ pub mod server;
 pub use client::Client;
 pub use options::{IcapOptionsBuilder, OptionsConfig, TransferBehavior};
 pub use request::{EmbeddedHttp, Method, Request};
-pub use response::{Response, ResponseBuilder, StatusCode};
+pub use response::{Response, StatusCode};
 pub use server::{RequestHandler, Server, ServerBuilder};
 
 ///Lib version

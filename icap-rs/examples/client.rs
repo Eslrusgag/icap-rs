@@ -26,7 +26,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match client.send(&req).await {
         Ok(resp) => {
             println!("ICAP {} {}", resp.status_code, resp.status_text);
-            for (name, value) in resp.headers.iter() {
+            for (name, value) in resp.headers().iter() {
                 println!("{}: {}", name, value.to_str().unwrap_or_default());
             }
             if !resp.body.is_empty() {

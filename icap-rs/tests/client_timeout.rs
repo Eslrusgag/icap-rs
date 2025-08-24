@@ -9,7 +9,10 @@ use tokio::{
 };
 
 pub fn options_200_wire() -> &'static [u8] {
-    b"ICAP/1.0 200 OK\r\nEncapsulated: null-body=0\r\n\r\n"
+    b"ICAP/1.0 200 OK\r\n\
+      ISTag: x\r\n\
+      Encapsulated: null-body=0\r\n\
+      \r\n"
 }
 
 async fn read_until_double_crlf(sock: &mut TcpStream) -> std::io::Result<()> {
