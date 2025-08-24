@@ -26,7 +26,8 @@
 //! assert_eq!(resp.status_code, StatusCode::NoContent204);
 //! ```
 
-use crate::error::IcapResult;
+use crate::ICAP_VERSION;
+use crate::error::{Error, IcapResult};
 use crate::parser::find_double_crlf;
 use http::{HeaderMap, HeaderName, HeaderValue};
 use std::fmt;
@@ -132,7 +133,7 @@ impl Response {
     /// Create a new ICAP response with the given status code and status text.
     pub fn new(status_code: StatusCode, status_text: &str) -> Self {
         Self {
-            version: "ICAP/1.0".to_string(),
+            version: ICAP_VERSION.to_string(),
             status_code,
             status_text: status_text.to_string(),
             headers: HeaderMap::new(),
@@ -308,6 +309,10 @@ pub fn parse_icap_response(raw: &[u8]) -> IcapResult<Response> {
     let parts: Vec<&str> = status_line.split_whitespace().collect();
     if parts.len() < 2 {
         return Err("Invalid status line format".into());
+    }
+
+    if parts[0] != ICAP_VERSION {
+        return Err(Error::InvalidVersion(parts[0].to_string()));
     }
 
     let version = parts[0].to_string();

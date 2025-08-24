@@ -773,10 +773,15 @@ async fn read_icap_headers(stream: &mut TcpStream) -> IcapResult<(u16, Vec<u8>)>
             }
             return Ok((code, buf));
         }
-
+        // TODO: Consider if this limit makes sense on the client side as well.
+        // It can protect against a misbehaving server sending unbounded headers,
+        // but may be unnecessary if all peers are trusted.
         if buf.len() > crate::MAX_HDR_BYTES {
-            // Defensive bound: prevent unbounded growth if peer never terminates headers.
-            return Err("ICAP headers too large".into());
+            return Err(Error::Header(format!(
+                "Headers too large: {} bytes (max {})",
+                buf.len(),
+                crate::MAX_HDR_BYTES
+            )));
         }
     }
 }
