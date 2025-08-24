@@ -10,29 +10,11 @@
 //! Status: **work in progress** — covers common headers used by popular ICAP
 //! servers/clients. Extend as needed for your deployment.
 
+use crate::request::Method;
 use crate::response::{Response, StatusCode};
 use chrono::{DateTime, Utc};
 use smallvec::SmallVec;
 use std::collections::HashMap;
-use std::fmt;
-
-/// ICAP methods supported by a service.
-#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
-pub enum IcapMethod {
-    ReqMod,
-    RespMod,
-    Options,
-}
-
-impl fmt::Display for IcapMethod {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            IcapMethod::ReqMod => write!(f, "REQMOD"),
-            IcapMethod::RespMod => write!(f, "RESPMOD"),
-            IcapMethod::Options => write!(f, "OPTIONS"),
-        }
-    }
-}
 
 /// Transfer behavior for file extensions advertised via `Transfer-*` headers.
 #[derive(Debug, Clone, PartialEq)]
@@ -49,7 +31,7 @@ pub enum TransferBehavior {
 #[derive(Debug, Clone)]
 pub struct OptionsConfig {
     /// Supported ICAP methods
-    pub(crate) methods: SmallVec<IcapMethod, 2>,
+    pub(crate) methods: SmallVec<Method, 2>,
     /// Human-readable service description (optional).
     pub service: Option<String>,
     /// Service tag (REQUIRED). A unique identifier for the service configuration.
@@ -169,7 +151,7 @@ impl OptionsConfig {
     /// Router-only: inject the supported ICAP methods.
     pub(crate) fn set_methods<M>(&mut self, methods: M)
     where
-        M: Into<SmallVec<IcapMethod, 2>>,
+        M: Into<SmallVec<Method, 2>>,
     {
         self.methods = methods.into();
     }

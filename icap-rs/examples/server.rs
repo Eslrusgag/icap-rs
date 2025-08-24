@@ -4,7 +4,8 @@
 // - blocker:   returns ICAP 200 with an encapsulated HTTP 403 "Blocked!" page (for REQMOD & RESPMOD)
 
 use http::HeaderMap;
-use icap_rs::options::{IcapMethod, OptionsConfig};
+use icap_rs::Method;
+use icap_rs::options::OptionsConfig;
 use icap_rs::request::{EmbeddedHttp, Request};
 use icap_rs::response::{Response, StatusCode};
 use icap_rs::server::Server;
@@ -80,7 +81,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // ---------- Blocker (REQMOD & RESPMOD) ----------
         .route(
             "blocker",
-            [IcapMethod::ReqMod, IcapMethod::RespMod],
+            [Method::ReqMod, Method::RespMod],
             |request: Request| async move {
                 if request.method.eq_ignore_ascii_case("REQMOD") {
                     if let Some(EmbeddedHttp::Req(http_req)) = &request.embedded {

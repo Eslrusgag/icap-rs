@@ -17,7 +17,7 @@
 //! ## Quick example
 //!
 //! ```rust,no_run
-//! use icap_rs::{Server, IcapMethod, Request, Response, StatusCode};
+//! use icap_rs::{Server, Method, Request, Response, StatusCode};
 //! use icap_rs::error::IcapResult;
 //!
 //! #[tokio::main]
@@ -25,7 +25,7 @@
 //!     let server = Server::builder()
 //!         .bind("127.0.0.1:1344")
 //!         // One handler serves both REQMOD and RESPMOD for service "spool".
-//!         .route("spool", [IcapMethod::ReqMod, IcapMethod::RespMod], |req: Request| async move {
+//!         .route("spool", [Method::ReqMod, Method::RespMod], |req: Request| async move {
 //!             if req.method.eq_ignore_ascii_case("REQMOD") {
 //!                 // handle request modification
 //!             } else {
@@ -60,7 +60,7 @@ use tracing::{error, trace, warn};
 use crate::error::IcapResult;
 use crate::parser::{find_double_crlf, read_chunked_to_end, serialize_icap_response};
 use crate::request::parse_icap_request;
-use crate::{IcapMethod, OptionsConfig, Request, Response, StatusCode};
+use crate::{Method, OptionsConfig, Request, Response, StatusCode};
 use smallvec::SmallVec;
 
 /// A per-service ICAP handler.
@@ -82,7 +82,7 @@ pub type RequestHandler = Box<
 struct RouteEntry {
     /// Map of method → handler. This enables duplicate-method detection and
     /// allows different handlers per method if desired.
-    handlers: HashMap<IcapMethod, RequestHandler>,
+    handlers: HashMap<Method, RequestHandler>,
     options: Option<OptionsConfig>,
 }
 
@@ -93,12 +93,12 @@ struct RouteEntry {
 /// # Example
 ///
 /// ```rust,no_run
-/// # use icap_rs::{Server, IcapMethod, Request, Response, StatusCode};
+/// # use icap_rs::{Server, Method, Request, Response, StatusCode};
 /// # use icap_rs::error::IcapResult;
 /// # #[tokio::main] async fn main() -> IcapResult<()> {
 /// let server = Server::builder()
 ///     .bind("127.0.0.1:1344")
-///     .route("scan", [IcapMethod::ReqMod], |req: Request| async move {
+///     .route("scan", [Method::ReqMod], |req: Request| async move {
 ///         Ok(Response::new(StatusCode::Ok200, "OK")
 ///             .add_header("Encapsulated", "null-body=0")
 ///             .add_header("Content-Length", "0"))
@@ -238,8 +238,8 @@ impl Server {
 
                 if let Some(entry) = routes_guard.get(&service_name) {
                     match method {
-                        IcapMethod::Options => {
-                            let allowed: SmallVec<IcapMethod, 2> =
+                        Method::Options => {
+                            let allowed: SmallVec<Method, 2> =
                                 entry.handlers.keys().copied().collect();
 
                             let mut cfg = if let Some(cfg) = &entry.options {
@@ -276,7 +276,7 @@ impl Server {
                             }
                         }
                     }
-                } else if method == IcapMethod::Options {
+                } else if method == Method::Options {
                     Self::build_default_options_response(&service_name, advertised_max_conn)
                 } else {
                     warn!("Service '{}' not found", service_name);
@@ -301,7 +301,7 @@ impl Server {
             .with_options_ttl(3600)
             .add_allow("204");
 
-        cfg.set_methods([IcapMethod::RespMod]);
+        cfg.set_methods([Method::RespMod]);
 
         cfg = cfg.with_service(&format!("ICAP Service {}", service_name));
 
@@ -312,13 +312,13 @@ impl Server {
     }
 }
 
-fn parse_method(s: &str) -> Option<IcapMethod> {
+fn parse_method(s: &str) -> Option<Method> {
     if s.eq_ignore_ascii_case("OPTIONS") {
-        Some(IcapMethod::Options)
+        Some(Method::Options)
     } else if s.eq_ignore_ascii_case("REQMOD") {
-        Some(IcapMethod::ReqMod)
+        Some(Method::ReqMod)
     } else if s.eq_ignore_ascii_case("RESPMOD") {
-        Some(IcapMethod::RespMod)
+        Some(Method::RespMod)
     } else {
         None
     }
@@ -334,7 +334,7 @@ fn parse_method(s: &str) -> Option<IcapMethod> {
 /// # Example
 ///
 /// ```rust,no_run
-/// # use icap_rs::{Server, IcapMethod, Request, Response, StatusCode};
+/// # use icap_rs::{Server, Method, Request, Response, StatusCode};
 /// # use icap_rs::error::IcapResult;
 /// # #[tokio::main] async fn main() -> IcapResult<()> {
 /// let server = Server::builder()
@@ -387,11 +387,12 @@ impl ServerBuilder {
     /// - Multiple calls to `.route(..)` for the **same service** are allowed
     ///   as long as methods do not overlap.
     /// - Registering the **same method** for the same service twice will `panic!`
-    ///   with a clear message (axum-like DX).
+    ///   with a clear message.
     /// - The same handler can be reused for multiple methods in a single call.
-    pub fn route<M, F, Fut>(mut self, service: &str, methods: M, handler: F) -> Self
+    pub fn route<MIt, MItem, F, Fut>(mut self, service: &str, methods: MIt, handler: F) -> Self
     where
-        M: IntoIterator<Item = IcapMethod>,
+        MIt: IntoIterator<Item = MItem>,
+        MItem: Into<Method>,
         F: Fn(Request) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = IcapResult<Response>> + Send + Sync + 'static,
     {
@@ -411,19 +412,26 @@ impl ServerBuilder {
         // Wrap handler in Arc so we can reuse it for multiple methods
         let h_arc = Arc::new(handler);
 
-        for m in methods {
+        for item in methods {
+            let m: Method = item.into();
+
+            if m == Method::Options {
+                panic!(
+                    "OPTIONS cannot have a handler; it's answered automatically for '{service}'"
+                );
+            }
             if entry.handlers.contains_key(&m) {
                 panic!(
                     "Overlapping method route. Handler for '{} {service}' already exists",
                     m
                 );
             }
+
             let h_clone = h_arc.clone();
             let h: RequestHandler = Box::new(move |req| Box::pin(h_clone(req)));
             entry.handlers.insert(m, h);
         }
 
-        // If options were set before this route, attach them now
         if let Some(cfg) = self.pending_options.remove(&key) {
             entry.options = Some(cfg);
         }
@@ -437,7 +445,7 @@ impl ServerBuilder {
         F: Fn(Request) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = IcapResult<Response>> + Send + Sync + 'static,
     {
-        self.route(service, [IcapMethod::ReqMod], handler)
+        self.route(service, [Method::ReqMod], handler)
     }
 
     /// Register a route for `RESPMOD` only.
@@ -446,7 +454,7 @@ impl ServerBuilder {
         F: Fn(Request) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = IcapResult<Response>> + Send + Sync + 'static,
     {
-        self.route(service, [IcapMethod::RespMod], handler)
+        self.route(service, [Method::RespMod], handler)
     }
 
     /// Optional: set a per-service [`OptionsConfig`].
@@ -530,8 +538,8 @@ mod tests {
         let h2 = handler_ok;
 
         let _builder = Server::builder()
-            .route("/spool", [IcapMethod::ReqMod], h1)
-            .route("/spool", [IcapMethod::RespMod], h2);
+            .route("/spool", [Method::ReqMod], h1)
+            .route("/spool", [Method::RespMod], h2);
     }
 
     #[test]
@@ -539,10 +547,10 @@ mod tests {
         let h1 = handler_ok;
         let h2 = handler_ok;
 
-        let builder = Server::builder().route("/spool", [IcapMethod::ReqMod], h1);
+        let builder = Server::builder().route("/spool", [Method::ReqMod], h1);
 
         let res = catch_unwind(AssertUnwindSafe(|| {
-            let _ = builder.route("/spool", [IcapMethod::ReqMod], h2);
+            let _ = builder.route("/spool", [Method::ReqMod], h2);
         }));
 
         assert!(res.is_err(), "expected panic on duplicate method route");
@@ -560,10 +568,10 @@ mod tests {
         let h = handler_ok;
         let h2 = handler_ok;
 
-        let builder = Server::builder().route("/svc", [IcapMethod::ReqMod, IcapMethod::RespMod], h);
+        let builder = Server::builder().route("/svc", [Method::ReqMod, Method::RespMod], h);
 
         let res = catch_unwind(AssertUnwindSafe(|| {
-            let _ = builder.route("/svc", [IcapMethod::RespMod], h2);
+            let _ = builder.route("/svc", [Method::RespMod], h2);
         }));
 
         assert!(res.is_err(), "expected panic on overlapping RESPMOD");
@@ -572,6 +580,54 @@ mod tests {
             msg.contains("Overlapping method route")
                 && msg.contains("RESPMOD")
                 && msg.contains("/svc"),
+            "unexpected panic message: {msg}"
+        );
+    }
+
+    #[test]
+    fn route_accepts_string_methods_case_insensitive() {
+        let h = handler_ok;
+        let _b = Server::builder().route("/svc", ["reqmod", "RESPMOD"], h);
+    }
+
+    #[test]
+    fn route_accepts_mixed_enum_and_string() {
+        let h = handler_ok;
+        let _b = Server::builder().route("/svc", vec![Method::ReqMod, "respmod".into()], h);
+    }
+
+    #[test]
+    fn route_panics_on_unknown_method() {
+        let h = handler_ok;
+
+        let res = catch_unwind(AssertUnwindSafe(|| {
+            let _ = Server::builder().route("/svc", ["FOO"], h);
+        }));
+
+        assert!(res.is_err(), "expected panic on unknown method string");
+        let msg = panic_str(res.map(|_| ()));
+        assert!(
+            msg.contains("Unknown ICAP method string"),
+            "unexpected panic message: {msg}"
+        );
+    }
+
+    #[test]
+    fn route_panics_on_options() {
+        let h = handler_ok;
+
+        let res = catch_unwind(AssertUnwindSafe(|| {
+            let _ = Server::builder().route("/svc", ["OPTIONS"], h);
+        }));
+
+        assert!(
+            res.is_err(),
+            "expected panic when routing OPTIONS explicitly"
+        );
+        let msg = panic_str(res.map(|_| ()));
+        assert!(
+            msg.contains("OPTIONS is answered automatically")
+                || msg.contains("OPTIONS cannot have a handler"),
             "unexpected panic message: {msg}"
         );
     }

@@ -1,6 +1,6 @@
 # icap-rs
 
-A Rust implementation of the **ICAP** protocol ([RFC 3507]) providing a practical client API and a minimal server.
+A Rust implementation of the **ICAP** protocol ([RFC 3507]) providing a practical client API and a server.
 
 [RFC 3507]: https://www.rfc-editor.org/rfc/rfc3507
 
@@ -10,8 +10,8 @@ A Rust implementation of the **ICAP** protocol ([RFC 3507]) providing a practica
 
 - **Client**: functional — supports `OPTIONS`, `REQMOD`, `RESPMOD`, Preview (including `ieof`), embedded HTTP/1.x
   messages, streaming bodies, and optional connection reuse.
-- **Server**: experimental — accepts `OPTIONS`/`REQMOD`/`RESPMOD`, lets you register per-service handlers, and safely
-  reads chunked bodies before invoking a handler.
+- **Server**: experimental — per-service routing, automatic `OPTIONS` responses, duplicate-route detection,
+  safe reading of chunked bodies before invoking handlers.
 
 ---
 
@@ -23,6 +23,8 @@ Add to your `Cargo.toml`:
 [dependencies]
 icap-rs = "0.0.2"
 ```
+
+---
 
 ## Features
 
@@ -38,10 +40,12 @@ icap-rs = "0.0.2"
 ### Server
 
 - Minimal async ICAP server built on Tokio.
-- Register handlers per service name (e.g., `"reqmod"`, `"respmod"`).
-- OPTIONS-response builder (`OptionsConfig` / `IcapOptionsBuilder`) with common headers:
-    - `Methods`, `ISTag`, `Service`, `Max-Connections`, `Options-TTL`, `Allow`, `Preview`, `Transfer-*`, etc.
-- Reads encapsulated *chunked* bodies to completion before invoking handlers (prevents client-side truncation).
+- **Routing per service**, with **one handler** able to serve multiple methods.
+- **Automatic `OPTIONS`** per service: `Methods` injected from registered routes; `Max-Connections` inherited from
+  global limit.
+- **Duplicate route detection**: registering the same `(service, method)` twice panics with a clear message (axum-like
+  DX).
+- Reads encapsulated *chunked* bodies to completion before invoking handlers.
 
 ---
 
@@ -49,63 +53,63 @@ icap-rs = "0.0.2"
 
 ### 1) Basic `OPTIONS`
 
-```rust
+```rust,no_run
 use icap_rs::{Client, Request};
 
 #[tokio::main]
 async fn main() -> icap_rs::error::IcapResult<()> {
-	// Transport (where to connect)
-	let client = Client::builder()
-		.from_uri("icap://127.0.0.1:1344")?
-		.keep_alive(true)
-		.build();
+    // Transport (where to connect)
+    let client = Client::builder()
+        .from_uri("icap://127.0.0.1:1344")?
+        .keep_alive(true)
+        .build();
 
-	// Semantics (which service to query)
-	let req = Request::options("respmod"); // becomes icap://<host>/respmod
+    // Semantics (which service to query)
+    let req = Request::options("respmod"); // becomes icap://<host>/respmod
 
-	let resp = client.send(&req).await?;
-	println!("ICAP: {} {}", resp.status_code, resp.status_text);
-	Ok(())
+    let resp = client.send(&req).await?;
+    println!("ICAP: {} {}", resp.status_code, resp.status_text);
+    Ok(())
 }
 ```
 
 ### 2) `REQMOD` with embedded HTTP and Preview
 
-```rust
+```rust,no_run
 use http::Request as HttpRequest;
 use icap_rs::{Client, Request, StatusCode};
 
 #[tokio::main]
 async fn main() -> icap_rs::error::IcapResult<()> {
-	let client = Client::builder().from_uri("icap://127.0.0.1:1344")?.build();
+    let client = Client::builder().from_uri("icap://127.0.0.1:1344")?.build();
 
-	// Build the HTTP message to embed
-	let http_req = HttpRequest::builder()
-		.method("POST")
-		.uri("/")
-		.header("host", "127.0.0.1")
-		.header("content-length", "5")
-		.body(b"hello".to_vec())
-		.unwrap();
+    // Build the HTTP message to embed
+    let http_req = HttpRequest::builder()
+        .method("POST")
+        .uri("/")
+        .header("host", "127.0.0.1")
+        .header("content-length", "5")
+        .body(b"hello".to_vec())
+        .unwrap();
 
-	// ICAP request: REQMOD to service "icap/full", advertise Allow: 204, and send Preview: 0 with ieof
-	let icap_req = Request::reqmod("icap/full")
-		.allow_204(true)
-		.preview(0)
-		.preview_ieof(true)
-		.with_http_request(http_req);
+    // ICAP request: REQMOD to service "test", advertise Allow: 204, and send Preview: 0 with ieof
+    let icap_req = Request::reqmod("test")
+        .allow_204(true)
+        .preview(0)
+        .preview_ieof(true)
+        .with_http_request(http_req);
 
-	let resp = client.send(&icap_req).await?;
+    let resp = client.send(&icap_req).await?;
 
-	if resp.status_code == StatusCode::NoContent204 {
-		println!("No modification needed (Allow 204)");
-	} else {
-		println!("{} {}", resp.status_code, resp.status_text);
-		if !resp.body.is_empty() {
-			println!("Body ({} bytes)", resp.body.len());
-		}
-	}
-	Ok(())
+    if resp.status_code == StatusCode::NoContent204 {
+        println!("No modification needed (Allow 204)");
+    } else {
+        println!("{} {}", resp.status_code, resp.status_text);
+        if !resp.body.is_empty() {
+            println!("Body ({} bytes)", resp.body.len());
+        }
+    }
+    Ok(())
 }
 ```
 
@@ -115,53 +119,76 @@ async fn main() -> icap_rs::error::IcapResult<()> {
 
 A minimal server exposing two services (`reqmod`, `respmod`) and replying `204 No Content`.
 
-```rust
-use icap_rs::{
-	error::IcapResult, IcapMethod, IcapOptionsBuilder, OptionsConfig, Response, Server, StatusCode,
-};
+```rust,no_run
+use icap_rs::{Server, Request, Response, StatusCode};
+use icap_rs::options::OptionsConfig;
 
 #[tokio::main]
-async fn main() -> IcapResult<()> {
-	let server = icap_rs::Server::builder()
-		.bind("127.0.0.1:1344")
-		// REQMOD → 204 (no changes)
-		.add_service("reqmod", |_req| async move {
-			Ok(Response::new(StatusCode::NoContent204, "No Modifications")
-				.add_header("Content-Length", "0"))
-		})
-		// RESPMOD → 204 as well
-		.add_service("respmod", |_req| async move {
-			Ok(Response::no_content().add_header("Content-Length", "0"))
-		})
-		// OPTIONS for both services
-		.add_options_config(
-			"reqmod",
-			IcapOptionsBuilder::new(vec![IcapMethod::ReqMod], "example-reqmod-1.0")
-				.service("Example REQMOD Service")
-				.max_connections(100)
-				.options_ttl(600)
-				.allow_204()
-				.with_current_date()
-				.build(),
-		)
-		.add_options_config(
-			"respmod",
-			IcapOptionsBuilder::new(vec![IcapMethod::RespMod], "example-respmod-1.0")
-				.service("Example RESPMOD Service")
-				.max_connections(100)
-				.options_ttl(600)
-				.allow_204()
-				.with_current_date()
-				.build(),
-		)
-		.build()
-		.await?;
+async fn main() -> icap_rs::error::IcapResult<()> {
+    let server = Server::builder()
+        .bind("127.0.0.1:1344")
+        // REQMOD → 204 (no changes)
+        .route_reqmod("reqmod", |_req: Request| async move {
+            Ok(Response::no_content().add_header("Content-Length", "0"))
+        })
+        // RESPMOD → 204 as well
+        .route_respmod("respmod", |_req: Request| async move {
+            Ok(Response::no_content().add_header("Content-Length", "0"))
+        })
+        // Per-service OPTIONS config (no need to list Methods — router injects them)
+        .set_options(
+            "reqmod",
+            OptionsConfig::new("example-reqmod-1.0")
+                .with_service("Example REQMOD Service")
+                .with_options_ttl(600)
+                .add_allow("204"),
+        )
+        .set_options(
+            "respmod",
+            OptionsConfig::new("example-respmod-1.0")
+                .with_service("Example RESPMOD Service")
+                .with_options_ttl(600)
+                .add_allow("204"),
+        )
+        .build()
+        .await?;
 
-	server.run().await
+    server.run().await
 }
 ```
 
-### Handlers and request parsing
+### One handler for both methods
+
+You can route by **strings** (case-insensitive) or enums. The same handler can handle both `REQMOD` and `RESPMOD`:
+
+```rust,no_run
+use icap_rs::{Server, Request, Response, StatusCode};
+
+#[tokio::main]
+async fn main() -> icap_rs::error::IcapResult<()> {
+    let server = Server::builder()
+        .bind("127.0.0.1:1344")
+        // Accept both REQMOD and RESPMOD using strings
+        .route("spool", ["REQMOD", "respmod"], |req: Request| async move {
+            if req.method.eq_ignore_ascii_case("REQMOD") {
+                // request logic
+            } else {
+                // response logic
+            }
+            Ok(Response::new(StatusCode::Ok200, "OK")
+                .add_header("Encapsulated", "null-body=0")
+                .add_header("Content-Length", "0"))
+        })
+        .build()
+        .await?;
+
+    server.run().await
+}
+```
+
+---
+
+## Handlers and request parsing
 
 Handlers receive a parsed `icap_rs::Request`, including ICAP headers and (if present) an embedded HTTP request/response
 with its headers/body. The server reads and buffers the ICAP chunked body before invoking the handler, so your handler
@@ -176,8 +203,17 @@ Key types re-exported at the crate root:
 - `Client` — high-level ICAP client with connection reuse.
 - `Request` — build `OPTIONS`/`REQMOD`/`RESPMOD` (set Preview, `Allow: 204/206`, attach embedded HTTP).
 - `Response`, `ResponseBuilder`, `StatusCode` — build and serialize ICAP responses.
-- `OptionsConfig`, `IcapOptionsBuilder`, `IcapMethod`, `TransferBehavior` — construct standard OPTIONS responses.
+- `options::{OptionsConfig, IcapOptionsBuilder, IcapMethod, TransferBehavior}` — construct `OPTIONS`.
+  - `OptionsConfig::new(istag)` **no longer** takes methods; the router injects `Methods` automatically.
+  - `IcapOptionsBuilder::new(istag)` likewise doesn’t take methods.
 - `error::{IcapError, IcapResult}` — error handling.
+
+**Routing API highlights**
+
+- `ServerBuilder::route(service, methods, handler)` — `methods` can be `IcapMethod` values **or strings** like
+  `"REQMOD"`, `"RESPMOD"` (case-insensitive).
+- `ServerBuilder::route_reqmod(...)` / `route_respmod(...)` — sugar for common cases.
+- Duplicate `(service, method)` registrations **panic** with a clear message.
 
 ---
 
@@ -195,7 +231,5 @@ Key types re-exported at the crate root:
 
 - TLS/ICAPS (likely via `rustls`).
 - Richer server APIs (streaming to handler, trailers, backpressure, graceful shutdown).
-- More complete OPTIONS helpers and better defaults.
+- More complete `OPTIONS` helpers and better defaults.
 - Connection pooling beyond a single keep-alive connection.
-
----
