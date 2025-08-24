@@ -37,7 +37,68 @@ use http::{
     HeaderMap, HeaderName, HeaderValue, Request as HttpRequest, Response as HttpResponse,
     StatusCode as HttpStatus, Version,
 };
+use std::fmt;
 use tracing::{debug, trace};
+
+/// ICAP protocol methods recognized by the server/router.
+///
+/// Defined by RFC 3507. In this crate:
+/// - `OPTIONS` is answered **automatically** by the server (capabilities discovery);
+/// - you register routes only for `REQMOD` and/or `RESPMOD` (see [`ServerBuilder::route`]).
+///
+/// ### Methods
+/// - **REQMOD** — *Request modification*: the ICAP client (usually a proxy)
+///   sends an embedded HTTP **request** to be adapted. Typical uses:
+///   URL/category filtering, DLP on outbound requests, antivirus before fetching
+///   the origin response, header normalization/enrichment.
+/// - **RESPMOD** — *Response modification*: the ICAP client sends an embedded
+///   HTTP **response** to be adapted. Typical uses: antivirus scanning of
+///   downloaded content, content rewriting, compliance filtering, response
+///   header/body adjustments.
+/// - **OPTIONS** — *Capability discovery*: clients learn which methods and
+///   features a service supports. **Handled automatically** by the server; do
+///   not register a handler for `OPTIONS`.
+///
+/// ### Conversions
+/// `Method` implements `From<&str>` / `From<String>` so you can pass
+/// `"REQMOD"` / `"RESPMOD"` (case-insensitive) to [`ServerBuilder::route`].
+/// Passing `"OPTIONS"` or an unknown string will **panic**.
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+pub enum Method {
+    /// Request modification (`REQMOD`).
+    ReqMod,
+    /// Response modification (`RESPMOD`).
+    RespMod,
+    /// Capability discovery (`OPTIONS`).
+    Options,
+}
+
+impl fmt::Display for Method {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Method::ReqMod => write!(f, "REQMOD"),
+            Method::RespMod => write!(f, "RESPMOD"),
+            Method::Options => write!(f, "OPTIONS"),
+        }
+    }
+}
+
+impl From<&str> for Method {
+    fn from(s: &str) -> Self {
+        match s.trim().to_ascii_uppercase().as_str() {
+            "REQMOD" => Method::ReqMod,
+            "RESPMOD" => Method::RespMod,
+            "OPTIONS" => panic!("OPTIONS is answered automatically; do not route it explicitly"),
+            other => panic!("Unknown ICAP method string: {other}"),
+        }
+    }
+}
+
+impl From<String> for Method {
+    fn from(s: String) -> Self {
+        Method::from(s.as_str())
+    }
+}
 
 /// Embedded HTTP message inside an ICAP request.
 #[derive(Debug, Clone)]
