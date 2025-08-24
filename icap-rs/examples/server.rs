@@ -3,13 +3,17 @@
 // - respmod:   demonstrates RESPMOD flow and 204 handling
 // - blocker:   returns ICAP 200 with an encapsulated HTTP 403 "Blocked!" page (for REQMOD & RESPMOD)
 
-use http::HeaderMap;
+use http::{HeaderMap, Response as HttpResponse, StatusCode as HttpStatus, Version};
 use icap_rs::Method;
 use icap_rs::options::OptionsConfig;
 use icap_rs::request::{EmbeddedHttp, Request};
 use icap_rs::response::{Response, StatusCode};
 use icap_rs::server::Server;
 use tracing::{error, info, warn};
+
+const ISTAG_REQMOD: &str = "reqmod-1.0";
+const ISTAG_RESPMOD: &str = "respmod-1.0";
+const ISTAG_BLOCKER: &str = "blocker-1.0";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -18,20 +22,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .init();
 
     // OPTIONS configs (SmallVec-based)
-    let reqmod_opts = OptionsConfig::new("reqmod-1.0")
+    let reqmod_opts = OptionsConfig::new(ISTAG_REQMOD)
         .with_service("Request Modifier")
         .with_options_ttl(3600)
         .add_allow("204")
         .with_preview(1024);
 
-    let respmod_opts = OptionsConfig::new("respmod-1.0")
+    let respmod_opts = OptionsConfig::new(ISTAG_RESPMOD)
         .with_service("Response Modifier")
         .with_options_ttl(3600)
         .add_allow("204")
         .with_preview(2048);
 
     // Blocker: announce BOTH methods in OPTIONS
-    let blocker_opts = OptionsConfig::new("blocker-1.0")
+    let blocker_opts = OptionsConfig::new(ISTAG_BLOCKER)
         .with_service("Request/Response Blocker")
         .with_options_ttl(3600)
         .with_preview(0);
@@ -49,12 +53,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
 
             if can_return_204(&request.icap_headers) {
-                return Ok(Response::no_content().add_header("Server", "icap-rs/0.1.0"));
+                return Ok(Response::no_content()
+                    .try_set_istag(ISTAG_REQMOD)?
+                    .add_header("Server", "icap-rs/0.1.0"));
             }
 
-            Ok(Response::new(StatusCode::Ok200, "OK")
-                .add_header("Encapsulated", "null-body=0")
-                .add_header("Content-Length", "0")
+            Ok(Response::no_content()
+                .try_set_istag(ISTAG_REQMOD)?
                 .add_header("Server", "icap-rs/0.1.0"))
         })
         .set_options("reqmod", reqmod_opts)
@@ -69,12 +74,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
 
             if can_return_204(&request.icap_headers) {
-                return Ok(Response::no_content().add_header("Server", "icap-rs/0.1.0"));
+                return Ok(Response::no_content()
+                    .try_set_istag(ISTAG_RESPMOD)?
+                    .add_header("Server", "icap-rs/0.1.0"));
             }
 
-            Ok(Response::new(StatusCode::Ok200, "OK")
-                .add_header("Encapsulated", "null-body=0")
-                .add_header("Content-Length", "0")
+            if let Some(EmbeddedHttp::Resp(http_resp)) = &request.embedded {
+                return Ok(Response::new(StatusCode::Ok200, "OK")
+                    .try_set_istag(ISTAG_RESPMOD)?
+                    .with_http_response(http_resp)?
+                    .add_header("Server", "icap-rs/0.1.0"));
+            }
+
+            Ok(Response::no_content()
+                .try_set_istag(ISTAG_RESPMOD)?
                 .add_header("Server", "icap-rs/0.1.0"))
         })
         .set_options("respmod", respmod_opts)
@@ -101,14 +114,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     }
                 }
 
-                let reason = "Blocked!";
-                let body = create_block_403(reason);
-                let (hdr_len, _) = split_http_bytes(&body); // res-hdr=0, res-body=<offset>
-
+                let http = build_block_403_http("Blocked!");
                 Ok(Response::new(StatusCode::Ok200, "OK")
-                    .add_header("ISTag", "\"blocker-1.0\"")
-                    .add_header("Encapsulated", &format!("res-hdr=0, res-body={}", hdr_len))
-                    .with_body(&body))
+                    .try_set_istag(ISTAG_BLOCKER)?
+                    .with_http_response(&http)?)
             },
         )
         .set_options("blocker", blocker_opts)
@@ -130,19 +139,8 @@ fn can_return_204(h: &HeaderMap) -> bool {
         .unwrap_or(false)
 }
 
-/// Returns (HTTP-headers length, HTTP-body length) for raw HTTP bytes.
-fn split_http_bytes(raw: &[u8]) -> (usize, usize) {
-    if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
-        let hdr_len = pos + 4;
-        let body_len = raw.len().saturating_sub(hdr_len);
-        (hdr_len, body_len)
-    } else {
-        (raw.len(), 0)
-    }
-}
-
-/// Build a simple HTTP 403 page with a reason.
-fn create_block_403(reason: &str) -> Vec<u8> {
+/// Build a simple HTTP 403 page with a reason (as http::Response<Vec<u8>>).
+fn build_block_403_http(reason: &str) -> HttpResponse<Vec<u8>> {
     let html = format!(
         r#"<!DOCTYPE html>
 <html>
@@ -158,20 +156,16 @@ fn create_block_403(reason: &str) -> Vec<u8> {
         reason
     );
 
-    let resp = format!(
-        "HTTP/1.1 403 Forbidden\r\n\
-         Content-Type: text/html; charset=utf-8\r\n\
-         Content-Length: {}\r\n\
-         Cache-Control: no-cache, no-store, must-revalidate\r\n\
-         Pragma: no-cache\r\n\
-         Expires: 0\r\n\
-         X-ICAP-Blocked: blocker-1.0\r\n\
-         X-Block-Reason: {}\r\n\
-         \r\n\
-         {}",
-        html.len(),
-        reason,
-        html
-    );
-    resp.into_bytes()
+    HttpResponse::builder()
+        .status(HttpStatus::FORBIDDEN)
+        .version(Version::HTTP_11)
+        .header("Content-Type", "text/html; charset=utf-8")
+        .header("Cache-Control", "no-cache, no-store, must-revalidate")
+        .header("Pragma", "no-cache")
+        .header("Expires", "0")
+        .header("X-ICAP-Blocked", ISTAG_BLOCKER)
+        .header("X-Block-Reason", reason)
+        .header("Content-Length", html.len().to_string())
+        .body(html.into_bytes())
+        .unwrap()
 }

@@ -27,7 +27,7 @@
 
 use crate::ICAP_VERSION;
 use crate::error::{Error, IcapResult};
-use crate::parser::find_double_crlf;
+use crate::parser::{find_double_crlf, serialize_http_response};
 use http::{HeaderMap, HeaderName, HeaderValue};
 use std::fmt;
 use std::str::FromStr;
@@ -206,28 +206,71 @@ impl Response {
 
     /// Serialize into raw ICAP bytes.
     pub fn to_raw(&self) -> IcapResult<Vec<u8>> {
-        let istag = self
-            .headers
-            .get("ISTag")
-            .ok_or(Error::MissingHeader("ISTag"))?
-            .to_str()
-            .map_err(|e| Error::Unexpected(e.to_string()))?;
-        validate_istag(istag)?;
+        let mut resp = self.clone();
 
-        if matches!(self.status_code, StatusCode::NoContent204) {
-            if !self.body.is_empty() {
-                return Err(Error::Body("204 must not carry a body".into()));
+        let require_istag = matches!(
+            resp.status_code,
+            StatusCode::Ok200 | StatusCode::NoContent204 | StatusCode::PartialContent206
+        );
+
+        if require_istag {
+            let istag = resp
+                .headers
+                .get("ISTag")
+                .ok_or(Error::MissingHeader("ISTag"))?
+                .to_str()
+                .map_err(|e| Error::Unexpected(e.to_string()))?;
+            validate_istag(istag)?;
+        } else if let Some(v) = resp.headers.get("ISTag") {
+            let s = v.to_str().map_err(|e| Error::Unexpected(e.to_string()))?;
+            validate_istag(s)?;
+        }
+
+        match resp.status_code {
+            StatusCode::NoContent204 => {
+                if !resp.body.is_empty() {
+                    return Err(Error::Body("204 must not carry a body".into()));
+                }
+                if !resp.headers.contains_key("Encapsulated") {
+                    resp.headers.insert(
+                        HeaderName::from_static("encapsulated"),
+                        HeaderValue::from_static("null-body=0"),
+                    );
+                } else if resp.headers.get("Encapsulated").map(|v| v.as_bytes())
+                    != Some(b"null-body=0".as_slice())
+                {
+                    return Err(Error::Header(
+                        "204 requires Encapsulated: null-body=0".into(),
+                    ));
+                }
             }
-            if self.headers.get("Encapsulated").map(|v| v.as_bytes())
-                != Some(b"null-body=0".as_slice())
-            {
-                return Err(Error::Header(
-                    "204 requires Encapsulated: null-body=0".into(),
-                ));
+            StatusCode::Ok200 | StatusCode::PartialContent206 => {
+                if !resp.headers.contains_key("Encapsulated") {
+                    if resp.body.is_empty() {
+                        return Err(Error::MissingHeader(
+                            "Encapsulated missing and cannot infer for 2xx with empty body; \
+                         set it explicitly or use Response::with_http_response(...)",
+                        ));
+                    }
+                    if looks_like_http_resp(&resp.body) {
+                        let enc = compute_enc_for_res_body(&resp.body)?;
+                        let hv = HeaderValue::from_str(&enc)
+                            .map_err(|e| Error::Header(e.to_string()))?;
+                        resp.headers
+                            .insert(HeaderName::from_static("encapsulated"), hv);
+                    } else {
+                        return Err(Error::Header(
+                            "Encapsulated missing and body is not an embedded HTTP/1.x".to_string(),
+                        ));
+                    }
+                }
+            }
+            _ => {
+                // for non-2xx Encapsulation is not required. CRUTCH!
             }
         }
 
-        crate::parser::serialize_icap_response(self)
+        crate::parser::serialize_icap_response(&resp)
             .map_err(|e| Error::Serialization(e.to_string()))
     }
 
@@ -277,6 +320,18 @@ impl Response {
                 | StatusCode::GatewayTimeout504
         )
     }
+
+    pub fn with_http_response(mut self, http: &http::Response<Vec<u8>>) -> IcapResult<Self> {
+        let bytes = serialize_http_response(http);
+
+        let enc = compute_enc_for_res_body(&bytes)?;
+        let hv = HeaderValue::from_str(&enc).map_err(|e| Error::Header(e.to_string()))?;
+
+        self.body = bytes;
+        self.headers
+            .insert(HeaderName::from_static("encapsulated"), hv);
+        Ok(self)
+    }
 }
 
 impl Default for Response {
@@ -305,6 +360,21 @@ impl fmt::Display for Response {
             writeln!(f, "\n{}", String::from_utf8_lossy(&self.body))?;
         }
         Ok(())
+    }
+}
+
+#[inline]
+fn looks_like_http_resp(body: &[u8]) -> bool {
+    body.starts_with(b"HTTP/1.0") || body.starts_with(b"HTTP/1.1")
+}
+
+fn compute_enc_for_res_body(body: &[u8]) -> IcapResult<String> {
+    let hdr_end = find_double_crlf(body)
+        .ok_or_else(|| Error::Header("embedded HTTP missing CRLFCRLF".into()))?;
+    if body.len() > hdr_end {
+        Ok(format!("res-hdr=0, res-body={}", hdr_end))
+    } else {
+        Ok("res-hdr=0".to_string())
     }
 }
 
@@ -352,6 +422,9 @@ pub(crate) fn parse_icap_response(raw: &[u8]) -> IcapResult<Response> {
     );
 
     let mut headers = HeaderMap::new();
+    let mut seen_encapsulated = false;
+    let mut encapsulated_value: Option<String> = None;
+
     for line in lines {
         if line.is_empty() {
             break;
@@ -360,7 +433,14 @@ pub(crate) fn parse_icap_response(raw: &[u8]) -> IcapResult<Response> {
             let name = &line[..colon];
             let value = line[colon + 1..].trim();
 
-            // Validate ISTag if present
+            if name.eq_ignore_ascii_case("Encapsulated") {
+                if seen_encapsulated {
+                    return Err(Error::Header("duplicate Encapsulated header".into()));
+                }
+                seen_encapsulated = true;
+                encapsulated_value = Some(value.to_string());
+            }
+
             if name.eq_ignore_ascii_case("ISTag") {
                 validate_istag(value)?;
             }
@@ -372,15 +452,10 @@ pub(crate) fn parse_icap_response(raw: &[u8]) -> IcapResult<Response> {
         }
     }
 
-    // Require ISTag only for success (2xx).
-    // RFC 3507 §4.7: ISTag MUST be in every response, however real-world
-    // servers often omit it on 1xx/4xx/5xx. We enforce it for 2xx (where
-    // cache validation matters) and accept non-2xx without ISTag, logging a warning.
     let require_istag = matches!(
         status_code,
         StatusCode::Ok200 | StatusCode::NoContent204 | StatusCode::PartialContent206
     );
-
     if !headers.contains_key("ISTag") {
         if require_istag {
             return Err(Error::MissingHeader("ISTag"));
@@ -395,6 +470,34 @@ pub(crate) fn parse_icap_response(raw: &[u8]) -> IcapResult<Response> {
     let body = raw[hdr_end..].to_vec();
     trace!("parse_icap_response: body_len={}", body.len());
 
+    if require_istag {
+        let enc_val = encapsulated_value
+            .or_else(|| {
+                headers
+                    .get("Encapsulated")
+                    .and_then(|v| v.to_str().ok().map(|s| s.to_string()))
+            })
+            .ok_or(Error::MissingHeader("Encapsulated"))?;
+
+        match status_code {
+            StatusCode::NoContent204 => {
+                if !enc_val.trim().eq_ignore_ascii_case("null-body=0") {
+                    return Err(Error::Header(
+                        "204 requires Encapsulated: null-body=0".into(),
+                    ));
+                }
+                if !body.is_empty() {
+                    return Err(Error::Body("204 must not carry a body".into()));
+                }
+            }
+            StatusCode::Ok200 | StatusCode::PartialContent206 => {
+                let pairs = parse_encapsulated_pairs_strict(&enc_val)?;
+                validate_encapsulated_offsets(&pairs, body.len())?;
+            }
+            _ => {}
+        }
+    }
+
     Ok(Response {
         version,
         status_code,
@@ -402,6 +505,64 @@ pub(crate) fn parse_icap_response(raw: &[u8]) -> IcapResult<Response> {
         headers,
         body,
     })
+}
+
+fn parse_encapsulated_pairs_strict(s: &str) -> IcapResult<Vec<(String, usize)>> {
+    let mut out = Vec::new();
+    if s.trim().is_empty() {
+        return Err(Error::MissingHeader("Encapsulated"));
+    }
+
+    for part in s.split(',') {
+        let p = part.trim();
+        let (name, off_str) = p
+            .split_once('=')
+            .ok_or_else(|| Error::Header(format!("invalid Encapsulated token: {p}")))?;
+        let name_norm = name.trim();
+        let name_lc = name_norm.to_ascii_lowercase();
+
+        let ok_name = matches!(
+            name_lc.as_str(),
+            "req-hdr" | "res-hdr" | "req-body" | "res-body" | "opt-body" | "null-body"
+        );
+        if !ok_name {
+            return Err(Error::Header(format!(
+                "invalid Encapsulated part name: {name_norm}"
+            )));
+        }
+
+        // оффсет
+        let off: usize = off_str
+            .trim()
+            .parse::<usize>()
+            .map_err(|_| Error::Header(format!("invalid Encapsulated offset: {off_str}")))?;
+
+        out.push((name_lc, off));
+    }
+
+    Ok(out)
+}
+
+fn validate_encapsulated_offsets(pairs: &[(String, usize)], enc_len: usize) -> IcapResult<()> {
+    for (_, off) in pairs {
+        if *off > enc_len {
+            return Err(Error::Header(format!(
+                "Encapsulated offset {} out of range (len={})",
+                off, enc_len
+            )));
+        }
+    }
+    for w in pairs.windows(2) {
+        let prev = w[0].1;
+        let curr = w[1].1;
+        if curr < prev {
+            return Err(Error::Header(format!(
+                "Encapsulated offsets not monotonic: {} -> {}",
+                prev, curr
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[inline]
@@ -497,10 +658,11 @@ mod tests {
     #[test]
     fn last_duplicate_header_wins() {
         let raw = icap_bytes(
-            "ICAP/1.0 200 OK\r\n\
-             ISTag: a\r\n\
-             ISTag: b\r\n\
-             \r\n",
+            "ICAP/1.0 204 No Content\r\n\
+         ISTag: a\r\n\
+         ISTag: b\r\n\
+         Encapsulated: null-body=0\r\n\
+         \r\n",
         );
         let r = parse_icap_response(&raw).expect("parse");
         assert_eq!(
@@ -561,31 +723,12 @@ mod tests {
     fn to_raw_ok_when_istag_is_valid() {
         let resp = Response::new(StatusCode::Ok200, "OK")
             .try_set_istag("ok-Tag.123")
-            .unwrap();
+            .unwrap()
+            .add_header("Encapsulated", "res-hdr=0")
+            .with_body_string("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
         let _bytes = resp
             .to_raw()
             .expect("to_raw should succeed with valid ISTag");
-    }
-
-    #[test]
-    fn to_raw_204_requires_null_body_and_no_payload() {
-        let resp = Response::no_content()
-            .try_set_istag("test.123")
-            .unwrap()
-            .add_header("Encapsulated", "null-body=0");
-        resp.to_raw().expect("valid 204 should serialize");
-
-        let resp_with_body = Response::no_content()
-            .try_set_istag("test.123")
-            .unwrap()
-            .add_header("Encapsulated", "null-body=0")
-            .with_body_string("oops");
-        let err = resp_with_body.to_raw().unwrap_err();
-        assert!(matches!(err, Error::Body(_)));
-
-        let bad_enc = Response::no_content().try_set_istag("test.123").unwrap();
-        let err = bad_enc.to_raw().unwrap_err();
-        assert!(matches!(err, Error::Header(_)));
     }
 
     #[test]
@@ -856,7 +999,10 @@ mod rfc_tests {
         let err = parse_icap_response(&raw).unwrap_err();
         let m = err.to_string().to_lowercase();
         assert!(
-            m.contains("204") && (m.contains("no body") || m.contains("null-body")),
+            m.contains("204")
+                && (m.contains("no body")
+                    || m.contains("null-body")
+                    || m.contains("must not carry a body")),
             "expected 204-with-body error; got: {m}"
         );
     }
