@@ -63,7 +63,7 @@ use tokio::sync::Semaphore;
 use tracing::{error, trace, warn};
 
 use crate::error::IcapResult;
-use crate::parser::{find_double_crlf, read_chunked_to_end, serialize_icap_response};
+use crate::parser::{find_double_crlf, read_chunked_to_end};
 use crate::request::parse_icap_request;
 use crate::{Method, OptionsConfig, Request, Response, StatusCode};
 use smallvec::SmallVec;
@@ -128,10 +128,16 @@ impl Server {
         ServerBuilder::new()
     }
 
-    /// Main accept loop.
-    ///
-    /// Accepts TCP connections, enforces the optional connection limit, and
-    /// dispatches ICAP messages (`OPTIONS`, `REQMOD`, `RESPMOD`) to registered handlers.
+    /// Accept loop:
+    /// - Accepts TCP connections and enforces an optional global limit (semaphore).
+    ///   If the limit is reached, send an early `ICAP/1.0 503 Service Unavailable`
+    ///   with `Connection: close`; `to_raw()` auto-adds `Encapsulated: null-body=0`
+    ///   (no ISTag on errors). Set `SO_LINGER(1s)`, non-blocking `try_read` drain,
+    ///   then drop the socket (graceful FIN, fewer RSTs).
+    /// - Otherwise, move the permit into a spawned task and call `handle_connection(...)`
+    ///   which reads full ICAP messages (incl. chunked bodies) and dispatches to
+    ///   registered handlers (`OPTIONS`, `REQMOD`, `RESPMOD`).
+    /// - Shared routing/alias/default/max-conn state is passed via `Arc`.
     pub async fn run(self) -> IcapResult<()> {
         let local_addr = self.listener.local_addr()?;
         trace!("ICAP server started on {}", local_addr);
@@ -151,14 +157,34 @@ impl Server {
 
                         let resp =
                             Response::new(StatusCode::ServiceUnavailable503, "Service Unavailable")
-                                .add_header("Encapsulated", "null-body=0")
-                                .add_header("Content-Length", "0");
+                                .add_header("Connection", "close");
 
-                        if let Ok(bytes) = serialize_icap_response(&resp) {
-                            if let Err(e) = socket.write_all(&bytes).await {
-                                warn!("Failed to send 503 to {}: {}", addr, e);
+                        match resp.to_raw() {
+                            Ok(bytes) => {
+                                if let Err(e) = socket.write_all(&bytes).await {
+                                    warn!("Failed to send 503 to {}: {}", addr, e);
+                                } else {
+                                    let _ =
+                                        socket.set_linger(Some(std::time::Duration::from_secs(1)));
+
+                                    let mut tmp = [0u8; 1024];
+                                    loop {
+                                        match socket.try_read(&mut tmp) {
+                                            Ok(0) => break,
+                                            Ok(_n) => continue,
+                                            Err(ref e)
+                                                if e.kind() == std::io::ErrorKind::WouldBlock =>
+                                            {
+                                                break;
+                                            }
+                                            Err(_e) => break,
+                                        }
+                                    }
+                                }
                             }
-                            let _ = socket.shutdown().await;
+                            Err(e) => {
+                                warn!("Failed to serialize 503 to {}: {}", addr, e);
+                            }
                         }
                         continue;
                     }
@@ -256,6 +282,7 @@ impl Server {
             let enc = crate::parser::parse_encapsulated_header(hdr_text);
             let mut msg_end = h_end;
 
+            // If body is present, ensure we read the whole chunked body into buf
             if let Some(body_rel) = enc.req_body.or(enc.res_body) {
                 let body_abs = h_end + body_rel;
                 while buf.len() < body_abs {
@@ -277,8 +304,7 @@ impl Server {
                 Self::resolve_service(raw_service, &aliases, default_service.as_deref());
 
             trace!(
-                "Received {} to service '{}'",
-                method,
+                "Received {method} to service '{}'",
                 service_resolved.as_ref()
             );
 
@@ -314,12 +340,9 @@ impl Server {
                     }
                     _ => {
                         if let Some(h) = entry.handlers.get(&method) {
-                            // move(req) happens here; don't use borrowed fields after this
                             h(req).await?
                         } else {
                             Response::new(StatusCode::MethodNotAllowed405, "Method Not Allowed")
-                                .add_header("Encapsulated", "null-body=0")
-                                .add_header("Content-Length", "0")
                         }
                     }
                 }
@@ -328,14 +351,28 @@ impl Server {
             } else {
                 warn!("Service '{}' not found", service_resolved.as_ref());
                 Response::new(StatusCode::NotFound404, "Service Not Found")
-                    .add_header("Encapsulated", "null-body=0")
-                    .add_header("Content-Length", "0")
             };
 
-            // === Write response and continue (keep-alive) ===
+            let should_close = !matches!(
+                resp.status_code,
+                StatusCode::Ok200 | StatusCode::NoContent204
+            );
+
+            let resp = if should_close {
+                resp.add_header("Connection", "close")
+            } else {
+                resp
+            };
+
+            // === Write response ===
             let bytes = resp.to_raw()?;
             socket.write_all(&bytes).await?;
             trace!("Response sent with status {}", resp.status_code);
+
+            if should_close {
+                let _ = socket.shutdown().await;
+                return Ok(());
+            }
 
             buf.drain(..msg_end);
         }
@@ -410,6 +447,39 @@ impl ServerBuilder {
     /// - Registering the **same method** for the same service twice will `panic!`
     ///   with a clear message.
     /// - The same handler can be reused for multiple methods in a single call.
+    ///
+    /// # Example
+    ///
+    /// One handler for both `REQMOD` and `RESPMOD` on service `"scan"`:
+    ///
+    /// ```rust,no_run
+    /// use icap_rs::{Server, Method, Request, Response};
+    /// use icap_rs::error::IcapResult;
+    /// use icap_rs::options::OptionsConfig;
+    ///
+    /// const ISTAG: &str = "scan-1.0";
+    ///
+    /// #[tokio::main]
+    /// async fn main() -> IcapResult<()> {
+    ///     let server = Server::builder()
+    ///         .route("scan", [Method::ReqMod, Method::RespMod], |req: Request| async move {
+    ///             // Do your logic based on req.method / req.embedded ...
+    ///             Ok(Response::no_content().try_set_istag(ISTAG)?)
+    ///         })
+    ///         // Optional per-service OPTIONS config:
+    ///         .set_options("scan",
+    ///             OptionsConfig::new(ISTAG)
+    ///                 .with_service("Scan Service")
+    ///                 .add_allow("204")
+    ///                 .with_preview(1024)
+    ///         )
+    ///         .build()
+    ///         .await?;
+    ///
+    ///     // server.run().await
+    ///     Ok(())
+    /// }
+    /// ```
     pub fn route<MIt, MItem, F, Fut>(mut self, service: &str, methods: MIt, handler: F) -> Self
     where
         MIt: IntoIterator<Item = MItem>,

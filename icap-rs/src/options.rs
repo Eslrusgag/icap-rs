@@ -2,7 +2,7 @@
 //!
 //! This module provides types to build an ICAP `OPTIONS` response for a given
 //! service. It includes:
-//! - [`IcapMethod`] — ICAP methods
+//! - [`Method`] — ICAP methods
 //! - [`TransferBehavior`] — per-extension transfer hints (Preview/Ignore/Complete)
 //! - [`OptionsConfig`] — a builder-like struct that serializes to an ICAP response
 //! - [`IcapOptionsBuilder`] — fluent builder that validates the config

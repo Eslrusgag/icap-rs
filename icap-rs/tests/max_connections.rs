@@ -13,7 +13,7 @@ async fn pick_free_port() -> io::Result<u16> {
     Ok(port)
 }
 
-/// Запускаем сервер на 127.0.0.1:{port} с глобальным лимитом соединений.
+/// Start a server on 127.0.0.1:{port} with a global connection limit.
 async fn start_server_with_limit(
     limit: usize,
 ) -> Result<(tokio::task::JoinHandle<()>, u16), io::Error> {
@@ -25,27 +25,28 @@ async fn start_server_with_limit(
         .await
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("build: {e}")))?;
 
-    // поднимаем сервер
+    // Spawn the server.
     let handle = tokio::spawn(async move {
         let _ = server.run().await;
     });
 
-    // даём серверу время забиндиться
+    // Give the server a moment to bind.
     sleep(Duration::from_millis(50)).await;
     Ok((handle, port))
 }
 
-/// читаем чуть-чуть из сокета с таймаутом; Ok(Some(n)) — прочитали n байт; Ok(None) — EOF
+/// Read a small chunk with a timeout.
+/// Ok(Some(n)) — read n bytes; Ok(None) — EOF; Ok(Some(0)) — timed out (socket still open).
 async fn read_some_with_timeout(s: &mut TcpStream, ms: u64) -> io::Result<Option<usize>> {
     match timeout(Duration::from_millis(ms), s.read(&mut [0u8; 4096])).await {
-        Ok(Ok(0)) => Ok(None),    // EOF
-        Ok(Ok(n)) => Ok(Some(n)), // есть байты
-        Ok(Err(e)) => Err(e),     // ошибка
-        Err(_) => Ok(Some(0)),    // таймаут (сокет жив)
+        Ok(Ok(0)) => Ok(None),
+        Ok(Ok(n)) => Ok(Some(n)),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Ok(Some(0)), // timeout (socket alive)
     }
 }
 
-/// минимальный OPTIONS-запрос
+/// Minimal ICAP OPTIONS request.
 fn build_options(port: u16, svc: &str) -> Vec<u8> {
     format!("OPTIONS icap://127.0.0.1:{port}/{svc} ICAP/1.0\r\nHost: 127.0.0.1\r\n\r\n")
         .into_bytes()
@@ -55,25 +56,25 @@ fn build_options(port: u16, svc: &str) -> Vec<u8> {
 async fn respects_global_max_connections() -> Result<(), std::io::Error> {
     let (_srv, port) = start_server_with_limit(1).await?;
 
-    // 1-й коннект — занимает permit
+    // First connection occupies the permit.
     let _hold = tokio::net::TcpStream::connect(("127.0.0.1", port)).await?;
     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
 
-    // 2-й коннект — должен получить ICAP 503
+    // Second connection should receive ICAP 503.
     let mut c2 = tokio::net::TcpStream::connect(("127.0.0.1", port)).await?;
     let mut buf = vec![0u8; 2048];
     let n =
         tokio::time::timeout(std::time::Duration::from_millis(500), c2.read(&mut buf)).await??;
-    assert!(n > 0, "ожидали получить ICAP-ответ 503");
+    assert!(n > 0, "expected to receive ICAP 503 response bytes");
 
     let head = String::from_utf8_lossy(&buf[..n]).to_ascii_uppercase();
     assert!(
         head.starts_with("ICAP/1.0 503"),
-        "должен прийти ICAP/1.0 503, получили:\n{head}"
+        "expected ICAP/1.0 503 status line, got:\n{head}"
     );
     assert!(
         head.contains("ENCAPSULATED: NULL-BODY=0"),
-        "ожидали Encapsulated: null-body=0:\n{head}"
+        "expected 'Encapsulated: null-body=0', got:\n{head}"
     );
 
     Ok(())
@@ -108,9 +109,9 @@ async fn allows_two_connections_when_limit_is_two() -> Result<(), io::Error> {
     let mut c1 = TcpStream::connect(("127.0.0.1", port)).await?;
     let mut c2 = TcpStream::connect(("127.0.0.1", port)).await?;
 
+    // Timeout (Some(0)) is acceptable; only EOF (None) is not.
     let r1 = read_some_with_timeout(&mut c1, 200).await?;
     let r2 = read_some_with_timeout(&mut c2, 200).await?;
-    // допускаем таймаут (Some(0)), но не EOF
     assert!(r1.is_some(), "conn1 should still be open");
     assert!(r2.is_some(), "conn2 should still be open");
 
@@ -119,35 +120,33 @@ async fn allows_two_connections_when_limit_is_two() -> Result<(), io::Error> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn returns_503_when_over_connection_limit() -> Result<(), io::Error> {
-    // лимит 1: первый коннект держим открытым, второй должен получить ICAP 503
     let (_srv, port) = start_server_with_limit(1).await?;
 
-    // первый коннект — занимает permit
+    // First connection occupies the permit.
     let _hold = TcpStream::connect(("127.0.0.1", port)).await?;
     sleep(Duration::from_millis(30)).await;
 
-    // второй коннект — сервер должен сразу прислать ICAP/1.0 503 и закрыть сокет
+    // Second connection should immediately get ICAP/1.0 503.
     let mut c2 = TcpStream::connect(("127.0.0.1", port)).await?;
 
-    // читаем чуть-чуть данных (заголовков достаточно), ожидаем, что придёт 503
     let mut buf = vec![0u8; 2048];
     let n = timeout(Duration::from_millis(500), c2.read(&mut buf)).await??;
-    assert!(n > 0, "ожидали получить ICAP-ответ 503, но пришло 0 байт");
+    assert!(n > 0, "expected to receive ICAP 503 response bytes, got 0");
 
     let text = String::from_utf8_lossy(&buf[..n]).to_string();
     let start = text.lines().next().unwrap_or_default().to_ascii_uppercase();
 
     assert!(
         start.starts_with("ICAP/1.0 503"),
-        "должен прийти статусная строка ICAP/1.0 503, получили:\n{}",
+        "expected ICAP/1.0 503 status line, got:\n{}",
         start
     );
 
-    // Дополнительно проверим Encapsulated и отсутствие тела
+    // Also check Encapsulated and absence of a body.
     let lower = text.to_ascii_lowercase();
     assert!(
         lower.contains("encapsulated: null-body=0"),
-        "в ответе должен быть Encapsulated: null-body=0, получили:\n{}",
+        "expected 'Encapsulated: null-body=0' header, got:\n{}",
         text
     );
 
