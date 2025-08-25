@@ -800,7 +800,7 @@ fn build_preview_and_chunks(
             out.extend_from_slice(b"0\r\n\r\n");
             Ok((out, false, None))
         }
-        Some(ps) if ps == 0 => {
+        Some(0) => {
             if body.is_empty() {
                 if preview0_ieof {
                     out.extend_from_slice(b"0; ieof\r\n\r\n");

@@ -1127,6 +1127,5 @@ mod rfc_tests {
         );
         let r = parse_icap_response(&raw).expect("parse ok");
         assert_eq!(r.status_code, StatusCode::Ok200);
-        assert!(r.body.len() >= 0);
     }
 }
