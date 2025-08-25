@@ -17,37 +17,35 @@
 //! ## Quick example
 //!
 //! ```rust,no_run
-//! use icap_rs::{Server, Method, Request, Response, StatusCode};
-//! use icap_rs::error::IcapResult;
+//!use icap_rs::{Server, Method, Request, Response, StatusCode};
+//!use icap_rs::error::IcapResult;
 //!
-//! #[tokio::main]
-//! async fn main() -> IcapResult<()> {
-//!     let server = Server::builder()
-//!         .bind("127.0.0.1:1344")
-//!         // One handler for REQMOD and RESPMOD of the "scan" service.
-//!         .route("scan", [Method::ReqMod, Method::RespMod], |req: Request| async move {
-//!             match req.method {
-//!                 Method::ReqMod => {
-//!                     // handle request modification
-//!                     Ok(Response::new(StatusCode::Ok200, "OK")
-//!                         .add_header("Encapsulated", "null-body=0")
-//!                         .add_header("Content-Length", "0"))
-//!                 }
-//!                 Method::RespMod => {
-//!                     // handle response modification
-//!                     Ok(Response::new(StatusCode::Ok200, "OK")
-//!                         .add_header("Encapsulated", "null-body=0")
-//!                         .add_header("Content-Length", "0"))
-//!                 }
-//!                 Method::Options => unreachable!("OPTIONS is handled automatically by the server"),
-//!             }
-//!         })
-//!         .with_max_connections(128)
-//!         .build()
-//!         .await?;
+//!const ISTAG: &str = "scan-1.0";
 //!
-//!     server.run().await
-//! }
+//!#[tokio::main]
+//!async fn main() -> IcapResult<()> {
+//!    let server = Server::builder()
+//!        .bind("127.0.0.1:1344")
+//!        // One handler for REQMOD and RESPMOD of the "scan" service.
+//!        .route("scan", [Method::ReqMod, Method::RespMod], |req: Request| async move {
+//!            match req.method {
+//!                Method::ReqMod => {
+//!                    // handle request modification (no changes) → 204
+//!                    Ok(Response::no_content().try_set_istag(ISTAG)?)
+//!                }
+//!                Method::RespMod => {
+//!                    // handle response modification (no changes) → 204
+//!                    Ok(Response::no_content().try_set_istag(ISTAG)?)
+//!                }
+//!                Method::Options => unreachable!("OPTIONS is handled automatically by the server"),
+//!            }
+//!        })
+//!        .with_max_connections(128)
+//!     .build()
+//!     .await?;
+//!
+//! server.run().await
+//!}
 //! ```
 //!
 //! When a client sends `OPTIONS icap://host/scan`, the server responds with
@@ -100,21 +98,20 @@ struct RouteEntry {
 /// # Example
 ///
 /// ```rust,no_run
-/// # use icap_rs::{Server, Method, Request, Response, StatusCode};
-/// # use icap_rs::error::IcapResult;
-/// # #[tokio::main] async fn main() -> IcapResult<()> {
-/// let server = Server::builder()
+/// use icap_rs::{Server, Method, Request, Response};
+/// use icap_rs::error::IcapResult;
+/// #[tokio::main]
+/// async fn main() -> IcapResult<()> {
+///     let server = Server::builder()
 ///     .bind("127.0.0.1:1344")
-///     .route("scan", [Method::ReqMod], |req: Request| async move {
-///         Ok(Response::new(StatusCode::Ok200, "OK")
-///             .add_header("Encapsulated", "null-body=0")
-///             .add_header("Content-Length", "0"))
+///     .route("scan", [Method::ReqMod], |_req: Request| async move {
+///     Ok(Response::no_content().try_set_istag("scan-1.0")?)
 ///     })
 ///     .build()
 ///     .await?;
 ///
-/// server.run().await
-/// # }
+///     server.run().await
+///  }
 /// ```
 pub struct Server {
     listener: TcpListener,
@@ -321,25 +318,6 @@ impl Server {
 ///
 /// Duplicate registration of the **same (service, method)** panics with a clear error,
 /// like axum.
-///
-/// # Example
-///
-/// ```rust,no_run
-/// # use icap_rs::{Server, Method, Request, Response, StatusCode};
-/// # use icap_rs::error::IcapResult;
-/// # #[tokio::main] async fn main() -> IcapResult<()> {
-/// let server = Server::builder()
-///     .bind("127.0.0.1:1344")
-///     .route_respmod("resp", |req: Request| async move {
-///         Ok(Response::new(StatusCode::Ok200, "OK")
-///             .add_header("Encapsulated", "null-body=0")
-///             .add_header("Content-Length", "0"))
-///     })
-///     .build()
-///     .await?;
-/// server.run().await
-/// # }
-/// ```
 pub struct ServerBuilder {
     bind_addr: Option<String>,
     routes: HashMap<String, RouteEntry>,

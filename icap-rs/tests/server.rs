@@ -94,7 +94,6 @@ async fn respmod_allow_present_may_be_204() {
 }
 
 #[tokio::test]
-#[ignore]
 async fn respmod_no_allow_must_be_200() {
     let port = 13511;
     start_server_on(port).await;
