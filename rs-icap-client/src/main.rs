@@ -134,10 +134,6 @@ struct Args {
     #[arg(long, action = clap::ArgAction::SetTrue)]
     ieof: bool,
 
-    /// Use HTTP/1.0 for the embedded HTTP message
-    #[arg(long, action = clap::ArgAction::SetTrue)]
-    http10: bool,
-
     /// Stream body from file (do not buffer in memory)
     #[arg(long, action = clap::ArgAction::SetTrue)]
     stream_io: bool,
@@ -188,9 +184,7 @@ async fn main() -> IcapResult<()> {
         m.to_uppercase()
     } else if args.req_url.is_some() {
         "REQMOD".to_string()
-    } else if args.resp_url.is_some() {
-        "RESPMOD".to_string()
-    } else if args.filename.is_some() {
+    } else if args.resp_url.is_some() || args.filename.is_some() {
         "RESPMOD".to_string()
     } else {
         "OPTIONS".to_string()
@@ -313,11 +307,7 @@ async fn main() -> IcapResult<()> {
 
             let mut builder = HttpRequest::builder()
                 .method(if use_post { Method::POST } else { Method::GET })
-                .version(if args.http10 {
-                    Version::HTTP_10
-                } else {
-                    Version::HTTP_11
-                })
+                .version(Version::HTTP_10)
                 .uri(uri);
 
             if let Some(h) = host_hdr.as_deref() {
@@ -347,14 +337,9 @@ async fn main() -> IcapResult<()> {
             icap_req = icap_req.with_http_request(http_req);
         } else {
             // Build embedded HTTP response (HTTP/1.0 by default, like c-icap-client)
-            let mut builder =
-                HttpResponse::builder()
-                    .status(StatusCode::OK)
-                    .version(if args.http10 {
-                        Version::HTTP_10
-                    } else {
-                        Version::HTTP_10
-                    });
+            let mut builder = HttpResponse::builder()
+                .status(StatusCode::OK)
+                .version(Version::HTTP_10);
 
             // Simple `Date` and `Last-Modified` similar to c-icap-client output (local time)
             let now_local = Local::now();
