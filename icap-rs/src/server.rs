@@ -1,11 +1,13 @@
-//! # Minimal ICAP server
+//! # ICAP server
 //!
-//! A small ICAP server with per-service routing and **one handler that can serve multiple
+//! ICAP server with per-service routing and **one handler that can serve multiple
 //! ICAP methods** (`REQMOD`, `RESPMOD`). The server:
 //!
 //! - Supports `OPTIONS`, `REQMOD`, `RESPMOD`;
 //! - Lets you register services with **one handler** and a **list of allowed methods** via
 //!   [`ServerBuilder::route`];
+//! - **Supports internal rerouting** via [`ServerBuilder::alias`] and [`ServerBuilder::default_service`]:
+//!   map one service name to another (e.g. `/` → `scan`) and choose the default service for empty or `/` path;
 //! - Automatically answers `OPTIONS` per service using the allowed methods;
 //! - Returns `404` for unknown services and `405` for unsupported methods;
 //! - Reads encapsulated **chunked bodies to completion** before parsing (avoids premature close
@@ -17,41 +19,39 @@
 //! ## Quick example
 //!
 //! ```rust,no_run
-//!use icap_rs::{Server, Method, Request, Response, StatusCode};
-//!use icap_rs::error::IcapResult;
+//! use icap_rs::{Server, Method, Request, Response, StatusCode};
+//! use icap_rs::error::IcapResult;
 //!
-//!const ISTAG: &str = "scan-1.0";
+//! const ISTAG: &str = "scan-1.0";
 //!
-//!#[tokio::main]
-//!async fn main() -> IcapResult<()> {
-//!    let server = Server::builder()
-//!        .bind("127.0.0.1:1344")
-//!        // One handler for REQMOD and RESPMOD of the "scan" service.
-//!        .route("scan", [Method::ReqMod, Method::RespMod], |req: Request| async move {
-//!            match req.method {
-//!                Method::ReqMod => {
-//!                    // handle request modification (no changes) → 204
-//!                    Ok(Response::no_content().try_set_istag(ISTAG)?)
-//!                }
-//!                Method::RespMod => {
-//!                    // handle response modification (no changes) → 204
-//!                    Ok(Response::no_content().try_set_istag(ISTAG)?)
-//!                }
-//!                Method::Options => unreachable!("OPTIONS is handled automatically by the server"),
-//!            }
-//!        })
-//!        .with_max_connections(128)
-//!     .build()
-//!     .await?;
+//! #[tokio::main]
+//! async fn main() -> IcapResult<()> {
+//!     let server = Server::builder()
+//!         .bind("127.0.0.1:1344")
+//!         // One handler for REQMOD and RESPMOD of the "scan" service.
+//!         .route("scan", [Method::ReqMod, Method::RespMod], |req: Request| async move {
+//!             match req.method {
+//!                 Method::ReqMod => Ok(Response::no_content().try_set_istag(ISTAG)?),
+//!                 Method::RespMod => Ok(Response::no_content().try_set_istag(ISTAG)?),
+//!                 Method::Options => unreachable!("OPTIONS is handled automatically by the server"),
+//!             }
+//!         })
+//!         // If a client uses `icap://host/`, internally route it to the "scan" service.
+//!         .default_service("scan")
+//!         .alias("/", "scan")
+//!         .with_max_connections(128)
+//!         .build()
+//!         .await?;
 //!
-//! server.run().await
-//!}
+//!     server.run().await
+//! }
 //! ```
 //!
 //! When a client sends `OPTIONS icap://host/scan`, the server responds with
 //! `Methods: REQMOD, RESPMOD` based on the registration above. If a method not in
 //! the list is used, `405 Method Not Allowed` is returned; unknown services yield `404`.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::future::Future;
 use std::str;
@@ -59,7 +59,7 @@ use std::sync::Arc;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{RwLock, Semaphore};
+use tokio::sync::Semaphore;
 use tracing::{error, trace, warn};
 
 use crate::error::IcapResult;
@@ -115,9 +115,11 @@ struct RouteEntry {
 /// ```
 pub struct Server {
     listener: TcpListener,
-    routes: Arc<RwLock<HashMap<String, RouteEntry>>>,
+    routes: Arc<HashMap<String, RouteEntry>>,
     conn_limit: Option<Arc<Semaphore>>,
-    advertised_max_conn: Option<u32>,
+    advertised_max_conn: Option<usize>,
+    aliases: Arc<HashMap<String, String>>,
+    default_service: Option<String>,
 }
 
 impl Server {
@@ -165,16 +167,57 @@ impl Server {
                 None
             };
 
+            // Clone shared state into the task
             let routes = Arc::clone(&self.routes);
+            let aliases = Arc::clone(&self.aliases);
+            let default_service = self.default_service.clone();
             let advertised_max = self.advertised_max_conn;
 
             tokio::spawn(async move {
                 let _permit = maybe_permit;
-                if let Err(e) = Self::handle_connection(socket, routes, advertised_max).await {
+                if let Err(e) = Self::handle_connection(
+                    socket,
+                    routes,
+                    aliases,
+                    default_service,
+                    advertised_max,
+                )
+                .await
+                {
                     error!("Error handling connection {}: {}", addr, e);
                 }
             });
         }
+    }
+
+    ///
+    /// Rules:
+    /// - If `raw` is empty or exactly "/", use `default_service` (when set).
+    /// - Apply up to 4 alias rewrites (`from` → `to`) to avoid cycles.
+    fn resolve_service<'a>(
+        raw: &'a str,
+        aliases: &'a HashMap<String, String>,
+        default_service: Option<&'a str>,
+    ) -> Cow<'a, str> {
+        let mut cur: Cow<'a, str> = if raw.is_empty() || raw == "/" {
+            if let Some(def) = default_service {
+                Cow::Borrowed(def)
+            } else {
+                Cow::Borrowed(raw)
+            }
+        } else {
+            Cow::Borrowed(raw)
+        };
+
+        for _ in 0..4 {
+            if let Some(next) = aliases.get(cur.as_ref()) {
+                cur = Cow::Borrowed(next.as_str());
+            } else {
+                break;
+            }
+        }
+
+        cur
     }
 
     /// Handle a single client connection (persistent / keep-alive).
@@ -183,8 +226,10 @@ impl Server {
     /// writes the response, then repeats until the peer closes the connection.
     async fn handle_connection(
         mut socket: TcpStream,
-        routes: Arc<RwLock<HashMap<String, RouteEntry>>>,
-        advertised_max_conn: Option<u32>,
+        routes: Arc<HashMap<String, RouteEntry>>,
+        aliases: Arc<HashMap<String, String>>,
+        default_service: Option<String>,
+        advertised_max_conn: Option<usize>,
     ) -> IcapResult<()> {
         let mut buf: Vec<u8> = Vec::with_capacity(16 * 1024);
         let mut tmp = [0u8; 8192];
@@ -225,78 +270,81 @@ impl Server {
 
             // === Parse request and route ===
             let req = parse_icap_request(&buf[..msg_end])?;
-            trace!("Received {} to service '{}'", req.method, req.service);
-
-            let service_name = req
-                .service
-                .rsplit('/')
-                .next()
-                .unwrap_or(&req.service)
-                .to_string();
-
             let method = req.method;
+            let raw_service: &str = req.service.rsplit('/').next().unwrap_or(&req.service);
 
-            let resp = {
-                let routes_guard = routes.read().await;
+            let service_resolved =
+                Self::resolve_service(raw_service, &aliases, default_service.as_deref());
 
-                if let Some(entry) = routes_guard.get(&service_name) {
-                    match method {
-                        Method::Options => {
-                            let allowed: SmallVec<Method, 2> =
-                                entry.handlers.keys().copied().collect();
+            trace!(
+                "Received {} to service '{}'",
+                method,
+                service_resolved.as_ref()
+            );
 
-                            let mut cfg = if let Some(cfg) = &entry.options {
-                                cfg.clone()
-                            } else {
-                                OptionsConfig::new(&format!("{}-default-1.0", service_name))
-                                    .with_options_ttl(3600)
-                                    .add_allow("204")
-                            };
+            let resp = if let Some(entry) = routes.get(service_resolved.as_ref()) {
+                match method {
+                    Method::Options => {
+                        let mut allowed: SmallVec<Method, 2> =
+                            entry.handlers.keys().copied().collect();
+                        allowed.sort_unstable();
 
-                            cfg.set_methods(allowed);
+                        let mut cfg = if let Some(cfg) = &entry.options {
+                            cfg.clone()
+                        } else {
+                            OptionsConfig::new(&format!("{}-default-1.0", service_resolved))
+                                .with_options_ttl(3600)
+                                .add_allow("204")
+                        };
 
-                            if cfg.service.is_none() {
-                                cfg = cfg.with_service(&format!("ICAP Service {}", service_name));
-                            }
+                        cfg.set_methods(allowed);
 
-                            if let (Some(n), None) = (advertised_max_conn, cfg.max_connections) {
-                                cfg.with_max_connections(n);
-                            }
-
-                            cfg.build_response()
+                        if cfg.service.is_none() {
+                            cfg = cfg.with_service(&format!(
+                                "ICAP Service {}",
+                                service_resolved.as_ref()
+                            ));
                         }
-                        _ => {
-                            // If exact method handler exists — call it; else 405.
-                            if let Some(h) = entry.handlers.get(&method) {
-                                h(req).await?
-                            } else {
-                                Response::new(StatusCode::MethodNotAllowed405, "Method Not Allowed")
-                                    .add_header("Encapsulated", "null-body=0")
-                                    .add_header("Content-Length", "0")
-                            }
+
+                        if let (Some(n), None) = (advertised_max_conn, cfg.max_connections) {
+                            cfg.with_max_connections(n);
+                        }
+
+                        cfg.build_response()
+                    }
+                    _ => {
+                        if let Some(h) = entry.handlers.get(&method) {
+                            // move(req) happens here; don't use borrowed fields after this
+                            h(req).await?
+                        } else {
+                            Response::new(StatusCode::MethodNotAllowed405, "Method Not Allowed")
+                                .add_header("Encapsulated", "null-body=0")
+                                .add_header("Content-Length", "0")
                         }
                     }
-                } else if method == Method::Options {
-                    Self::build_default_options_response(&service_name, advertised_max_conn)
-                } else {
-                    warn!("Service '{}' not found", service_name);
-                    Response::new(StatusCode::NotFound404, "Service Not Found")
-                        .add_header("Encapsulated", "null-body=0")
-                        .add_header("Content-Length", "0")
                 }
+            } else if method == Method::Options {
+                Self::build_default_options_response(service_resolved.as_ref(), advertised_max_conn)
+            } else {
+                warn!("Service '{}' not found", service_resolved.as_ref());
+                Response::new(StatusCode::NotFound404, "Service Not Found")
+                    .add_header("Encapsulated", "null-body=0")
+                    .add_header("Content-Length", "0")
             };
 
             // === Write response and continue (keep-alive) ===
             let bytes = resp.to_raw()?;
             socket.write_all(&bytes).await?;
-            socket.flush().await?;
-            trace!("Response sent for service: {}", service_name);
+            trace!("Response sent with status {}", resp.status_code);
 
             buf.drain(..msg_end);
         }
     }
 
-    fn build_default_options_response(service_name: &str, advertised_max: Option<u32>) -> Response {
+    fn build_default_options_response(
+        service_name: &str,
+        advertised_max: Option<usize>,
+    ) -> Response {
         let mut cfg = OptionsConfig::new(&format!("{}-default-1.0", service_name))
             .with_options_ttl(3600)
             .add_allow("204");
@@ -323,6 +371,8 @@ pub struct ServerBuilder {
     routes: HashMap<String, RouteEntry>,
     pending_options: HashMap<String, OptionsConfig>,
     max_connections_global: Option<usize>,
+    aliases: HashMap<String, String>,
+    default_service: Option<String>,
 }
 
 impl ServerBuilder {
@@ -333,6 +383,8 @@ impl ServerBuilder {
             routes: HashMap::new(),
             pending_options: HashMap::new(),
             max_connections_global: None,
+            aliases: HashMap::new(),
+            default_service: None,
         }
     }
 
@@ -417,7 +469,7 @@ impl ServerBuilder {
         self.route(service, [Method::ReqMod], handler)
     }
 
-    /// Register a route for `RESPMOD` only.
+    ///Register a route for `RESPMOD` only.
     pub fn route_respmod<F, Fut>(self, service: &str, handler: F) -> Self
     where
         F: Fn(Request) -> Fut + Send + Sync + 'static,
@@ -440,6 +492,40 @@ impl ServerBuilder {
         self
     }
 
+    /// Add an alias for a service name: `from` → `to`.
+    ///
+    /// Useful to make root path behave like an existing service:
+    /// ```
+    /// # use icap_rs::Server;
+    /// let builder = Server::builder()
+    ///     .alias("/", "scan"); // "icap://host:1344/" will be treated as "scan"
+    /// ```
+    ///
+    /// Notes:
+    /// - Aliases are applied *after* [`default_service`](Self::default_service) is considered
+    ///   for empty or "/" path.
+    /// - Up to 4 alias rewrites are applied to avoid cycles.
+    pub fn alias(mut self, from: &str, to: &str) -> Self {
+        self.aliases.insert(from.to_string(), to.to_string());
+        self
+    }
+
+    /// Set a default service for empty or "/" path (e.g. `"scan"`).
+    ///
+    /// Example:
+    /// ```
+    /// # use icap_rs::Server;
+    /// let builder = Server::builder()
+    ///     .default_service("scan");
+    /// ```
+    ///
+    /// If a client sends `icap://host:1344/` or an empty service, requests are internally
+    /// routed to the specified service name.
+    pub fn default_service(mut self, svc: &str) -> Self {
+        self.default_service = Some(svc.to_string());
+        self
+    }
+
     /// Finalize the builder and create a [`Server`].
     pub async fn build(mut self) -> IcapResult<Server> {
         for (svc, cfg) in self.pending_options.drain() {
@@ -458,13 +544,15 @@ impl ServerBuilder {
         let conn_limit = self
             .max_connections_global
             .map(|n| Arc::new(Semaphore::new(n)));
-        let advertised_max_conn = self.max_connections_global.map(|n| n as u32);
+        let advertised_max_conn = self.max_connections_global;
 
         Ok(Server {
             listener,
-            routes: Arc::new(RwLock::new(self.routes)),
+            routes: Arc::new(self.routes),
             conn_limit,
             advertised_max_conn,
+            aliases: Arc::new(self.aliases),
+            default_service: self.default_service,
         })
     }
 }

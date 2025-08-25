@@ -5,7 +5,7 @@ use icap_rs::options::OptionsConfig;
 use icap_rs::request::Request;
 use icap_rs::response::{Response, StatusCode};
 use icap_rs::server::Server;
-use tokio::time::{Duration, sleep};
+use tokio::time::Duration;
 
 async fn always_204_handler(_req: Request) -> IcapResult<Response> {
     Ok(Response::no_content()
@@ -24,6 +24,9 @@ async fn start_server_on(port: u16) {
             always_204_handler(req).await
         })
         .set_options("respmod", respmod_opts)
+        .default_service("respmod")
+        .alias("/", "respmod")
+        .alias("alt", "respmod")
         .build()
         .await
         .expect("build server");
@@ -32,7 +35,7 @@ async fn start_server_on(port: u16) {
         let _ = server.run().await;
     });
 
-    sleep(Duration::from_millis(60)).await;
+    tokio::time::sleep(Duration::from_millis(60)).await;
 }
 
 fn make_embedded_http(body: &str) -> HttpResponse<Vec<u8>> {
@@ -43,6 +46,26 @@ fn make_embedded_http(body: &str) -> HttpResponse<Vec<u8>> {
         .header("Content-Length", body.len().to_string())
         .body(body.as_bytes().to_vec())
         .unwrap()
+}
+
+#[tokio::test]
+async fn alias_and_default_service_resolve() {
+    let port = 13520;
+    start_server_on(port).await;
+
+    let client = Client::builder().host("127.0.0.1").port(port).build();
+
+    let req_root = Request::respmod("")
+        .allow_204(true)
+        .with_http_response(make_embedded_http("hello"));
+    let resp_root = client.send(&req_root).await.expect("icap send root");
+    assert_eq!(resp_root.status_code, StatusCode::NoContent204);
+
+    let req_alt = Request::respmod("alt")
+        .allow_204(true)
+        .with_http_response(make_embedded_http("hello"));
+    let resp_alt = client.send(&req_alt).await.expect("icap send alt");
+    assert_eq!(resp_alt.status_code, StatusCode::NoContent204);
 }
 
 #[tokio::test]
