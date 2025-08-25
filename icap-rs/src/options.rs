@@ -37,7 +37,7 @@ pub struct OptionsConfig {
     /// Service tag (REQUIRED). A unique identifier for the service configuration.
     pub istag: String,
     /// Max concurrent connections hint (optional).
-    pub max_connections: Option<u32>,
+    pub max_connections: Option<usize>,
     /// TTL (seconds) for caching the OPTIONS response (optional).
     pub options_ttl: Option<u32>,
     /// Server date (optional). If set, formatted as HTTP-date (GMT).
@@ -88,7 +88,7 @@ impl OptionsConfig {
     }
 
     /// Router-only: set Max-Connections from global advertised limit if not set.
-    pub(crate) fn with_max_connections(&mut self, n: u32) {
+    pub(crate) fn with_max_connections(&mut self, n: usize) {
         self.max_connections = Some(n);
     }
 

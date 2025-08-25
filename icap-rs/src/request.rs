@@ -66,7 +66,7 @@ use tracing::{debug, trace};
 /// `Method` implements `From<&str>` / `From<String>` so you can pass
 /// `"REQMOD"` / `"RESPMOD"` (case-insensitive) to [`ServerBuilder::route`].
 /// Passing `"OPTIONS"` or an unknown string will **panic**.
-#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, Ord, PartialOrd)]
 pub enum Method {
     /// Request modification (`REQMOD`).
     ReqMod,
