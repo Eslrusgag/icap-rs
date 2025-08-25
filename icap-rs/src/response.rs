@@ -266,7 +266,25 @@ impl Response {
                 }
             }
             _ => {
-                // for non-2xx Encapsulation is not required. CRUTCH!
+                if !resp.headers.contains_key("Encapsulated") {
+                    if resp.body.is_empty() {
+                        resp.headers.insert(
+                            HeaderName::from_static("encapsulated"),
+                            HeaderValue::from_static("null-body=0"),
+                        );
+                    } else if looks_like_http_resp(&resp.body) {
+                        let enc = compute_enc_for_res_body(&resp.body)?;
+                        let hv = HeaderValue::from_str(&enc)
+                            .map_err(|e| Error::Header(e.to_string()))?;
+                        resp.headers
+                            .insert(HeaderName::from_static("encapsulated"), hv);
+                    } else {
+                        resp.headers.insert(
+                            HeaderName::from_static("encapsulated"),
+                            HeaderValue::from_static("opt-body=0"),
+                        );
+                    }
+                }
             }
         }
 
@@ -750,6 +768,24 @@ mod tests {
     #[test]
     fn istag_quoted_with_bad_char_rejected() {
         assert!(validate_istag(r#""ABC_DEF""#).is_err());
+    }
+
+    #[test]
+    fn to_raw_autogenerates_encapsulated_for_404_without_body() {
+        let resp = Response::new(StatusCode::NotFound404, "Not Found");
+        let raw = resp.to_raw().expect("serialize 404");
+        let s = String::from_utf8(raw).unwrap();
+        assert!(s.contains("Encapsulated: null-body=0"));
+        assert!(!s.to_lowercase().contains("istag:"), "no ISTag on non-2xx");
+    }
+
+    #[test]
+    fn to_raw_autogenerates_opt_body_for_non_http_body_on_error() {
+        let resp =
+            Response::new(StatusCode::InternalServerError500, "Internal").with_body_string("oops");
+        let raw = resp.to_raw().expect("serialize 500 with body");
+        let s = String::from_utf8(raw).unwrap();
+        assert!(s.contains("Encapsulated: opt-body=0"));
     }
 }
 
