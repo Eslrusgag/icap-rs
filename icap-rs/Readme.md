@@ -10,8 +10,9 @@ A Rust implementation of the **ICAP** protocol ([RFC 3507]) providing a practica
 
 - **Client**: functional — supports `OPTIONS`, `REQMOD`, `RESPMOD`, Preview (including `ieof`), embedded HTTP/1.x
   messages, streaming bodies, and optional connection reuse.
-- **Server**: experimental — per-service routing, automatic `OPTIONS` responses, duplicate-route detection,
-  safe reading of chunked bodies before invoking handlers.
+- **Server**: experimental — per-service routing, automatic `OPTIONS` responses (with optional **dynamic ISTag**),
+  duplicate-route detection, safe reading of chunked bodies before invoking handlers, and an RFC-friendly **200 echo**
+  fallback when `Allow: 204` is absent and `Preview` is not used.
 
 ---
 
@@ -43,6 +44,11 @@ icap-rs = "0.0.2"
 - **Routing per service**, with **one handler** able to serve multiple methods.
 - **Automatic `OPTIONS`** per service: `Methods` injected from registered routes; `Max-Connections` inherited from
   global limit.
+- **Dynamic ISTag provider**: `ServiceOptions::with_istag_provider` lets you compute `ISTag` per request (incl.
+  `OPTIONS`).
+- **RFC guard**: if the request has **no** `Allow: 204` and **no** `Preview`, the server **must not** reply `204`;
+  it will automatically send `200 OK` and **echo back** the embedded HTTP message (request for `REQMOD`, response for
+  `RESPMOD`).
 - **Duplicate route detection**: registering the same `(service, method)` twice panics with a clear message (axum-like
   DX).
 - Reads encapsulated *chunked* bodies to completion before invoking handlers.
@@ -94,9 +100,9 @@ async fn main() -> icap_rs::error::IcapResult<()> {
 
     // ICAP request: REQMOD to service "test", advertise Allow: 204, and send Preview: 0 with ieof
     let icap_req = Request::reqmod("test")
-        .allow_204(true)
+        .allow_204()
         .preview(0)
-        .preview_ieof(true)
+        .preview_ieof()
         .with_http_request(http_req);
 
     let resp = client.send(&icap_req).await?;
@@ -121,37 +127,31 @@ A minimal server exposing two services (`reqmod`, `respmod`) and replying `204 N
 
 ```rust,no_run
 use icap_rs::{Server, Request, Response, StatusCode};
-use icap_rs::options::OptionsConfig;
+use icap_rs::server::options::ServiceOptions;
 
 const ISTAG: &str = "example-1.0";
 
 #[tokio::main]
 async fn main() -> icap_rs::error::IcapResult<()> {
+    // Per-service OPTIONS config (Methods are injected by the router)
+    let reqmod_opts = ServiceOptions::new()
+        .with_service("Example REQMOD Service")
+        .add_allow("204");
+
+    let respmod_opts = ServiceOptions::new()
+        .with_service("Example RESPMOD Service")
+        .add_allow("204");
+
     let server = Server::builder()
         .bind("127.0.0.1:1344")
         // REQMOD → 204 (no changes). Encapsulated will be set automatically (null-body=0).
         .route_reqmod("reqmod", |_req: Request| async move {
             Ok(Response::no_content().try_set_istag(ISTAG)?)
-        })
+        }, Some(reqmod_opts))
         // RESPMOD → 204 (also without body).
         .route_respmod("respmod", |_req: Request| async move {
             Ok(Response::no_content().try_set_istag(ISTAG)?)
-        })
-        // Per-service OPTIONS config (Methods do not need to be specified - the router will supply them automatically)
-        .set_options(
-            "reqmod",
-            OptionsConfig::new("example-reqmod-1.0")
-                .with_service("Example REQMOD Service")
-                .with_options_ttl(600)
-                .add_allow("204"),
-        )
-        .set_options(
-            "respmod",
-            OptionsConfig::new("example-respmod-1.0")
-                .with_service("Example RESPMOD Service")
-                .with_options_ttl(600)
-                .add_allow("204"),
-        )
+        }, Some(respmod_opts))
         .build()
         .await?;
 
@@ -165,6 +165,7 @@ You can route by **strings** (case-insensitive) or enums. The same handler can h
 
 ```rust,no_run
 use icap_rs::{Server, Method, Request, Response, StatusCode};
+use icap_rs::server::options::ServiceOptions;
 use icap_rs::error::IcapResult;
 use http::{Response as HttpResponse, StatusCode as HttpStatus, Version};
 
@@ -181,6 +182,10 @@ fn make_http(body: &str) -> HttpResponse<Vec<u8>> {
 
 #[tokio::main]
 async fn main() -> IcapResult<()> {
+    let opts = ServiceOptions::new()
+        .with_service("Test Service")
+        .add_allow("204");
+
     let server = Server::builder()
         .bind("127.0.0.1:1344")
         // One handler handles both REQMOD and RESPMOD (strings are case-insensitive)
@@ -192,7 +197,6 @@ async fn main() -> IcapResult<()> {
                 }
                 Method::RespMod => {
                     // Return 200 with embedded HTTP.
-                    // Encapsulated (res-hdr[, res-body]) will be set automatically.
                     let http = make_http("hello from icap");
                     Response::new(StatusCode::Ok200, "OK")
                         .try_set_istag(ISTAG)?
@@ -201,14 +205,49 @@ async fn main() -> IcapResult<()> {
                 Method::Options => unreachable!("OPTIONS is handled automatically"),
             };
             Ok(resp)
-        })
+        }, Some(opts))
         .build()
         .await?;
 
     server.run().await
 }
-
 ```
+
+---
+
+## Dynamic ISTag (per-request)
+
+If your service tag reflects a mutable policy (e.g., a filtering rule-set version), you can compute `ISTag`
+**per request** (including `OPTIONS`):
+
+```rust,no_run
+use std::sync::{Arc, RwLock};
+use icap_rs::server::options::ServiceOptions;
+use icap_rs::request::Request;
+
+let version = Arc::new(RwLock::new(String::from("respmod-1.0")));
+let opts = ServiceOptions::new()
+    .with_istag_provider({
+        let version = version.clone();
+        move |_: &Request| version.read().unwrap().clone()
+    })
+    .with_service("Response Modifier")
+    .add_allow("204");
+```
+
+---
+
+## 204 policy & automatic 200 echo
+
+To align with RFC 3507 semantics:
+
+- If the client **did not** advertise `Allow: 204` **and** **did not** use `Preview`, the server **must not** reply
+  `204`.
+- In such cases, the server automatically returns `200 OK` and **echoes the embedded HTTP** message back:
+  - for `REQMOD` — echoes the HTTP request;
+  - for `RESPMOD` — echoes the HTTP response.
+
+When `Allow: 204` is present or `Preview` is used, your handler is free to return `204` where appropriate.
 
 ---
 
@@ -226,17 +265,19 @@ Key types re-exported at the crate root:
 
 - `Client` — high-level ICAP client with connection reuse.
 - `Request` — build `OPTIONS`/`REQMOD`/`RESPMOD` (set Preview, `Allow: 204/206`, attach embedded HTTP).
-- `Response`, `ResponseBuilder`, `StatusCode` — build and serialize ICAP responses.
-- `options::{OptionsConfig, IcapOptionsBuilder, IcapMethod, TransferBehavior}` — construct `OPTIONS`.
-  - `OptionsConfig::new(istag)` **no longer** takes methods; the router injects `Methods` automatically.
-  - `IcapOptionsBuilder::new(istag)` likewise doesn’t take methods.
+- `Response`, `StatusCode` — build and serialize ICAP responses.
+  - `Response::with_http_response(&http::Response<Vec<u8>>)` — attach embedded HTTP **response**.
+  - `Response::with_http_request(&http::Request<Vec<u8>>)` — attach embedded HTTP **request**.
+- `server::options::ServiceOptions` — construct per-service `OPTIONS` responses (router injects `Methods`).
+  - `ServiceOptions::with_istag_provider(F: Fn(&Request) -> String + Send + Sync + 'static)` — **dynamic ISTag** per
+    request.
 - `error::{IcapError, IcapResult}` — error handling.
 
 **Routing API highlights**
 
-- `ServerBuilder::route(service, methods, handler)` — `methods` can be `IcapMethod` values **or strings** like
-  `"REQMOD"`, `"RESPMOD"` (case-insensitive).
-- `ServerBuilder::route_reqmod(...)` / `route_respmod(...)` — sugar for common cases.
+- `ServerBuilder::route(service, methods, handler, options)` — `methods` can be enum values or strings like
+  `"REQMOD"`, `"RESPMOD"` (case-insensitive). `options` is `Option<ServiceOptions>`.
+- `ServerBuilder::route_reqmod(service, handler, options)` / `route_respmod(service, handler, options)` — sugar.
 - Duplicate `(service, method)` registrations **panic** with a clear message.
 
 ---

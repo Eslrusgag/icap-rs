@@ -27,11 +27,11 @@
 
 use crate::ICAP_VERSION;
 use crate::error::{Error, IcapResult};
-use crate::parser::{find_double_crlf, serialize_http_response};
+use crate::parser::{find_double_crlf, serialize_http_request, serialize_http_response};
 use http::{HeaderMap, HeaderName, HeaderValue};
 use std::fmt;
 use std::str::FromStr;
-use tracing::{debug, trace};
+use tracing::{trace, warn};
 
 /// ICAP status codes as defined in RFC 3507.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -339,6 +339,22 @@ impl Response {
         )
     }
 
+    /// Attach an **embedded HTTP request** (for `REQMOD` flows).
+    /// Sets `Encapsulated: req-hdr=0[, req-body=..]`.
+    pub fn with_http_request(mut self, http: &http::Request<Vec<u8>>) -> IcapResult<Self> {
+        let bytes = serialize_http_request(http);
+
+        let enc = compute_enc_for_req_body(&bytes)?;
+        let hv = HeaderValue::from_str(&enc).map_err(|e| Error::Header(e.to_string()))?;
+
+        self.body = bytes;
+        self.headers
+            .insert(HeaderName::from_static("encapsulated"), hv);
+        Ok(self)
+    }
+
+    /// Attach an **embedded HTTP response** (for `RESPMOD` flows).
+    /// Sets `Encapsulated: res-hdr=0[, res-body=..]`.
     pub fn with_http_response(mut self, http: &http::Response<Vec<u8>>) -> IcapResult<Self> {
         let bytes = serialize_http_response(http);
 
@@ -385,7 +401,7 @@ impl fmt::Display for Response {
 fn looks_like_http_resp(body: &[u8]) -> bool {
     body.starts_with(b"HTTP/1.0") || body.starts_with(b"HTTP/1.1")
 }
-
+#[inline]
 fn compute_enc_for_res_body(body: &[u8]) -> IcapResult<String> {
     let hdr_end = find_double_crlf(body)
         .ok_or_else(|| Error::Header("embedded HTTP missing CRLFCRLF".into()))?;
@@ -395,9 +411,19 @@ fn compute_enc_for_res_body(body: &[u8]) -> IcapResult<String> {
         Ok("res-hdr=0".to_string())
     }
 }
+#[inline]
+fn compute_enc_for_req_body(body: &[u8]) -> IcapResult<String> {
+    let hdr_end = find_double_crlf(body)
+        .ok_or_else(|| Error::Header("embedded HTTP missing CRLFCRLF".into()))?;
+    if body.len() > hdr_end {
+        Ok(format!("req-hdr=0, req-body={}", hdr_end))
+    } else {
+        Ok("req-hdr=0".to_string())
+    }
+}
 
 pub(crate) fn parse_icap_response(raw: &[u8]) -> IcapResult<Response> {
-    trace!("parse_icap_response: len={}", raw.len());
+    trace!(len = raw.len(), "parse_icap_response");
     if raw.is_empty() {
         return Err("Empty response".into());
     }
@@ -434,10 +460,7 @@ pub(crate) fn parse_icap_response(raw: &[u8]) -> IcapResult<Response> {
         String::new()
     };
 
-    debug!(
-        "parse_icap_response: {} {} {}",
-        version, status_code, status_text
-    );
+    trace!(version = %version, code = %status_code, text = %status_text, "parsed status line");
 
     let mut headers = HeaderMap::new();
     let mut seen_encapsulated = false;
@@ -478,16 +501,12 @@ pub(crate) fn parse_icap_response(raw: &[u8]) -> IcapResult<Response> {
         if require_istag {
             return Err(Error::MissingHeader("ISTag"));
         } else {
-            tracing::warn!(
-                code = %status_code,
-                "ICAP response without ISTag (non-2xx) — accepting for compatibility"
-            );
+            warn!(code = %status_code, "response without ISTag on non-2xx (accepted for compatibility)");
         }
     }
 
     let body = raw[hdr_end..].to_vec();
-    trace!("parse_icap_response: body_len={}", body.len());
-
+    trace!(body_len = body.len(), "parsed body");
     if require_istag {
         let enc_val = encapsulated_value
             .or_else(|| {

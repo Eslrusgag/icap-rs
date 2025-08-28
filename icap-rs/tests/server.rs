@@ -1,10 +1,10 @@
 use http::{Response as HttpResponse, StatusCode as HttpStatus, Version};
 use icap_rs::Client;
 use icap_rs::error::IcapResult;
-use icap_rs::options::OptionsConfig;
 use icap_rs::request::Request;
 use icap_rs::response::{Response, StatusCode};
 use icap_rs::server::Server;
+use icap_rs::server::options::ServiceOptions;
 use tokio::time::Duration;
 
 async fn always_204_handler(_req: Request) -> IcapResult<Response> {
@@ -14,16 +14,13 @@ async fn always_204_handler(_req: Request) -> IcapResult<Response> {
 }
 
 async fn start_server_on(port: u16) {
-    let respmod_opts = OptionsConfig::new("respmod-1.0")
+    let respmod_opts = ServiceOptions::new()
         .with_service("Response Modifier")
         .with_options_ttl(60);
 
     let server = Server::builder()
         .bind(&format!("127.0.0.1:{port}"))
-        .route_respmod("respmod", |req: Request| async move {
-            always_204_handler(req).await
-        })
-        .set_options("respmod", respmod_opts)
+        .route_respmod("respmod", |req| always_204_handler(req), Some(respmod_opts))
         .default_service("respmod")
         .alias("/", "respmod")
         .alias("alt", "respmod")
@@ -56,13 +53,13 @@ async fn alias_and_default_service_resolve() {
     let client = Client::builder().host("127.0.0.1").port(port).build();
 
     let req_root = Request::respmod("")
-        .allow_204(true)
+        .allow_204()
         .with_http_response(make_embedded_http("hello"));
     let resp_root = client.send(&req_root).await.expect("icap send root");
     assert_eq!(resp_root.status_code, StatusCode::NoContent204);
 
     let req_alt = Request::respmod("alt")
-        .allow_204(true)
+        .allow_204()
         .with_http_response(make_embedded_http("hello"));
     let resp_alt = client.send(&req_alt).await.expect("icap send alt");
     assert_eq!(resp_alt.status_code, StatusCode::NoContent204);
@@ -76,9 +73,8 @@ async fn respmod_no_allow_with_preview_may_be_204() {
     let client = Client::builder().host("127.0.0.1").port(port).build();
 
     let req = Request::respmod("respmod")
-        .allow_204(false)
         .preview(0)
-        .preview_ieof(true)
+        .preview_ieof()
         .with_http_response(make_embedded_http("hello"));
 
     let resp = client.send(&req).await.expect("icap send");
@@ -101,7 +97,7 @@ async fn respmod_allow_present_may_be_204() {
     let client = Client::builder().host("127.0.0.1").port(port).build();
 
     let req = Request::respmod("respmod")
-        .allow_204(true)
+        .allow_204()
         .with_http_response(make_embedded_http("hello"));
 
     let resp = client.send(&req).await.expect("icap send");
@@ -117,7 +113,7 @@ async fn respmod_allow_present_may_be_204() {
 }
 
 #[tokio::test]
-async fn respmod_no_allow_must_be_200() {
+async fn no_allow_header_must_be_200() {
     let port = 13511;
     start_server_on(port).await;
 

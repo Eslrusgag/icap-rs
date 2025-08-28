@@ -4,13 +4,32 @@
 //! service. It includes:
 //! - [`Method`] — ICAP methods
 //! - [`TransferBehavior`] — per-extension transfer hints (Preview/Ignore/Complete)
-//! - [`OptionsConfig`] — a builder-like struct that serializes to an ICAP response
-//! - [`IcapOptionsBuilder`] — fluent builder that validates the config
+//! - [`ServiceOptions`] — a builder-like struct that serializes to an ICAP response
+//!   and supports a dynamic ISTag provider.
 //!
-//! Status: **work in progress** — covers common headers used by popular ICAP
-//! servers/clients. Extend as needed for your deployment.
+//! ## Dynamic ISTag provider
+//! Some deployments need the ICAP ISTag to reflect a mutable policy (e.g. a
+//! filtering rule-set version). Use [`ServiceOptions::with_istag_provider`] to
+//! supply a closure that computes the ISTag *per request* (including `OPTIONS`).
+//!
+//! ### Example
+//! ```no_run
+//! # use icap_rs::server::options::ServiceOptions;
+//! # use icap_rs::request::Request;
+//! # let state = std::sync::Arc::new(std::sync::Mutex::new(String::from("respmod-1.0")));
+//! let opts = ServiceOptions::new()
+//!     .with_istag_provider({
+//!         let state = state.clone();
+//!         move |_: &Request| state.lock().unwrap().clone()
+//!     })
+//!     .with_service("Response Modifier")
+//!     .with_options_ttl(60)
+//!     .add_allow("204");
+//! ```
 
-use crate::request::Method;
+use std::sync::Arc;
+
+use crate::request::{Method, Request};
 use crate::response::{Response, StatusCode};
 use chrono::{DateTime, Utc};
 use smallvec::SmallVec;
@@ -27,15 +46,37 @@ pub enum TransferBehavior {
     Complete,
 }
 
+/// Source of the ISTag value used in responses.
+///
+/// - `Static`: fixed at configuration time (backward compatible).
+/// - `Dynamic`: computed per incoming request via a user-provided closure.
+///   This allows the ISTag to track a mutable policy or any other runtime state.
+#[derive(Clone)]
+pub enum IstagSource {
+    Static(String),
+    Dynamic(Arc<dyn Fn(&Request) -> String + Send + Sync>),
+}
+
+impl IstagSource {
+    /// Resolve the current ISTag for the given request.
+    #[inline]
+    pub fn current_for(&self, req: &Request) -> String {
+        match self {
+            IstagSource::Static(s) => s.clone(),
+            IstagSource::Dynamic(f) => (f)(req),
+        }
+    }
+}
+
 /// Configuration for generating an ICAP `OPTIONS` response.
-#[derive(Debug, Clone)]
-pub struct OptionsConfig {
-    /// Supported ICAP methods
+#[derive(Clone)]
+pub struct ServiceOptions {
+    /// Supported ICAP methods (injected by the router).
     pub(crate) methods: SmallVec<Method, 2>,
     /// Human-readable service description (optional).
     pub service: Option<String>,
-    /// Service tag (REQUIRED). A unique identifier for the service configuration.
-    pub istag: String,
+    /// ISTag source (static or dynamic provider).
+    pub istag: IstagSource,
     /// Max concurrent connections hint (optional).
     pub max_connections: Option<usize>,
     /// TTL (seconds) for caching the OPTIONS response (optional).
@@ -60,13 +101,22 @@ pub struct OptionsConfig {
     pub opt_body: Option<Vec<u8>>,
 }
 
-impl OptionsConfig {
+impl Default for ServiceOptions {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ServiceOptions {
     /// Create a new OPTIONS config with required fields.
-    pub fn new(istag: &str) -> Self {
+    ///
+    /// This uses a **static** ISTag by default. To make ISTag dynamic, call
+    /// [`with_istag_provider`](Self::with_istag_provider).
+    pub fn new() -> Self {
         Self {
             methods: SmallVec::new(),
             service: None,
-            istag: istag.to_string(),
+            istag: IstagSource::Static("default".to_string()),
             max_connections: None,
             options_ttl: None,
             date: None,
@@ -79,6 +129,38 @@ impl OptionsConfig {
             opt_body_type: None,
             opt_body: None,
         }
+    }
+
+    /// Provide a **dynamic ISTag provider** that will be invoked for **each request**
+    /// (including `OPTIONS`). The closure should be fast and lock-free if possible.
+    ///
+    /// Typical sources include: a version string stored in an `Arc<RwLock<String>>`,
+    /// an atomic epoch counter, or a lightweight in-process cache.
+    ///
+    /// # Example
+    /// ```
+    /// # use std::sync::{Arc, RwLock};
+    /// # use icap_rs::server::options::ServiceOptions;
+    /// # use icap_rs::request::Request;
+    /// let tag = Arc::new(RwLock::new(String::from("respmod-1.0")));
+    /// let opts = ServiceOptions::new()
+    ///     .with_istag_provider({
+    ///         let tag = tag.clone();
+    ///         move |_: &Request| tag.read().unwrap().clone()
+    ///     });
+    /// ```
+    pub fn with_istag_provider<F>(mut self, f: F) -> Self
+    where
+        F: Fn(&Request) -> String + Send + Sync + 'static,
+    {
+        self.istag = IstagSource::Dynamic(Arc::new(f));
+        self
+    }
+
+    /// Use a **static** ISTag for responses.
+    pub fn with_static_istag(mut self, istag: &str) -> Self {
+        self.istag = IstagSource::Static(istag.to_string());
+        self
     }
 
     /// Set the human-readable service description.
@@ -156,10 +238,21 @@ impl OptionsConfig {
         self.methods = methods.into();
     }
 
-    /// Build an ICAP `OPTIONS` response from this config.
+    /// Get the ISTag for a specific request (static or dynamic).
+    #[inline]
+    pub fn istag_for(&self, req: &Request) -> String {
+        self.istag.current_for(req)
+    }
+
+    /// Build an ICAP `OPTIONS` response for **this specific request**.
     ///
-    /// Assumes the router injected a non-empty `methods` list.
-    pub fn build_response(&self) -> Response {
+    /// The response includes:
+    /// - `Methods` — from the injected method set
+    /// - `ISTag`   — resolved via the static string or dynamic provider
+    /// - Standard headers (`Encapsulated`, `Service`, `Max-Connections`, etc.)
+    ///
+    /// Assumes the router injected a non-empty `methods` list via [`set_methods`](Self::set_methods).
+    pub fn build_response_for(&self, req: &Request) -> Response {
         let mut response = Response::new(StatusCode::Ok200, "OK");
 
         // Methods
@@ -171,8 +264,9 @@ impl OptionsConfig {
             .join(", ");
         response = response.add_header("Methods", &methods_str);
 
-        // ISTag
-        response = response.add_header("ISTag", &format!("\"{}\"", self.istag));
+        // ISTag — dynamic per-request
+        let istag_now = self.istag_for(req);
+        response = response.add_header("ISTag", &format!("\"{}\"", istag_now));
 
         // Encapsulated
         let encapsulated_value = if self.opt_body.is_some() {
@@ -209,6 +303,7 @@ impl OptionsConfig {
         if let Some(ref opt_body_type) = self.opt_body_type {
             response = response.add_header("Opt-body-type", opt_body_type);
         }
+
         // Transfer-* headers
         if !self.transfer_rules.is_empty() {
             let mut preview_extensions = Vec::new();
@@ -240,6 +335,7 @@ impl OptionsConfig {
                     response.add_header("Transfer-Complete", &complete_extensions.join(", "));
             }
         }
+
         // Custom headers
         for (name, value) in &self.custom_headers {
             response = response.add_header(name, value);
@@ -248,17 +344,16 @@ impl OptionsConfig {
         if let Some(ref opt_body) = self.opt_body {
             response = response.with_body(opt_body);
         }
+
         response
     }
 
     /// Validate invariants for this configuration.
     ///
-    /// `methods` may be empty here — the router will inject them before
-    /// `build_response()` is called.
+    /// For dynamic ISTag providers it is not possible to validate non-emptiness
+    /// at configuration time; perform validation when computing the value if needed.
     pub fn validate(&self) -> Result<(), String> {
-        if self.istag.is_empty() {
-            return Err("ISTag cannot be empty".to_string());
-        }
+        // No eager validation for dynamic ISTag; keep other invariants.
         if !self.transfer_rules.is_empty() && self.default_transfer_behavior.is_none() {
             return Err(
                 "Default transfer behavior must be set when transfer rules are defined".to_string(),
@@ -268,82 +363,5 @@ impl OptionsConfig {
             return Err("Opt-body-type must be set when opt-body is present".to_string());
         }
         Ok(())
-    }
-}
-
-/// Fluent builder for [`OptionsConfig`].
-///
-/// Prefer using this builder over constructing [`OptionsConfig`] directly when
-/// you want validation via [`IcapOptionsBuilder::build`].
-pub struct IcapOptionsBuilder {
-    config: OptionsConfig,
-}
-
-impl IcapOptionsBuilder {
-    /// Start a new builder (methods will be injected by the router).
-    pub fn new(istag: &str) -> Self {
-        Self {
-            config: OptionsConfig::new(istag),
-        }
-    }
-
-    /// Set service description.
-    pub fn service(mut self, service: &str) -> Self {
-        self.config = self.config.with_service(service);
-        self
-    }
-
-    /// Set `Options-TTL` (seconds).
-    pub fn options_ttl(mut self, ttl: u32) -> Self {
-        self.config = self.config.with_options_ttl(ttl);
-        self
-    }
-
-    /// Set current UTC date.
-    pub fn with_current_date(mut self) -> Self {
-        self.config = self.config.with_date(Utc::now());
-        self
-    }
-
-    /// Set service ID.
-    pub fn service_id(mut self, service_id: &str) -> Self {
-        self.config = self.config.with_service_id(service_id);
-        self
-    }
-
-    /// Add `204` to `Allow`.
-    pub fn allow_204(mut self) -> Self {
-        self.config = self.config.add_allow("204");
-        self
-    }
-
-    /// Set Preview size (bytes).
-    pub fn preview(mut self, preview: u32) -> Self {
-        self.config = self.config.with_preview(preview);
-        self
-    }
-
-    /// Add a per-extension transfer rule.
-    pub fn transfer_rule(mut self, extension: &str, behavior: TransferBehavior) -> Self {
-        self.config = self.config.add_transfer_rule(extension, behavior);
-        self
-    }
-
-    /// Set default transfer behavior (`*`).
-    pub fn default_transfer_behavior(mut self, behavior: TransferBehavior) -> Self {
-        self.config = self.config.with_default_transfer_behavior(behavior);
-        self
-    }
-
-    /// Add a custom header.
-    pub fn custom_header(mut self, name: &str, value: &str) -> Self {
-        self.config = self.config.add_custom_header(name, value);
-        self
-    }
-
-    /// Finish and validate.
-    pub fn build(self) -> Result<OptionsConfig, String> {
-        self.config.validate()?;
-        Ok(self.config)
     }
 }
