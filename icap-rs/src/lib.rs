@@ -2,17 +2,15 @@
 
 pub mod client;
 pub mod error;
-pub mod options;
 mod parser;
 pub mod request;
 pub mod response;
 pub mod server;
 
 pub use client::Client;
-pub use options::{IcapOptionsBuilder, OptionsConfig, TransferBehavior};
 pub use request::{EmbeddedHttp, Method, Request};
 pub use response::{Response, StatusCode};
-pub use server::{RequestHandler, Server, ServerBuilder};
+pub use server::{RequestHandler, Server, ServerBuilder, ServiceOptions, TransferBehavior};
 
 ///Lib version
 pub const LIB_VERSION: &str = env!("CARGO_PKG_VERSION");

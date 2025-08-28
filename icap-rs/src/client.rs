@@ -983,7 +983,7 @@ mod tests {
 
         let req = Request::reqmod("icap/test")
             .preview(4)
-            .allow_204(true)
+            .allow_204()
             .icap_header("x-foo", "bar")
             .with_http_request(http);
 
@@ -1035,7 +1035,7 @@ mod tests {
 
         let req = Request::reqmod("icap/full")
             .preview(0)
-            .preview_ieof(true)
+            .preview_ieof()
             .with_http_request(http);
 
         let wire = c.get_request_wire(&req, false).unwrap();

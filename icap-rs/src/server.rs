@@ -21,6 +21,7 @@
 //! ```rust,no_run
 //! use icap_rs::{Server, Method, Request, Response, StatusCode};
 //! use icap_rs::error::IcapResult;
+//! use icap_rs::server::options::ServiceOptions;
 //!
 //! const ISTAG: &str = "scan-1.0";
 //!
@@ -29,13 +30,21 @@
 //!     let server = Server::builder()
 //!         .bind("127.0.0.1:1344")
 //!         // One handler for REQMOD and RESPMOD of the "scan" service.
-//!         .route("scan", [Method::ReqMod, Method::RespMod], |req: Request| async move {
-//!             match req.method {
-//!                 Method::ReqMod => Ok(Response::no_content().try_set_istag(ISTAG)?),
-//!                 Method::RespMod => Ok(Response::no_content().try_set_istag(ISTAG)?),
-//!                 Method::Options => unreachable!("OPTIONS is handled automatically by the server"),
-//!             }
-//!         })
+//!         .route(
+//!             "scan",
+//!             [Method::ReqMod, Method::RespMod],
+//!             |req: Request| async move {
+//!                 match req.method {
+//!                     Method::ReqMod => Ok(Response::no_content().try_set_istag(ISTAG)?),
+//!                     Method::RespMod => Ok(Response::no_content().try_set_istag(ISTAG)?),
+//!                     Method::Options => unreachable!("OPTIONS is handled automatically by the server"),
+//!                 }
+//!             },
+//!             Some(ServiceOptions::new().with_static_istag(ISTAG)
+//!                 .with_service("Scan Service")
+//!                 .add_allow("204")
+//!                 .with_preview(2048))
+//!         )
 //!         // If a client uses `icap://host/`, internally route it to the "scan" service.
 //!         .default_service("scan")
 //!         .alias("/", "scan")
@@ -65,8 +74,12 @@ use tracing::{error, trace, warn};
 use crate::error::IcapResult;
 use crate::parser::{find_double_crlf, read_chunked_to_end};
 use crate::request::parse_icap_request;
-use crate::{Method, OptionsConfig, Request, Response, StatusCode};
+pub use crate::server::options::{ServiceOptions, TransferBehavior};
+use crate::{EmbeddedHttp, Method, Request, Response, StatusCode};
 use smallvec::SmallVec;
+pub mod options;
+
+// Public alias so user code can write `ServiceOptions::new(..)` instead of `OptionsConfig::new(..)`.
 
 /// A per-service ICAP handler.
 ///
@@ -88,7 +101,7 @@ struct RouteEntry {
     /// Map of method → handler. This enables duplicate-method detection and
     /// allows different handlers per method if desired.
     handlers: HashMap<Method, RequestHandler>,
-    options: Option<OptionsConfig>,
+    options: Option<ServiceOptions>,
 }
 
 /// ICAP server.
@@ -100,18 +113,27 @@ struct RouteEntry {
 /// ```rust,no_run
 /// use icap_rs::{Server, Method, Request, Response};
 /// use icap_rs::error::IcapResult;
+/// use icap_rs::server::options::ServiceOptions;
+///
+/// const ISTAG: &str = "scan-1.0";
+///
 /// #[tokio::main]
 /// async fn main() -> IcapResult<()> {
 ///     let server = Server::builder()
-///     .bind("127.0.0.1:1344")
-///     .route("scan", [Method::ReqMod], |_req: Request| async move {
-///     Ok(Response::no_content().try_set_istag("scan-1.0")?)
-///     })
-///     .build()
-///     .await?;
+///         .bind("127.0.0.1:1344")
+///         .route(
+///             "scan",
+///             [Method::ReqMod],
+///             |_req: Request| async move {
+///                 Ok(Response::no_content().try_set_istag(ISTAG)?)
+///             },
+///             Some(ServiceOptions::new().with_static_istag(ISTAG).with_preview(1024)),
+///         )
+///         .build()
+///         .await?;
 ///
 ///     server.run().await
-///  }
+/// }
 /// ```
 pub struct Server {
     listener: TcpListener,
@@ -140,21 +162,17 @@ impl Server {
     /// - Shared routing/alias/default/max-conn state is passed via `Arc`.
     pub async fn run(self) -> IcapResult<()> {
         let local_addr = self.listener.local_addr()?;
-        trace!("ICAP server started on {}", local_addr);
+        trace!(addr=%local_addr, "ICAP server started");
 
         loop {
             let (mut socket, addr) = self.listener.accept().await?;
-            trace!("New connection from {}", addr);
+            trace!(client=%addr, "new connection");
 
             let maybe_permit = if let Some(sem) = &self.conn_limit {
                 match sem.clone().try_acquire_owned() {
                     Ok(p) => Some(p),
                     Err(_) => {
-                        warn!(
-                            "Refusing connection from {}: too many concurrent connections",
-                            addr
-                        );
-
+                        warn!(client=%addr, "refusing connection: too many concurrent connections");
                         let resp =
                             Response::new(StatusCode::ServiceUnavailable503, "Service Unavailable")
                                 .add_header("Connection", "close");
@@ -162,7 +180,7 @@ impl Server {
                         match resp.to_raw() {
                             Ok(bytes) => {
                                 if let Err(e) = socket.write_all(&bytes).await {
-                                    warn!("Failed to send 503 to {}: {}", addr, e);
+                                    warn!(client=%addr, error=%e, "failed to send 503");
                                 } else {
                                     let _ =
                                         socket.set_linger(Some(std::time::Duration::from_secs(1)));
@@ -183,7 +201,7 @@ impl Server {
                                 }
                             }
                             Err(e) => {
-                                warn!("Failed to serialize 503 to {}: {}", addr, e);
+                                warn!(client=%addr, error=%e, "failed to serialize 503");
                             }
                         }
                         continue;
@@ -210,7 +228,7 @@ impl Server {
                 )
                 .await
                 {
-                    error!("Error handling connection {}: {}", addr, e);
+                    error!(client=%addr, error=%e, "error handling connection");
                 }
             });
         }
@@ -303,14 +321,12 @@ impl Server {
             let service_resolved =
                 Self::resolve_service(raw_service, &aliases, default_service.as_deref());
 
-            trace!(
-                "Received {method} to service '{}'",
-                service_resolved.as_ref()
-            );
+            trace!(method=?method, service=%service_resolved, "received request");
 
             let resp = if let Some(entry) = routes.get(service_resolved.as_ref()) {
                 match method {
                     Method::Options => {
+                        // Build per-request OPTIONS with dynamic ISTag
                         let mut allowed: SmallVec<Method, 2> =
                             entry.handlers.keys().copied().collect();
                         allowed.sort_unstable();
@@ -318,7 +334,8 @@ impl Server {
                         let mut cfg = if let Some(cfg) = &entry.options {
                             cfg.clone()
                         } else {
-                            OptionsConfig::new(&format!("{}-default-1.0", service_resolved))
+                            ServiceOptions::new()
+                                .with_static_istag(&format!("{}-default-1.0", service_resolved))
                                 .with_options_ttl(3600)
                                 .add_allow("204")
                         };
@@ -336,20 +353,59 @@ impl Server {
                             cfg.with_max_connections(n);
                         }
 
-                        cfg.build_response()
+                        cfg.build_response_for(&req)
                     }
                     _ => {
-                        if let Some(h) = entry.handlers.get(&method) {
-                            h(req).await?
+                        // --- RFC guard for 204 ---
+                        // If no Allow: 204 and no Preview -> MUST NOT return 204; echo original HTTP back with 200.
+                        let allow_204 = req
+                            .icap_headers
+                            .get("Allow")
+                            .and_then(|v| v.to_str().ok())
+                            .map(|s| s.split(',').any(|t| t.trim() == "204"))
+                            .unwrap_or(false);
+
+                        let has_preview = req.icap_headers.get("Preview").is_some();
+
+                        if !allow_204 && !has_preview {
+                            let istag_now = entry
+                                .options
+                                .as_ref()
+                                .map(|opts| opts.istag_for(&req))
+                                .unwrap_or_else(|| format!("{}-default-1.0", service_resolved));
+
+                            let mut out =
+                                Response::new(StatusCode::Ok200, "OK").try_set_istag(&istag_now)?;
+
+                            match (&req.embedded, method) {
+                                (Some(EmbeddedHttp::Resp(http_resp)), Method::RespMod) => {
+                                    out = out.with_http_response(http_resp)?;
+                                }
+                                (Some(EmbeddedHttp::Req(http_req)), Method::ReqMod) => {
+                                    out = out.with_http_request(http_req)?;
+                                }
+                                _ => {}
+                            }
+
+                            out
                         } else {
-                            Response::new(StatusCode::MethodNotAllowed405, "Method Not Allowed")
+                            // allowed to return 204 (either Allow: 204 present or Preview in use)
+                            if let Some(h) = entry.handlers.get(&method) {
+                                h(req).await?
+                            } else {
+                                Response::new(StatusCode::MethodNotAllowed405, "Method Not Allowed")
+                            }
                         }
                     }
                 }
             } else if method == Method::Options {
-                Self::build_default_options_response(service_resolved.as_ref(), advertised_max_conn)
+                Self::build_default_options_response(
+                    service_resolved.as_ref(),
+                    advertised_max_conn,
+                    &req,
+                )
             } else {
-                warn!("Service '{}' not found", service_resolved.as_ref());
+                warn!(service=%service_resolved, "service not found");
                 Response::new(StatusCode::NotFound404, "Service Not Found")
             };
 
@@ -381,19 +437,18 @@ impl Server {
     fn build_default_options_response(
         service_name: &str,
         advertised_max: Option<usize>,
+        req: &Request,
     ) -> Response {
-        let mut cfg = OptionsConfig::new(&format!("{}-default-1.0", service_name))
-            .with_options_ttl(3600)
-            .add_allow("204");
+        let mut cfg = ServiceOptions::new().with_static_istag(service_name);
 
         cfg.set_methods([Method::RespMod]);
-
         cfg = cfg.with_service(&format!("ICAP Service {}", service_name));
 
         if let Some(n) = advertised_max {
             cfg.with_max_connections(n);
         }
-        cfg.build_response()
+
+        cfg.build_response_for(req)
     }
 }
 
@@ -406,7 +461,6 @@ impl Server {
 pub struct ServerBuilder {
     bind_addr: Option<String>,
     routes: HashMap<String, RouteEntry>,
-    pending_options: HashMap<String, OptionsConfig>,
     max_connections_global: Option<usize>,
     aliases: HashMap<String, String>,
     default_service: Option<String>,
@@ -418,7 +472,6 @@ impl ServerBuilder {
         Self {
             bind_addr: None,
             routes: HashMap::new(),
-            pending_options: HashMap::new(),
             max_connections_global: None,
             aliases: HashMap::new(),
             default_service: None,
@@ -434,53 +487,24 @@ impl ServerBuilder {
     /// Limit the number of concurrent connections accepted by the server.
     ///
     /// The value is also advertised in `OPTIONS` as `Max-Connections` if
-    /// not explicitly configured on the per-service `OptionsConfig`.
+    /// not explicitly configured on the per-service options.
     pub fn with_max_connections(mut self, n: usize) -> Self {
         self.max_connections_global = Some(n.max(1));
         self
     }
 
-    /// Register a **service route** for one or more ICAP methods.
+    /// Register a **service route** for one or more ICAP methods (with optional per-service options).
     ///
-    /// - Multiple calls to `.route(..)` for the **same service** are allowed
-    ///   as long as methods do not overlap.
-    /// - Registering the **same method** for the same service twice will `panic!`
-    ///   with a clear message.
+    /// - Multiple calls to `.route(..)` for the **same service** are allowed as long as methods do not overlap.
+    /// - Registering the **same method** for the same service twice will `panic!` with a clear message.
     /// - The same handler can be reused for multiple methods in a single call.
-    ///
-    /// # Example
-    ///
-    /// One handler for both `REQMOD` and `RESPMOD` on service `"scan"`:
-    ///
-    /// ```rust,no_run
-    /// use icap_rs::{Server, Method, Request, Response};
-    /// use icap_rs::error::IcapResult;
-    /// use icap_rs::options::OptionsConfig;
-    ///
-    /// const ISTAG: &str = "scan-1.0";
-    ///
-    /// #[tokio::main]
-    /// async fn main() -> IcapResult<()> {
-    ///     let server = Server::builder()
-    ///         .route("scan", [Method::ReqMod, Method::RespMod], |req: Request| async move {
-    ///             // Do your logic based on req.method / req.embedded ...
-    ///             Ok(Response::no_content().try_set_istag(ISTAG)?)
-    ///         })
-    ///         // Optional per-service OPTIONS config:
-    ///         .set_options("scan",
-    ///             OptionsConfig::new(ISTAG)
-    ///                 .with_service("Scan Service")
-    ///                 .add_allow("204")
-    ///                 .with_preview(1024)
-    ///         )
-    ///         .build()
-    ///         .await?;
-    ///
-    ///     // server.run().await
-    ///     Ok(())
-    /// }
-    /// ```
-    pub fn route<MIt, MItem, F, Fut>(mut self, service: &str, methods: MIt, handler: F) -> Self
+    pub fn route<MIt, MItem, F, Fut>(
+        mut self,
+        service: &str,
+        methods: MIt,
+        handler: F,
+        options: Option<ServiceOptions>,
+    ) -> Self
     where
         MIt: IntoIterator<Item = MItem>,
         MItem: Into<Method>,
@@ -523,43 +547,43 @@ impl ServerBuilder {
             entry.handlers.insert(m, h);
         }
 
-        if let Some(cfg) = self.pending_options.remove(&key) {
+        // Attach options if provided for this route
+        if let Some(cfg) = options {
+            if entry.options.is_some() {
+                panic!("Options already set for service '{service}'");
+            }
             entry.options = Some(cfg);
         }
 
         self
     }
 
-    ///Register a route for `REQMOD` only.
-    pub fn route_reqmod<F, Fut>(self, service: &str, handler: F) -> Self
+    /// Register a route for `REQMOD` only
+    pub fn route_reqmod<F, Fut>(
+        self,
+        service: &str,
+        handler: F,
+        options: Option<ServiceOptions>,
+    ) -> Self
     where
         F: Fn(Request) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = IcapResult<Response>> + Send + Sync + 'static,
     {
-        self.route(service, [Method::ReqMod], handler)
+        self.route(service, [Method::ReqMod], handler, options)
     }
 
-    ///Register a route for `RESPMOD` only.
-    pub fn route_respmod<F, Fut>(self, service: &str, handler: F) -> Self
+    /// Register a route for `RESPMOD` only.
+    pub fn route_respmod<F, Fut>(
+        self,
+        service: &str,
+        handler: F,
+        options: Option<ServiceOptions>,
+    ) -> Self
     where
         F: Fn(Request) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = IcapResult<Response>> + Send + Sync + 'static,
     {
-        self.route(service, [Method::RespMod], handler)
-    }
-
-    /// Optional: set a per-service [`OptionsConfig`].
-    ///
-    /// Can be called **before or after** `.route(..)`; the config will be attached either way.
-    pub fn set_options(mut self, service: &str, cfg: OptionsConfig) -> Self {
-        let key = service.to_string();
-        if let Some(entry) = self.routes.get_mut(&key) {
-            entry.options = Some(cfg);
-        } else {
-            // store for later; attached in build() when the service is created
-            self.pending_options.insert(key, cfg);
-        }
-        self
+        self.route(service, [Method::RespMod], handler, options)
     }
 
     /// Add an alias for a service name: `from` → `to`.
@@ -597,15 +621,7 @@ impl ServerBuilder {
     }
 
     /// Finalize the builder and create a [`Server`].
-    pub async fn build(mut self) -> IcapResult<Server> {
-        for (svc, cfg) in self.pending_options.drain() {
-            let entry = self.routes.entry(svc).or_insert_with(|| RouteEntry {
-                handlers: HashMap::new(),
-                options: None,
-            });
-            entry.options = Some(cfg);
-        }
-
+    pub async fn build(self) -> IcapResult<Server> {
         let bind_addr = self
             .bind_addr
             .unwrap_or_else(|| "127.0.0.1:1344".to_string());
@@ -665,8 +681,8 @@ mod tests {
         let h2 = handler_ok;
 
         let _builder = Server::builder()
-            .route("/spool", [Method::ReqMod], h1)
-            .route("/spool", [Method::RespMod], h2);
+            .route("/spool", [Method::ReqMod], h1, None)
+            .route("/spool", [Method::RespMod], h2, None);
     }
 
     #[test]
@@ -674,10 +690,10 @@ mod tests {
         let h1 = handler_ok;
         let h2 = handler_ok;
 
-        let builder = Server::builder().route("/spool", [Method::ReqMod], h1);
+        let builder = Server::builder().route("/spool", [Method::ReqMod], h1, None);
 
         let res = catch_unwind(AssertUnwindSafe(|| {
-            let _ = builder.route("/spool", [Method::ReqMod], h2);
+            let _ = builder.route("/spool", [Method::ReqMod], h2, None);
         }));
 
         assert!(res.is_err(), "expected panic on duplicate method route");
@@ -695,10 +711,10 @@ mod tests {
         let h = handler_ok;
         let h2 = handler_ok;
 
-        let builder = Server::builder().route("/svc", [Method::ReqMod, Method::RespMod], h);
+        let builder = Server::builder().route("/svc", [Method::ReqMod, Method::RespMod], h, None);
 
         let res = catch_unwind(AssertUnwindSafe(|| {
-            let _ = builder.route("/svc", [Method::RespMod], h2);
+            let _ = builder.route("/svc", [Method::RespMod], h2, None);
         }));
 
         assert!(res.is_err(), "expected panic on overlapping RESPMOD");
@@ -714,13 +730,13 @@ mod tests {
     #[test]
     fn route_accepts_string_methods_case_insensitive() {
         let h = handler_ok;
-        let _b = Server::builder().route("/svc", ["reqmod", "RESPMOD"], h);
+        let _b = Server::builder().route("/svc", ["reqmod", "RESPMOD"], h, None);
     }
 
     #[test]
     fn route_accepts_mixed_enum_and_string() {
         let h = handler_ok;
-        let _b = Server::builder().route("/svc", vec![Method::ReqMod, "respmod".into()], h);
+        let _b = Server::builder().route("/svc", vec![Method::ReqMod, "respmod".into()], h, None);
     }
 
     #[test]
@@ -728,7 +744,7 @@ mod tests {
         let h = handler_ok;
 
         let res = catch_unwind(AssertUnwindSafe(|| {
-            let _ = Server::builder().route("/svc", ["FOO"], h);
+            let _ = Server::builder().route("/svc", ["FOO"], h, None);
         }));
 
         assert!(res.is_err(), "expected panic on unknown method string");
@@ -744,7 +760,7 @@ mod tests {
         let h = handler_ok;
 
         let res = catch_unwind(AssertUnwindSafe(|| {
-            let _ = Server::builder().route("/svc", ["OPTIONS"], h);
+            let _ = Server::builder().route("/svc", ["OPTIONS"], h, None);
         }));
 
         assert!(

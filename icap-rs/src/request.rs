@@ -22,7 +22,7 @@
 //!     .unwrap();
 //!
 //! let icap_req = Request::reqmod("icap/test")
-//!     .allow_204(true)
+//!     .allow_204()
 //!     .preview(4)
 //!     .with_http_request(http_req);
 //!
@@ -194,18 +194,18 @@ impl Request {
         self.preview_size = Some(n);
         self
     }
-    pub fn preview_ieof(mut self, yes: bool) -> Self {
-        self.preview_ieof = yes;
+    pub fn preview_ieof(mut self) -> Self {
+        self.preview_ieof = true;
         self
     }
 
     /// Advertise Allow: 204/206.
-    pub fn allow_204(mut self, yes: bool) -> Self {
-        self.allow_204 = yes;
+    pub fn allow_204(mut self) -> Self {
+        self.allow_204 = true;
         self
     }
-    pub fn allow_206(mut self, yes: bool) -> Self {
-        self.allow_206 = yes;
+    pub fn allow_206(mut self) -> Self {
+        self.allow_206 = true;
         self
     }
 
@@ -435,10 +435,10 @@ mod tests {
     #[test]
     fn builder_flags_preview_allow() {
         let req = Request::reqmod("icap/test")
-            .allow_204(true)
-            .allow_206(true)
+            .allow_204()
+            .allow_206()
             .preview(16)
-            .preview_ieof(true);
+            .preview_ieof();
 
         assert!(req.allow_204);
         assert!(req.allow_206);
@@ -651,7 +651,7 @@ mod rfc_tests {
         assert_eq!(r.preview_size, Some(0));
         assert!(!r.preview_ieof);
 
-        let r2 = Request::reqmod("svc").preview(0).preview_ieof(true);
+        let r2 = Request::reqmod("svc").preview(0).preview_ieof();
         assert_eq!(r2.preview_size, Some(0));
         assert!(r2.preview_ieof);
     }

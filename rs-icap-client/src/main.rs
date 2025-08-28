@@ -223,10 +223,10 @@ async fn main() -> IcapResult<()> {
 
     let mut icap_req = Request::new(icap_method.as_str(), &service);
     if !args.no204 {
-        icap_req = icap_req.allow_204(true);
+        icap_req = icap_req.allow_204();
     }
     if args.allow_206 {
-        icap_req = icap_req.allow_206(true);
+        icap_req = icap_req.allow_206();
     }
 
     // Extra ICAP headers (-x)
@@ -258,7 +258,7 @@ async fn main() -> IcapResult<()> {
     } else if let Some(n) = args.preview_size {
         icap_req = icap_req.preview(n);
         if args.ieof && n == 0 {
-            icap_req = icap_req.preview_ieof(true);
+            icap_req = icap_req.preview_ieof();
         }
     } else if icap_method != "OPTIONS"
         && !args.print_request
@@ -520,7 +520,7 @@ fn parse_authority_and_service(uri: &str) -> Option<(String, u16, String)> {
 }
 
 async fn negotiate_caps(client: &Client, service: &str) -> IcapResult<IcapCaps> {
-    let opt_req = Request::options(service).allow_204(true);
+    let opt_req = Request::options(service).allow_204();
     let resp: IcapResponse = client.send(&opt_req).await?;
 
     let get = |name: &str| -> Option<String> {
