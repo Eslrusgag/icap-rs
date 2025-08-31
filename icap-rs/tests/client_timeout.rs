@@ -52,7 +52,6 @@ pub async fn spawn_slow_icap_server(
             let _ = sock.write_all(wire).await;
             let _ = sock.flush().await;
 
-            // мягко закрыть запись и дать клиенту дочитать
             let _ = sock.shutdown().await;
             tokio::time::sleep(Duration::from_millis(100)).await;
         }

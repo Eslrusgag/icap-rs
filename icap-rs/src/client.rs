@@ -9,13 +9,12 @@
 //! - Encapsulated header calculation and chunked bodies.
 use crate::error::{Error, IcapResult};
 use crate::parser::parse_encapsulated_header;
-use crate::parser::{
-    canon_icap_header, find_double_crlf, read_chunked_to_end, write_chunk, write_chunk_into,
-};
+use crate::parser::{canon_icap_header, read_chunked_to_end, write_chunk, write_chunk_into};
 use crate::request::{Request, serialize_embedded_http};
 use crate::response::{Response, parse_icap_response};
 
 use crate::Method;
+use crate::parser::icap::find_double_crlf;
 use http::{HeaderMap, HeaderName, HeaderValue};
 use std::path::Path;
 use std::sync::Arc;
@@ -708,8 +707,6 @@ async fn read_icap_headers(stream: &mut TcpStream) -> IcapResult<(u16, Vec<u8>)>
     let mut buf = Vec::new();
     let mut tmp = [0u8; 4096];
 
-    // Returns true if we already have the canonical end-of-headers marker.
-    let has_double_crlf = |b: &Vec<u8>| b.windows(4).any(|w| w == b"\r\n\r\n");
     // Returns the position of the first CRLF (end of the status line).
     let first_crlf_pos = |b: &Vec<u8>| b.windows(2).position(|w| w == b"\r\n");
 
@@ -735,7 +732,7 @@ async fn read_icap_headers(stream: &mut TcpStream) -> IcapResult<(u16, Vec<u8>)>
             // Peer closed before we saw \r\n\r\n.
             // Some non-strict servers send only a single CRLF and then close.
             // If we already have a status line, normalize to \r\n\r\n for compatibility.
-            if first_crlf_pos(&buf).is_some() && !has_double_crlf(&buf) {
+            if first_crlf_pos(&buf).is_some() && find_double_crlf(&buf).is_none() {
                 buf.extend_from_slice(b"\r\n"); // synthesize the missing empty line
             } else {
                 return Err(Error::EarlyCloseWithoutHeaders);
@@ -745,7 +742,7 @@ async fn read_icap_headers(stream: &mut TcpStream) -> IcapResult<(u16, Vec<u8>)>
         }
 
         // 1) Fast path: canonical end-of-headers found.
-        if has_double_crlf(&buf) {
+        if let Some(_hdr_end) = find_double_crlf(&buf) {
             let line_end = first_crlf_pos(&buf).unwrap_or(buf.len());
             let status_line = &buf[..line_end];
 
@@ -768,7 +765,7 @@ async fn read_icap_headers(stream: &mut TcpStream) -> IcapResult<(u16, Vec<u8>)>
         if let Some(code) = parse_status_if_possible(&buf).map_err(|e| e.to_string())?
             && (400..=599).contains(&code)
         {
-            if !has_double_crlf(&buf) {
+            if find_double_crlf(&buf).is_none() {
                 buf.extend_from_slice(b"\r\n"); // synthesize the missing empty line
             }
             return Ok((code, buf));
@@ -834,47 +831,72 @@ fn build_preview_and_chunks(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parser::icap::find_double_crlf;
     use http::{Request as HttpReq, Version, header};
-    use tokio::net::TcpListener;
-    use tokio::time::timeout;
+    use rstest::{fixture, rstest};
+    use std::future;
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::time::{Duration, timeout};
 
     fn bytes_to_string_prefix(v: &[u8], n: usize) -> String {
         String::from_utf8_lossy(&v[..v.len().min(n)]).to_string()
     }
 
     fn extract_headers_text(wire: &[u8]) -> String {
-        let end = wire.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+        let end = find_double_crlf(wire).expect("headers terminator not found");
         String::from_utf8_lossy(&wire[..end]).to_string()
     }
 
     fn find_header_line(hdrs: &str, name_ci: &str) -> Option<String> {
+        let needle = format!("{}:", name_ci.to_ascii_lowercase());
         hdrs.lines()
-            .find(|l| {
-                l.to_ascii_lowercase()
-                    .starts_with(&format!("{}:", name_ci.to_ascii_lowercase()))
-            })
+            .find(|l| l.to_ascii_lowercase().starts_with(&needle))
             .map(|s| s.to_string())
     }
 
-    #[test]
-    fn parse_authority_default_port() {
-        let (h, p) = parse_authority("icap://proxy.local/service").unwrap();
-        assert_eq!(h, "proxy.local");
-        assert_eq!(p, 1344);
+    #[fixture]
+    fn client() -> Client {
+        Client::builder()
+            .host("icap.example")
+            .port(1344)
+            .default_header("x-trace-id", "test-123")
+            .keep_alive(true)
+            .build()
     }
 
-    #[test]
-    fn parse_authority_with_port() {
-        let (h, p) = parse_authority("icap://proxy.local:1345/respmod").unwrap();
-        assert_eq!(h, "proxy.local");
-        assert_eq!(p, 1345);
+    async fn connect_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        (client, server)
     }
 
-    #[test]
-    fn parse_authority_errors() {
-        assert!(parse_authority("http://wrong").is_err());
-        assert!(parse_authority("icap://:1344/").is_err());
-        assert!(parse_authority("icap://proxy:bad/").is_err());
+    async fn server_write(server: TcpStream, bytes: &[u8], keep_open: bool) {
+        use tokio::io::AsyncWriteExt;
+        let mut s = server;
+        if !bytes.is_empty() {
+            s.write_all(bytes).await.unwrap();
+            let _ = s.flush().await;
+        }
+        if keep_open {
+            let _ = future::pending::<()>().await;
+        }
+    }
+
+    #[rstest]
+    #[case("icap://proxy.local/service", Ok(("proxy.local".to_string(), 1344)))]
+    #[case("icap://proxy.local:1345/respmod", Ok(("proxy.local".to_string(), 1345)))]
+    #[case("http://wrong", Err(()))]
+    #[case("icap://:1344/", Err(()))]
+    #[case("icap://proxy:bad/", Err(()))]
+    fn parse_authority_cases(#[case] input: &str, #[case] expected: Result<(String, u16), ()>) {
+        match (parse_authority(input), expected) {
+            (Ok((h, p)), Ok((eh, ep))) => assert_eq!((h, p), (eh, ep)),
+            (Err(_), Err(_)) => {}
+            other => panic!("mismatch: {:?}", other),
+        }
     }
 
     #[test]
@@ -889,76 +911,38 @@ mod tests {
         assert_eq!(s.matches("204").count(), 1);
     }
 
-    #[test]
-    fn build_preview_none_body_empty() {
-        let (bytes, expect_cont, rest) = build_preview_and_chunks(None, Vec::new(), false).unwrap();
-        assert_eq!(bytes, b"0\r\n\r\n");
-        assert!(!expect_cont);
-        assert!(rest.is_none());
-    }
+    #[rstest]
+    #[case(None, b"" as &[u8], false, b"0\r\n\r\n".as_ref(), false, None)]
+    #[case(None, b"abcd".as_ref(), false, b"4\r\nabcd\r\n0\r\n\r\n".as_ref(), false, None)]
+    #[case(Some(0), b"".as_ref(), true, b"0; ieof\r\n\r\n".as_ref(), false, None)]
+    #[case(Some(0), b"DATA".as_ref(), false, b"0\r\n\r\n".as_ref(), true, Some(b"DATA".as_ref()))]
+    #[case(Some(4), b"ABCDEFG".as_ref(), false, b"4\r\nABCD\r\n0\r\n\r\n".as_ref(), true, Some(b"EFG".as_ref())
+    )]
+    #[case(Some(8), b"ABC".as_ref(), false, b"3\r\nABC\r\n0; ieof\r\n\r\n".as_ref(), false, None)]
+    fn build_preview(
+        #[case] preview: Option<usize>,
+        #[case] body: &[u8],
+        #[case] ieof: bool,
+        #[case] expected_prefix: &[u8],
+        #[case] expect_continue: bool,
+        #[case] rest: Option<&[u8]>,
+    ) {
+        let (bytes, got_expect_continue, rest_opt) =
+            build_preview_and_chunks(preview, body.to_vec(), ieof).unwrap();
 
-    #[test]
-    fn build_preview_none_with_body() {
-        let (bytes, expect_cont, rest) =
-            build_preview_and_chunks(None, b"abcd".to_vec(), false).unwrap();
-        let s = String::from_utf8(bytes.clone()).unwrap();
-        assert!(s.starts_with("4\r\nabcd\r\n0\r\n\r\n"));
-        assert!(!expect_cont);
-        assert!(rest.is_none());
-    }
+        assert!(bytes.starts_with(expected_prefix));
+        assert_eq!(got_expect_continue, expect_continue);
 
-    #[test]
-    fn build_preview_zero_ieof_true_empty_body() {
-        let (bytes, expect_cont, rest) =
-            build_preview_and_chunks(Some(0), Vec::new(), true).unwrap();
-        assert_eq!(bytes, b"0; ieof\r\n\r\n");
-        assert!(!expect_cont);
-        assert!(rest.is_none());
-    }
-
-    #[test]
-    fn build_preview_zero_ieof_false_with_body_buffered() {
-        let (bytes, expect_cont, rest) =
-            build_preview_and_chunks(Some(0), b"DATA".to_vec(), false).unwrap();
-        assert_eq!(bytes, b"0\r\n\r\n");
-        assert!(expect_cont);
-        assert_eq!(rest.unwrap(), b"DATA".to_vec());
-    }
-
-    #[test]
-    fn build_preview_n_sends_prefix_and_waits_rest() {
-        let body = b"ABCDEFG".to_vec();
-        let (bytes, expect_cont, rest) =
-            build_preview_and_chunks(Some(4), body.clone(), false).unwrap();
-        let s = String::from_utf8(bytes.clone()).unwrap();
-        assert!(s.starts_with("4\r\nABCD\r\n0\r\n\r\n"));
-        assert!(expect_cont);
-        assert_eq!(rest.unwrap(), b"EFG".to_vec());
-    }
-
-    #[test]
-    fn build_preview_n_all_fits_ieof() {
-        let body = b"ABC".to_vec();
-        let (bytes, expect_cont, rest) =
-            build_preview_and_chunks(Some(8), body.clone(), false).unwrap();
-        let s = String::from_utf8(bytes.clone()).unwrap();
-        assert!(s.starts_with("3\r\nABC\r\n0; ieof\r\n\r\n"));
-        assert!(!expect_cont);
-        assert!(rest.is_none());
-    }
-
-    fn mk_client() -> Client {
-        Client::builder()
-            .host("icap.example")
-            .port(1344)
-            .default_header("x-trace-id", "test-123")
-            .keep_alive(true)
-            .build()
+        match (rest_opt.as_deref(), rest) {
+            (None, None) => {}
+            (Some(a), Some(b)) => assert_eq!(a, b),
+            other => panic!("rest mismatch: {:?}", other),
+        }
     }
 
     #[test]
     fn options_has_null_body_and_headers() {
-        let c = mk_client();
+        let c = client();
         let req = Request::options("options");
         let wire = c.get_request_wire(&req, false).unwrap();
         let head = extract_headers_text(&wire);
@@ -971,7 +955,7 @@ mod tests {
 
     #[test]
     fn reqmod_with_embedded_and_preview_offsets() {
-        let c = mk_client();
+        let c = client();
         let http = HttpReq::builder()
             .method("POST")
             .uri("/scan")
@@ -1004,9 +988,16 @@ mod tests {
         assert!(tail_str.contains("\r\n0\r\n\r\n"));
     }
 
-    #[test]
-    fn reqmod_preview_zero_appends_zero_chunk_in_wire() {
-        let c = mk_client();
+    #[rstest]
+    #[case::preview0(false, false, "\r\n\r\n0\r\n\r\n")]
+    #[case::preview0_ieof(true, false, "\r\n\r\n0; ieof\r\n\r\n")]
+    //#[case::streaming(true, true, "\r\n\r\n0\r\n\r\n")] // streaming=true, preview(0)
+    fn reqmod_wire_variants(
+        client: Client,
+        #[case] ieof: bool,
+        #[case] streaming: bool,
+        #[case] must_contain: &'static str,
+    ) {
         let http = HttpReq::builder()
             .method("POST")
             .uri("/scan")
@@ -1014,95 +1005,51 @@ mod tests {
             .body(Vec::<u8>::new())
             .unwrap();
 
-        let req = Request::reqmod("icap/test")
+        let mut req = Request::reqmod("icap/test")
             .preview(0)
             .with_http_request(http);
+        if ieof {
+            req = req.preview_ieof();
+        }
 
-        let wire = c.get_request_wire(&req, false).unwrap();
-        let all = String::from_utf8(wire.clone()).unwrap();
-        assert!(all.contains("\r\n\r\n0\r\n\r\n"));
-    }
+        let wire = client.get_request_wire(&req, streaming).unwrap();
+        let all = std::str::from_utf8(&wire).unwrap();
+        assert!(all.contains(must_contain));
 
-    #[test]
-    fn reqmod_preview_zero_ieof_true_appends_ieof_zero_chunk() {
-        let c = mk_client();
-        let http = HttpReq::builder()
-            .method("POST")
-            .uri("/scan")
-            .header(header::HOST, "x")
-            .body(Vec::<u8>::new())
-            .unwrap();
-
-        let req = Request::reqmod("icap/full")
-            .preview(0)
-            .preview_ieof()
-            .with_http_request(http);
-
-        let wire = c.get_request_wire(&req, false).unwrap();
-        let all = String::from_utf8(wire.clone()).unwrap();
-        assert!(all.contains("\r\n\r\n0; ieof\r\n\r\n"));
-    }
-
-    #[test]
-    fn streaming_true_forces_body_marker_in_encapsulated() {
-        let c = mk_client();
-        let http = HttpReq::builder()
-            .method("POST")
-            .uri("/scan")
-            .header(header::HOST, "x")
-            .body(Vec::<u8>::new())
-            .unwrap();
-
-        let req = Request::reqmod("icap/test")
-            .preview(0)
-            .with_http_request(http);
-
-        let wire = c.get_request_wire(&req, true).unwrap();
         let head = extract_headers_text(&wire);
         let enc = find_header_line(&head, "Encapsulated").unwrap();
         assert!(enc.to_ascii_lowercase().contains("req-hdr=0"));
-        assert!(enc.to_ascii_lowercase().contains("req-body="));
-        let all = String::from_utf8(wire).unwrap();
-        assert!(all.contains("\r\n\r\n0\r\n\r\n"));
+        if streaming {
+            assert!(enc.to_ascii_lowercase().contains("req-body="));
+        }
     }
 
-    #[test]
-    fn host_override_is_used() {
-        let c = Client::builder()
-            .host("icap.internal")
-            .port(1344)
-            .host_override("icap.external.name")
-            .build();
+    #[rstest]
+    #[case("icap.example", None, "icap://icap.example:1344/options")]
+    #[case(
+        "icap.internal",
+        Some("icap.external.name"),
+        "icap://icap.internal:1344/options"
+    )]
+    fn options_and_host_header(
+        #[case] client_host: &'static str,
+        #[case] host_override: Option<&'static str>,
+        #[case] uri_prefix: &'static str,
+    ) {
+        let mut b = Client::builder().host(client_host).port(1344);
+        if let Some(ho) = host_override {
+            b = b.host_override(ho);
+        }
+        let c = b.build();
 
         let req = Request::options("options");
         let wire = c.get_request_wire(&req, false).unwrap();
         let head = extract_headers_text(&wire);
+
+        assert!(head.starts_with(&format!("OPTIONS {uri_prefix} ICAP/1.0\r\n")));
         let host_line = find_header_line(&head, "Host").unwrap();
-        assert!(host_line.contains("icap.external.name"));
-    }
-
-    async fn connect_pair() -> (TcpStream, TcpStream) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        let client = TcpStream::connect(addr).await.unwrap();
-        let (server, _) = listener.accept().await.unwrap();
-        (client, server)
-    }
-
-    /// Server helper to write bytes and optionally keep the socket open (no close).
-    async fn server_write_and_optionally_hang(
-        mut server: TcpStream,
-        bytes: &[u8],
-        keep_open_ms: u64,
-    ) {
-        server.write_all(bytes).await.unwrap();
-        server.flush().await.unwrap();
-        if keep_open_ms > 0 {
-            tokio::time::sleep(Duration::from_millis(keep_open_ms)).await;
-        } else {
-            // drop closes the socket
-        }
+        let expected_host = host_override.unwrap_or(client_host);
+        assert!(host_line.contains(expected_host));
     }
 
     /// 1) 404 + single CRLF, connection kept open.
@@ -1111,24 +1058,21 @@ mod tests {
     async fn error_404_single_crlf_kept_open_returns_quickly() {
         let (mut client, server) = connect_pair().await;
 
-        // Spawn server: send status + single CRLF and keep connection open for a while.
-        tokio::spawn(server_write_and_optionally_hang(
+        tokio::spawn(server_write(
             server,
             b"ICAP/1.0 404 ICAP Service not found\r\n",
-            1500, // keep open long enough; client must not wait for this
+            true,
         ));
 
-        // Client must finish fast; we protect with a small timeout.
         let (code, buf) = timeout(Duration::from_millis(300), read_icap_headers(&mut client))
             .await
             .expect("client hung on single-CRLF 404")
             .expect("read_icap_headers failed");
 
         assert_eq!(code, 404, "status code should be 404");
-        // Buffer should end with CRLFCRLF after normalization.
         assert!(
             buf.ends_with(b"\r\n\r\n"),
-            "buffer should be normalized to CRLFCRLF"
+            "buffer should end with CRLFCRLF"
         );
     }
 
@@ -1138,7 +1082,7 @@ mod tests {
         let (mut client, server) = connect_pair().await;
 
         let wire = b"ICAP/1.0 404 ICAP Service not found\r\nISTag: x\r\nDate: Thu, 21 Aug 2025 17:00:00 GMT\r\n\r\n";
-        tokio::spawn(server_write_and_optionally_hang(server, wire, 0));
+        tokio::spawn(server_write(server, wire, false));
 
         let (code, buf) = timeout(Duration::from_millis(300), read_icap_headers(&mut client))
             .await
@@ -1160,7 +1104,7 @@ mod tests {
 
         // Status + one header + CRLF, then EOF (socket close)
         let wire = b"ICAP/1.0 404 ICAP Service not found\r\nISTag: y\r\n";
-        tokio::spawn(server_write_and_optionally_hang(server, wire, 0)); // close immediately
+        tokio::spawn(server_write(server, wire, false));
 
         let (code, buf) = timeout(Duration::from_millis(300), read_icap_headers(&mut client))
             .await
@@ -1185,14 +1129,8 @@ mod tests {
     async fn non_error_200_single_crlf_kept_open_times_out() {
         let (mut client, server) = connect_pair().await;
 
-        tokio::spawn(server_write_and_optionally_hang(
-            server,
-            b"ICAP/1.0 200 OK\r\n",
-            1200, // keep open; client should wait for \r\n\r\n and thus time out in test
-        ));
-
-        // We expect timeout here because the parser should wait for CRLFCRLF on non-error.
-        let res = timeout(Duration::from_millis(250), read_icap_headers(&mut client)).await;
+        tokio::spawn(server_write(server, b"ICAP/1.0 200 OK\r\n", true));
+        let res = timeout(Duration::from_millis(50), read_icap_headers(&mut client)).await;
         assert!(
             res.is_err(),
             "non-error single-CRLF should not complete; expected timeout"

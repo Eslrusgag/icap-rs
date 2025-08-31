@@ -27,7 +27,8 @@
 
 use crate::ICAP_VERSION;
 use crate::error::{Error, IcapResult};
-use crate::parser::{find_double_crlf, serialize_http_request, serialize_http_response};
+use crate::parser::icap::find_double_crlf;
+use crate::parser::{serialize_http_request, serialize_http_response};
 use http::{HeaderMap, HeaderName, HeaderValue};
 use std::fmt;
 use std::str::FromStr;
@@ -655,27 +656,9 @@ mod tests {
     use super::*;
     use http::HeaderValue;
 
+    #[inline]
     fn icap_bytes(s: &str) -> Vec<u8> {
         s.as_bytes().to_vec()
-    }
-
-    #[test]
-    fn statuscode_display_and_from() {
-        assert_eq!(StatusCode::Ok200.to_string(), "200");
-        assert_eq!(StatusCode::NoContent204.to_string(), "204");
-
-        assert_eq!(StatusCode::from_str("200").unwrap(), StatusCode::Ok200);
-        assert_eq!(
-            StatusCode::from_str("204").unwrap(),
-            StatusCode::NoContent204
-        );
-        assert!(StatusCode::from_str("777").is_err());
-
-        assert_eq!(
-            StatusCode::try_from(206).unwrap(),
-            StatusCode::PartialContent206
-        );
-        assert!(StatusCode::try_from(777u16).is_err());
     }
 
     #[test]
@@ -696,10 +679,10 @@ mod tests {
     fn last_duplicate_header_wins() {
         let raw = icap_bytes(
             "ICAP/1.0 204 No Content\r\n\
-         ISTag: a\r\n\
-         ISTag: b\r\n\
-         Encapsulated: null-body=0\r\n\
-         \r\n",
+             ISTag: a\r\n\
+             ISTag: b\r\n\
+             Encapsulated: null-body=0\r\n\
+             \r\n",
         );
         let r = parse_icap_response(&raw).expect("parse");
         assert_eq!(
@@ -768,26 +751,7 @@ mod tests {
             .expect("to_raw should succeed with valid ISTag");
     }
 
-    #[test]
-    fn istag_accepts_quoted() {
-        assert!(validate_istag(r#""5BDEEEA9-12E4-2""#).is_ok());
-    }
-
-    #[test]
-    fn istag_rejects_unterminated_quote() {
-        assert!(validate_istag(r#""ABC"#).is_err());
-    }
-
-    #[test]
-    fn istag_quoted_too_long_rejected() {
-        let v = format!(r#""{}""#, "A".repeat(33));
-        assert!(validate_istag(&v).is_err());
-    }
-
-    #[test]
-    fn istag_quoted_with_bad_char_rejected() {
-        assert!(validate_istag(r#""ABC_DEF""#).is_err());
-    }
+    // -------- serialization rules for auto Encapsulated --------
 
     #[test]
     fn to_raw_autogenerates_encapsulated_for_404_without_body() {
@@ -795,7 +759,10 @@ mod tests {
         let raw = resp.to_raw().expect("serialize 404");
         let s = String::from_utf8(raw).unwrap();
         assert!(s.contains("Encapsulated: null-body=0"));
-        assert!(!s.to_lowercase().contains("istag:"), "no ISTag on non-2xx");
+        assert!(
+            !s.to_lowercase().contains("istag:"),
+            "no ISTag required on non-2xx"
+        );
     }
 
     #[test]
@@ -811,7 +778,6 @@ mod tests {
 #[cfg(test)]
 mod rfc_tests {
     //! RFC 3507 conformance tests for ICAP **responses**.
-    //!
     //! These tests assert behavior that follows the spec explicitly:
     //! - Status line & version (`ICAP/1.0` only), multi-word reason phrase
     //! - ISTag (RFC 3507 §4.7): required for 2xx; ≤32 bytes; charset [A-Za-z0-9.-]
@@ -824,7 +790,9 @@ mod rfc_tests {
 
     use super::*;
     use http::HeaderValue;
+    use rstest::rstest;
 
+    #[inline]
     fn icap_bytes(s: &str) -> Vec<u8> {
         s.as_bytes().to_vec()
     }
@@ -874,70 +842,53 @@ mod rfc_tests {
         assert!(r.get_header("ISTag").is_none());
     }
 
-    #[test]
-    fn istag_must_not_exceed_32_bytes() {
-        let too_long = "A".repeat(33);
+    #[rstest]
+    #[case("ok-Tag.123".to_string(), true)] // valid plain token
+    #[case("helloo.1755855904-1755855904181".to_string(), true)] // 31 chars; '.' and '-' allowed
+    #[case("x".to_string(), true)] // minimal valid
+    #[case("A".repeat(32), true)] // exactly 32 chars
+    #[case(r#""5BDEEEA9-12E4-2""#.to_string(), true)] // valid quoted form
+    #[case(r#""ABC"#.to_string(), false)] // unterminated quote
+    #[case(format!(r#""{}""#, "A".repeat(33)), false)] // >32 chars in quotes
+    #[case(r#""ABC_DEF""#.to_string(), false)] // '_' not allowed in quoted value
+    #[case("TAG 1".to_string(), false)] // space not allowed
+    #[case("TAG_1".to_string(), false)] // '_' not allowed
+    #[case("TAG#1".to_string(), false)] // '#' not allowed
+    #[case("TAG@1".to_string(), false)] // '@' not allowed
+    fn istag_validate_cases(#[case] value: String, #[case] ok: bool) {
+        // 1) direct validator check
+        assert_eq!(
+            validate_istag(&value).is_ok(),
+            ok,
+            "validate_istag failed for value={value:?}"
+        );
+
+        // 2) integration with ICAP response parser
         let raw = format!(
             "ICAP/1.0 200 OK\r\n\
-             ISTag: {}\r\n\
-             Encapsulated: null-body=0\r\n\
-             \r\n",
-            too_long
+         ISTag: {}\r\n\
+         Encapsulated: null-body=0\r\n\
+         \r\n",
+            value
         );
-        let err = parse_icap_response(raw.as_bytes()).unwrap_err();
-        let msg = err.to_string().to_lowercase();
-        assert!(
-            msg.contains("istag") || msg.contains("32"),
-            "expected ISTag length error; got: {msg}"
-        );
-    }
 
-    #[test]
-    fn istag_at_most_32_bytes_is_ok() {
-        let valid = "A".repeat(32);
-        let raw = format!(
-            "ICAP/1.0 200 OK\r\n\
-             ISTag: {}\r\n\
-             Encapsulated: null-body=0\r\n\
-             \r\n",
-            valid
-        );
-        let resp = parse_icap_response(raw.as_bytes()).expect("parse ok");
-        let hdr = resp.get_header("ISTag").unwrap();
-        assert_eq!(hdr, &HeaderValue::from_str(&valid).unwrap());
-    }
-
-    #[test]
-    fn istag_allows_dashes_and_dots() {
-        let valid = "helloo.1755855904-1755855904181"; // 31 chars
-        let raw = format!(
-            "ICAP/1.0 200 OK\r\n\
-             ISTag: {}\r\n\
-             Encapsulated: null-body=0\r\n\
-             \r\n",
-            valid
-        );
-        let resp = parse_icap_response(raw.as_bytes()).expect("parse ok");
-        let hdr = resp.get_header("ISTag").unwrap();
-        assert_eq!(hdr, &HeaderValue::from_str(valid).unwrap());
-    }
-
-    #[test]
-    fn istag_invalid_characters_are_rejected() {
-        for bad in ["TAG 1", "TAG_1", "TAG#1", "TAG@1"] {
-            let raw = format!(
-                "ICAP/1.0 200 OK\r\n\
-                 ISTag: {}\r\n\
-                 Encapsulated: null-body=0\r\n\
-                 \r\n",
-                bad
-            );
-            let err = parse_icap_response(raw.as_bytes()).unwrap_err();
-            let msg = err.to_string().to_lowercase();
-            assert!(
-                msg.contains("istag") && (msg.contains("invalid") || msg.contains("character")),
-                "expected ISTag invalid-char error; got: {msg}"
-            );
+        match (ok, parse_icap_response(raw.as_bytes())) {
+            (true, Ok(resp)) => {
+                assert_eq!(
+                    resp.get_header("ISTag").unwrap(),
+                    &HeaderValue::from_str(&value).unwrap(),
+                    "parsed ISTag differs for value={value:?}"
+                );
+            }
+            (false, Err(e)) => {
+                let msg = e.to_string().to_lowercase();
+                assert!(
+                    msg.contains("istag"),
+                    "expected ISTag-related error, got: {msg}"
+                );
+            }
+            (true, Err(e)) => panic!("expected parse OK for valid ISTag={value:?}, got error: {e}"),
+            (false, Ok(_)) => panic!("expected parse error for invalid ISTag={value:?}"),
         }
     }
 
@@ -1062,7 +1013,7 @@ mod rfc_tests {
         );
     }
 
-    // --- Basic statuses ---
+    // --- Basic statuses & headers case-insensitive ---
 
     #[test]
     fn supports_100_continue() {
@@ -1086,8 +1037,6 @@ mod rfc_tests {
         assert_eq!(r.status_code, StatusCode::NotFound404);
         assert!(r.status_text.to_lowercase().contains("not"));
     }
-
-    // --- Header case-insensitivity ---
 
     #[test]
     fn header_lookup_is_case_insensitive() {

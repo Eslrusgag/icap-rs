@@ -6,6 +6,12 @@ use std::borrow::Cow;
 use http::{Request as HttpRequest, Response as HttpResponse, StatusCode as HttpStatus, Version};
 use std::fmt::Write;
 
+/// Find end of ICAP header block (position after CRLFCRLF).
+#[inline]
+pub fn find_double_crlf(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4)
+}
+
 /// Offsets parsed from the `Encapsulated` header.
 ///
 /// Offsets are **relative to the start of the encapsulated area**
