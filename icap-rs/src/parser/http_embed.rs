@@ -1,4 +1,4 @@
-use crate::parser::http_version_str;
+use crate::parser::{http_version_str, icap};
 use http::{Request as HttpRequest, Response as HttpResponse, StatusCode};
 use std::fmt::Write as _;
 
@@ -55,15 +55,9 @@ pub fn serialize_http_response(resp: &HttpResponse<Vec<u8>>) -> Vec<u8> {
     bytes
 }
 
-/// Find end of ICAP header block (position after CRLFCRLF).
-#[inline]
-pub fn find_double_crlf(buf: &[u8]) -> Option<usize> {
-    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4)
-}
-
 /// Split raw HTTP bytes into (headers, body).
 pub fn split_http_bytes(raw: &[u8]) -> (Vec<u8>, Option<Vec<u8>>) {
-    if let Some(hdr_end) = find_double_crlf(raw) {
+    if let Some(hdr_end) = icap::find_double_crlf(raw) {
         let headers = raw[..hdr_end].to_vec();
         if hdr_end < raw.len() {
             (headers, Some(raw[hdr_end..].to_vec()))

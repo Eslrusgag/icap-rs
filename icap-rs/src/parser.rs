@@ -8,6 +8,4 @@ pub use icap::{
 
 pub use wire::{read_chunked_to_end, write_chunk, write_chunk_into};
 
-pub use http_embed::{
-    find_double_crlf, serialize_http_request, serialize_http_response, split_http_bytes,
-};
+pub use http_embed::{serialize_http_request, serialize_http_response, split_http_bytes};

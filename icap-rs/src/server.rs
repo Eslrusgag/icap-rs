@@ -60,6 +60,8 @@
 //! `Methods: REQMOD, RESPMOD` based on the registration above. If a method not in
 //! the list is used, `405 Method Not Allowed` is returned; unknown services yield `404`.
 
+pub mod options;
+
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::future::Future;
@@ -72,12 +74,12 @@ use tokio::sync::Semaphore;
 use tracing::{error, trace, warn};
 
 use crate::error::IcapResult;
-use crate::parser::{find_double_crlf, read_chunked_to_end};
+use crate::parser::icap::find_double_crlf;
+use crate::parser::read_chunked_to_end;
 use crate::request::parse_icap_request;
 pub use crate::server::options::{ServiceOptions, TransferBehavior};
 use crate::{EmbeddedHttp, Method, Request, Response, StatusCode};
 use smallvec::SmallVec;
-pub mod options;
 
 // Public alias so user code can write `ServiceOptions::new(..)` instead of `OptionsConfig::new(..)`.
 
@@ -652,6 +654,7 @@ impl Default for ServerBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
     async fn handler_ok(_: Request) -> IcapResult<Response> {
@@ -675,6 +678,23 @@ mod tests {
         }
     }
 
+    fn assert_panics_with<F>(f: F, needles: &[&str])
+    where
+        F: FnOnce() + std::panic::UnwindSafe,
+    {
+        let res = catch_unwind(AssertUnwindSafe(f));
+        assert!(res.is_err(), "expected panic, but code did not panic");
+        let msg = panic_str(res.map(|_| ()));
+        for n in needles {
+            assert!(
+                msg.contains(n),
+                "expected panic message to contain {:?}, got: {}",
+                n,
+                msg
+            );
+        }
+    }
+
     #[test]
     fn route_allows_different_methods_same_service() {
         let h1 = handler_ok;
@@ -685,52 +705,50 @@ mod tests {
             .route("/spool", [Method::RespMod], h2, None);
     }
 
-    #[test]
-    fn route_panics_on_duplicate_method_same_service() {
-        let h1 = handler_ok;
-        let h2 = handler_ok;
+    #[rstest]
+    #[case("/spool")]
+    #[case("/svc")]
+    fn route_panics_on_duplicate_method_same_service(#[case] path: &str) {
+        assert_panics_with(
+            || {
+                let h1 = handler_ok;
+                let h2 = handler_ok;
 
-        let builder = Server::builder().route("/spool", [Method::ReqMod], h1, None);
-
-        let res = catch_unwind(AssertUnwindSafe(|| {
-            let _ = builder.route("/spool", [Method::ReqMod], h2, None);
-        }));
-
-        assert!(res.is_err(), "expected panic on duplicate method route");
-        let msg = panic_str(res.map(|_| ()));
-        assert!(
-            msg.contains("Overlapping method route")
-                && msg.contains("REQMOD")
-                && msg.contains("/spool"),
-            "unexpected panic message: {msg}"
+                let builder = Server::builder().route(path, [Method::ReqMod], h1, None);
+                let _ = builder.route(path, [Method::ReqMod], h2, None);
+            },
+            &["Overlapping method route", "REQMOD", path],
         );
     }
 
-    #[test]
-    fn panics_when_overlapping_multiple_methods() {
-        let h = handler_ok;
-        let h2 = handler_ok;
+    #[rstest]
+    #[case(Method::RespMod, "RESPMOD")]
+    #[case(Method::ReqMod, "REQMOD")]
+    fn panics_when_overlapping_multiple_methods(
+        #[case] overlap: Method,
+        #[case] overlap_str: &str,
+    ) {
+        let path = "/svc";
+        assert_panics_with(
+            || {
+                let h = handler_ok;
+                let h2 = handler_ok;
 
-        let builder = Server::builder().route("/svc", [Method::ReqMod, Method::RespMod], h, None);
-
-        let res = catch_unwind(AssertUnwindSafe(|| {
-            let _ = builder.route("/svc", [Method::RespMod], h2, None);
-        }));
-
-        assert!(res.is_err(), "expected panic on overlapping RESPMOD");
-        let msg = panic_str(res.map(|_| ()));
-        assert!(
-            msg.contains("Overlapping method route")
-                && msg.contains("RESPMOD")
-                && msg.contains("/svc"),
-            "unexpected panic message: {msg}"
+                let builder =
+                    Server::builder().route(path, [Method::ReqMod, Method::RespMod], h, None);
+                let _ = builder.route(path, [overlap], h2, None);
+            },
+            &["Overlapping method route", overlap_str, path],
         );
     }
 
-    #[test]
-    fn route_accepts_string_methods_case_insensitive() {
+    #[rstest]
+    #[case("reqmod", "RESPMOD")]
+    #[case("REQMOD", "respmod")]
+    #[case("  ReqMod  ", " ReSpMoD ")]
+    fn route_accepts_methods_case_insensitive(#[case] a: &str, #[case] b: &str) {
         let h = handler_ok;
-        let _b = Server::builder().route("/svc", ["reqmod", "RESPMOD"], h, None);
+        let _b = Server::builder().route("/svc", [a, b], h, None);
     }
 
     #[test]
@@ -739,39 +757,30 @@ mod tests {
         let _b = Server::builder().route("/svc", vec![Method::ReqMod, "respmod".into()], h, None);
     }
 
-    #[test]
-    fn route_panics_on_unknown_method() {
-        let h = handler_ok;
-
-        let res = catch_unwind(AssertUnwindSafe(|| {
-            let _ = Server::builder().route("/svc", ["FOO"], h, None);
-        }));
-
-        assert!(res.is_err(), "expected panic on unknown method string");
-        let msg = panic_str(res.map(|_| ()));
-        assert!(
-            msg.contains("Unknown ICAP method string"),
-            "unexpected panic message: {msg}"
+    #[rstest]
+    #[case("FOO")]
+    #[case("BAR")]
+    fn route_panics_on_unknown_method(#[case] bad: &str) {
+        assert_panics_with(
+            || {
+                let h = handler_ok;
+                let _ = Server::builder().route("/svc", [bad], h, None);
+            },
+            &["Unknown ICAP method string"],
         );
     }
 
-    #[test]
-    fn route_panics_on_options() {
-        let h = handler_ok;
-
-        let res = catch_unwind(AssertUnwindSafe(|| {
-            let _ = Server::builder().route("/svc", ["OPTIONS"], h, None);
-        }));
-
-        assert!(
-            res.is_err(),
-            "expected panic when routing OPTIONS explicitly"
-        );
-        let msg = panic_str(res.map(|_| ()));
-        assert!(
-            msg.contains("OPTIONS is answered automatically")
-                || msg.contains("OPTIONS cannot have a handler"),
-            "unexpected panic message: {msg}"
+    #[rstest]
+    #[case("OPTIONS")]
+    #[case("options")]
+    #[case("  Options  ")]
+    fn route_panics_on_options(#[case] opt: &str) {
+        assert_panics_with(
+            || {
+                let h = handler_ok;
+                let _ = Server::builder().route("/svc", [opt], h, None);
+            },
+            &["OPTIONS"],
         );
     }
 }

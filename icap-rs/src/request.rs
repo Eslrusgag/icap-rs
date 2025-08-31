@@ -33,15 +33,14 @@
 
 use crate::ICAP_VERSION;
 use crate::error::{Error, IcapResult};
-use crate::parser::{
-    find_double_crlf, serialize_http_request, serialize_http_response, split_http_bytes,
-};
+use crate::parser::icap::find_double_crlf;
+use crate::parser::{serialize_http_request, serialize_http_response, split_http_bytes};
 use http::{
     HeaderMap, HeaderName, HeaderValue, Request as HttpRequest, Response as HttpResponse,
     StatusCode as HttpStatus, Version,
 };
 use std::fmt;
-use tracing::{debug, trace};
+use tracing::trace;
 
 /// ICAP protocol methods recognized by the server/router.
 ///
@@ -251,7 +250,7 @@ pub(crate) fn parse_icap_request(data: &[u8]) -> IcapResult<Request> {
     if !version.eq_ignore_ascii_case(ICAP_VERSION) {
         return Err(Error::InvalidVersion(version.to_string()));
     }
-    debug!("parse_icap_request: {} {}", method, icap_uri);
+    trace!("parse_icap_request: {} {}", method, icap_uri);
 
     // ICAP headers
     let mut icap_headers = HeaderMap::new();
@@ -314,7 +313,7 @@ pub(crate) fn parse_icap_request(data: &[u8]) -> IcapResult<Request> {
             let mut p = start.split_whitespace();
             let _ver = p.next().unwrap_or("HTTP/1.1");
             let code = p.next().unwrap_or("200").parse::<u16>().unwrap_or(200);
-            debug!("parse_icap_request: embedded HTTP response code={}", code);
+            trace!("parse_icap_request: embedded HTTP response code={}", code);
 
             let mut http_headers = HeaderMap::new();
             for line in hlines {
@@ -349,7 +348,7 @@ pub(crate) fn parse_icap_request(data: &[u8]) -> IcapResult<Request> {
             let mut p = start.split_whitespace();
             let m = p.next().unwrap_or("GET");
             let u = p.next().unwrap_or("/");
-            debug!("parse_icap_request: embedded HTTP request {} {}", m, u);
+            trace!("parse_icap_request: embedded HTTP request {} {}", m, u);
 
             let mut http_headers = HeaderMap::new();
             for line in hlines {
@@ -400,20 +399,29 @@ pub(crate) fn parse_icap_request(data: &[u8]) -> IcapResult<Request> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use http::{Request as HttpRequest, Response as HttpResponse, StatusCode, Version};
+    use http::{
+        HeaderValue, Request as HttpRequest, Response as HttpResponse, StatusCode as HttpStatus,
+        Version,
+    };
+    use rstest::rstest;
 
+    #[inline]
     fn icap_bytes(s: &str) -> Vec<u8> {
         s.as_bytes().to_vec()
     }
 
+    #[rstest]
+    #[case("reqmod", Method::ReqMod)]
+    #[case("RESPMOD", Method::RespMod)]
+    #[case("  Options  ", Method::Options)]
+    fn method_from_str_is_case_insensitive(#[case] s: &str, #[case] expected: Method) {
+        assert_eq!(Method::from(s), expected);
+    }
+
     #[test]
-    fn version_must_be_icap_1_0_in_request() {
-        let raw = b"REQMOD icap://h/s ICAP/2.0\r\n\
-                Host: h\r\n\
-                Encapsulated: req-hdr=0\r\n\
-                \r\n";
-        let err = parse_icap_request(raw).unwrap_err();
-        assert!(matches!(err, Error::InvalidVersion(v) if v == "ICAP/2.0"));
+    #[should_panic(expected = "Unknown ICAP method string")]
+    fn method_from_str_unknown_panics() {
+        let _ = Method::from("PATCH");
     }
 
     #[test]
@@ -471,7 +479,7 @@ mod tests {
         matches!(req.embedded, Some(EmbeddedHttp::Req(_)));
 
         let http_resp = HttpResponse::builder()
-            .status(StatusCode::OK)
+            .status(HttpStatus::OK)
             .version(Version::HTTP_11)
             .body(Vec::<u8>::new())
             .unwrap();
@@ -480,35 +488,108 @@ mod tests {
         matches!(req2.embedded, Some(EmbeddedHttp::Resp(_)));
     }
 
+    // ---------- Version & framing ----------
+
     #[test]
-    fn parse_minimal_options_without_http() {
+    fn version_must_be_icap_1_0_in_request() {
+        let raw = b"REQMOD icap://h/s ICAP/2.0\r\n\
+                    Host: h\r\n\
+                    Encapsulated: req-hdr=0\r\n\
+                    \r\n";
+        let err = parse_icap_request(raw).unwrap_err();
+        assert!(matches!(err, Error::InvalidVersion(v) if v == "ICAP/2.0"));
+    }
+
+    #[rstest]
+    #[case(
+        "REQMOD icap://icap.example.org/icap/test ICAP/1.0\r\nHost: icap.example.org\r\nEncapsulated: req-hdr=0\r\n\r\n",
+        "test"
+    )]
+    #[case(
+        "RESPMOD icap://icap.example.org/respmod ICAP/1.0\r\nHost: icap.example.org\r\nEncapsulated: res-hdr=0\r\n\r\n",
+        "respmod"
+    )]
+    fn service_is_last_path_segment_of_icap_uri(
+        #[case] wire: &str,
+        #[case] expected_service: &str,
+    ) {
+        let r = parse_icap_request(&icap_bytes(wire)).expect("parse");
+        assert_eq!(r.service, expected_service);
+    }
+
+    #[test]
+    fn headers_are_case_insensitive_allow_parsed_with_whitespace() {
         let raw = icap_bytes(
-            "OPTIONS icap://icap.example.org/icap/test ICAP/1.0\r\n\
-         Host: icap.example.org\r\n\
-         \r\n",
+            "REQMOD icap://h/s ICAP/1.0\r\n\
+             host: icap.example.org\r\n\
+             aLlOw: 206, 204 \r\n\
+             Encapsulated: req-hdr=0\r\n\
+             \r\n",
         );
         let r = parse_icap_request(&raw).expect("parse");
-        assert_eq!(r.method, Method::Options);
-        assert_eq!(r.service, "test");
+        assert!(r.allow_204);
+        assert!(r.allow_206);
         assert_eq!(
             r.icap_headers.get("Host").unwrap(),
             &HeaderValue::from_static("icap.example.org")
         );
-        assert!(r.embedded.is_none());
-        assert!(!r.allow_204);
-        assert!(!r.allow_206);
-        assert_eq!(r.preview_size, None);
+    }
+
+    #[test]
+    fn parse_ignores_malformed_header_line_without_colon() {
+        let raw = icap_bytes(
+            "OPTIONS icap://icap.example.org/icap/test ICAP/1.0\r\n\
+             Host: icap.example.org\r\n\
+             ThisIsBadHeader\r\n\
+             \r\n",
+        );
+        let r = parse_icap_request(&raw).expect("parse");
+        assert_eq!(
+            r.icap_headers.get("Host").unwrap(),
+            &HeaderValue::from_static("icap.example.org")
+        );
+    }
+
+    #[test]
+    fn host_header_is_required() {
+        let raw = b"REQMOD icap://icap.example.org/icap/test ICAP/1.0\r\n\
+                    Encapsulated: req-hdr=0\r\n\
+                    \r\n";
+        let err = parse_icap_request(raw).unwrap_err();
+        let m = err.to_string().to_lowercase();
+        assert!(m.contains("host"), "expected missing Host error; got: {m}");
+    }
+
+    #[test]
+    fn encapsulated_is_required_for_request() {
+        let raw_req = b"REQMOD icap://icap.example.org/icap/test ICAP/1.0\r\n\
+                        Host: icap.example.org\r\n\
+                        \r\n";
+        let err1 = parse_icap_request(raw_req).unwrap_err();
+        assert!(
+            matches!(err1, Error::MissingHeader(h) if h == "Encapsulated"),
+            "expected MissingHeader(Encapsulated); got: {err1}"
+        );
+
+        let raw_resp = b"RESPMOD icap://icap.example.org/icap/test ICAP/1.0\r\n\
+                         Host: icap.example.org\r\n\
+                         \r\n";
+        let err2 = parse_icap_request(raw_resp).unwrap_err();
+        assert!(
+            matches!(err2, Error::MissingHeader(h) if h == "Encapsulated"),
+            "expected MissingHeader(Encapsulated); got: {err2}"
+        );
     }
 
     #[test]
     fn parse_reqmod_with_allow_and_preview() {
         let raw = icap_bytes(
             "REQMOD icap://icap.example.org/icap/test ICAP/1.0\r\n\
-         Host: icap.example.org\r\n\
-         Encapsulated: req-hdr=0\r\n\
-         Allow: 204, 206\r\n\
-         Preview: 128\r\n\
-         \r\n",
+             Host: icap.example.org\r\n\
+             Encapsulated: req-hdr=0\r\n\
+             Allow: 204, 206\r\n\
+             Preview: 128\r\n\
+             \r\n",
         );
         let r = parse_icap_request(&raw).expect("parse");
         assert_eq!(r.method, Method::ReqMod);
@@ -516,6 +597,21 @@ mod tests {
         assert!(r.allow_206);
         assert_eq!(r.preview_size, Some(128));
     }
+
+    #[test]
+    fn parse_preview_not_a_number_is_ignored() {
+        let raw = icap_bytes(
+            "REQMOD icap://icap.example.org/icap/test ICAP/1.0\r\n\
+             Host: icap.example.org\r\n\
+             Preview: notanumber\r\n\
+             Encapsulated: req-hdr=0\r\n\
+             \r\n",
+        );
+        let r = parse_icap_request(&raw).expect("parse");
+        assert_eq!(r.preview_size, None);
+    }
+
+    // ---------- Embedded HTTP ----------
 
     #[test]
     fn parse_reqmod_with_embedded_http_request_and_body() {
@@ -545,31 +641,22 @@ mod tests {
     }
 
     #[test]
-    fn parse_ignores_malformed_header_line_without_colon() {
+    fn parse_minimal_options_without_http() {
         let raw = icap_bytes(
             "OPTIONS icap://icap.example.org/icap/test ICAP/1.0\r\n\
              Host: icap.example.org\r\n\
-             ThisIsBadHeader\r\n\
              \r\n",
         );
         let r = parse_icap_request(&raw).expect("parse");
+        assert_eq!(r.method, Method::Options);
+        assert_eq!(r.service, "test");
         assert_eq!(
             r.icap_headers.get("Host").unwrap(),
             &HeaderValue::from_static("icap.example.org")
         );
-        // Just ensure we didn't panic and header map remains valid.
-    }
-
-    #[test]
-    fn parse_preview_not_a_number_is_ignored() {
-        let raw = icap_bytes(
-            "REQMOD icap://icap.example.org/icap/test ICAP/1.0\r\n\
-         Host: icap.example.org\r\n\
-         Preview: notanumber\r\n\
-         Encapsulated: req-hdr=0\r\n\
-         \r\n",
-        );
-        let r = parse_icap_request(&raw).expect("parse");
+        assert!(r.embedded.is_none());
+        assert!(!r.allow_204);
+        assert!(!r.allow_206);
         assert_eq!(r.preview_size, None);
     }
 }
