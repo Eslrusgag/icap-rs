@@ -1,15 +1,16 @@
 use crate::error::IcapResult;
-use crate::request::{EmbeddedHttp, Request};
+//use crate::request::{EmbeddedHttp, Request};
 use crate::response::Response;
 use std::borrow::Cow;
 
-use http::{Request as HttpRequest, Response as HttpResponse, StatusCode as HttpStatus, Version};
+//use http::{Request as HttpRequest, Response as HttpResponse, StatusCode as HttpStatus};
+use http::Version;
 use std::fmt::Write;
 
 /// Find end of ICAP header block (position after CRLFCRLF).
 #[inline]
 pub fn find_double_crlf(buf: &[u8]) -> Option<usize> {
-    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4)
+    memchr::memmem::find(buf, b"\r\n\r\n").map(|i| i + 4)
 }
 
 /// Offsets parsed from the `Encapsulated` header.
@@ -65,33 +66,33 @@ pub fn http_version_str(v: Version) -> &'static str {
     }
 }
 
-pub fn serialize_icap_request(req: &Request) -> IcapResult<Vec<u8>> {
-    let full_uri = format!("icap://localhost/{}", req.service.trim_start_matches('/'));
-
-    let mut out = String::new();
-    write!(&mut out, "{} {} ICAP/1.0\r\n", req.method, full_uri).unwrap();
-
-    for (name, value) in req.icap_headers.iter() {
-        let canon = canon_icap_header(name.as_str());
-        write!(
-            &mut out,
-            "{}: {}\r\n",
-            canon,
-            value.to_str().unwrap_or_default()
-        )
-        .unwrap();
-    }
-    out.push_str("\r\n");
-
-    let mut bytes = out.into_bytes();
-    if let Some(ref emb) = req.embedded {
-        match emb {
-            EmbeddedHttp::Req(r) => bytes.extend_from_slice(&serialize_http_request(r)),
-            EmbeddedHttp::Resp(r) => bytes.extend_from_slice(&serialize_http_response(r)),
-        }
-    }
-    Ok(bytes)
-}
+// pub fn serialize_icap_request(req: &Request) -> IcapResult<Vec<u8>> {
+//     let full_uri = format!("icap://localhost/{}", req.service.trim_start_matches('/'));
+//
+//     let mut out = String::new();
+//     write!(&mut out, "{} {} ICAP/1.0\r\n", req.method, full_uri).unwrap();
+//
+//     for (name, value) in req.icap_headers.iter() {
+//         let canon = canon_icap_header(name.as_str());
+//         write!(
+//             &mut out,
+//             "{}: {}\r\n",
+//             canon,
+//             value.to_str().unwrap_or_default()
+//         )
+//         .unwrap();
+//     }
+//     out.push_str("\r\n");
+//
+//     let mut bytes = out.into_bytes();
+//     if let Some(ref emb) = req.embedded {
+//         match emb {
+//             EmbeddedHttp::Req(r) => bytes.extend_from_slice(&serialize_http_request(r)),
+//             EmbeddedHttp::Resp(r) => bytes.extend_from_slice(&serialize_http_response(r)),
+//         }
+//     }
+//     Ok(bytes)
+// }
 
 pub fn serialize_icap_response(resp: &Response) -> IcapResult<Vec<u8>> {
     // Status line
@@ -99,7 +100,9 @@ pub fn serialize_icap_response(resp: &Response) -> IcapResult<Vec<u8>> {
     write!(
         &mut head,
         "{} {} {}\r\n",
-        resp.version, resp.status_code, resp.status_text
+        resp.version,
+        resp.status_code.as_str(),
+        resp.status_text
     )
     .unwrap();
 
@@ -152,61 +155,6 @@ pub fn serialize_icap_response(resp: &Response) -> IcapResult<Vec<u8>> {
 
     out.extend_from_slice(&resp.body);
     Ok(out)
-}
-
-fn serialize_http_request(req: &HttpRequest<Vec<u8>>) -> Vec<u8> {
-    let mut out = String::new();
-    write!(
-        &mut out,
-        "{} {} {}\r\n",
-        req.method(),
-        req.uri(),
-        http_version_str(req.version())
-    )
-    .unwrap();
-
-    for (n, v) in req.headers().iter() {
-        write!(
-            &mut out,
-            "{}: {}\r\n",
-            n.as_str(),
-            v.to_str().unwrap_or_default()
-        )
-        .unwrap();
-    }
-    out.push_str("\r\n");
-
-    let mut bytes = out.into_bytes();
-    bytes.extend_from_slice(req.body());
-    bytes
-}
-
-fn serialize_http_response(resp: &HttpResponse<Vec<u8>>) -> Vec<u8> {
-    let mut out = String::new();
-    let code: HttpStatus = resp.status();
-    write!(
-        &mut out,
-        "{} {} {}\r\n",
-        http_version_str(resp.version()),
-        code.as_u16(),
-        code.canonical_reason().unwrap_or("")
-    )
-    .unwrap();
-
-    for (n, v) in resp.headers().iter() {
-        write!(
-            &mut out,
-            "{}: {}\r\n",
-            n.as_str(),
-            v.to_str().unwrap_or_default()
-        )
-        .unwrap();
-    }
-    out.push_str("\r\n");
-
-    let mut bytes = out.into_bytes();
-    bytes.extend_from_slice(resp.body());
-    bytes
 }
 
 /// Return canonical ICAP header name (title-cased, with special-cases).

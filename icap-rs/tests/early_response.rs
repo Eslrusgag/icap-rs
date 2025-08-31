@@ -25,7 +25,7 @@ async fn spawn_server_with_limit(limit: usize) -> (String, JoinHandle<()>) {
         .route_reqmod(
             "svc-options",
             |_: Request| async move {
-                Ok(Response::new(StatusCode::Ok200, "OK")
+                Ok(Response::new(StatusCode::OK, "OK")
                     .try_set_istag("x")
                     .unwrap())
             },
@@ -78,7 +78,7 @@ async fn early_503_when_conn_limit_exceeded() {
 
     assert_eq!(
         resp.status_code,
-        StatusCode::ServiceUnavailable503,
+        StatusCode::SERVICE_UNAVAILABLE,
         "expected early 503 produced by server accept loop"
     );
 
@@ -103,7 +103,7 @@ async fn not_found_404_for_unknown_service() {
         .expect("client.send timed out")
         .expect("client.send failed");
 
-    assert_eq!(resp.status_code, StatusCode::NotFound404);
+    assert_eq!(resp.status_code, StatusCode::NOT_FOUND);
 
     if let Some(v) = resp
         .get_header("Encapsulated")

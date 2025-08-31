@@ -56,13 +56,13 @@ async fn alias_and_default_service_resolve() {
         .allow_204()
         .with_http_response(make_embedded_http("hello"));
     let resp_root = client.send(&req_root).await.expect("icap send root");
-    assert_eq!(resp_root.status_code, StatusCode::NoContent204);
+    assert_eq!(resp_root.status_code, StatusCode::NO_CONTENT);
 
     let req_alt = Request::respmod("alt")
         .allow_204()
         .with_http_response(make_embedded_http("hello"));
     let resp_alt = client.send(&req_alt).await.expect("icap send alt");
-    assert_eq!(resp_alt.status_code, StatusCode::NoContent204);
+    assert_eq!(resp_alt.status_code, StatusCode::NO_CONTENT);
 }
 
 #[tokio::test]
@@ -80,10 +80,7 @@ async fn respmod_no_allow_with_preview_may_be_204() {
     let resp = client.send(&req).await.expect("icap send");
 
     assert!(
-        matches!(
-            resp.status_code,
-            StatusCode::NoContent204 | StatusCode::Ok200
-        ),
+        matches!(resp.status_code, StatusCode::NO_CONTENT | StatusCode::OK),
         "RFC: with Preview and no Allow, 204 is permitted (200 also ok). Got: {:?}",
         resp.status_code
     );
@@ -103,10 +100,7 @@ async fn respmod_allow_present_may_be_204() {
     let resp = client.send(&req).await.expect("icap send");
 
     assert!(
-        matches!(
-            resp.status_code,
-            StatusCode::NoContent204 | StatusCode::Ok200
-        ),
+        matches!(resp.status_code, StatusCode::NO_CONTENT | StatusCode::OK),
         "RFC: when Allow: 204 present, 204 is permitted (200 also ok). Got: {:?}",
         resp.status_code
     );
@@ -125,7 +119,7 @@ async fn no_allow_header_must_be_200() {
 
     assert_eq!(
         resp.status_code,
-        StatusCode::Ok200,
+        StatusCode::OK,
         "RFC: MUST be 200 when no Allow: 204 and no Preview"
     );
 }

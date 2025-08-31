@@ -106,7 +106,7 @@ async fn no_timeout_allows_fast_server() {
         res.err()
     );
     let resp = res.unwrap();
-    assert!(matches!(resp.status_code, IcapStatus::Ok200));
+    assert!(matches!(resp.status_code, IcapStatus::OK));
 }
 
 #[tokio::test]
@@ -121,5 +121,5 @@ async fn small_timeout_but_server_responds_in_time() {
         res.err()
     );
     let resp = res.unwrap();
-    assert!(matches!(resp.status_code, IcapStatus::Ok200));
+    assert!(matches!(resp.status_code, IcapStatus::OK));
 }

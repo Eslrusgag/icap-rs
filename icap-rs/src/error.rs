@@ -1,7 +1,7 @@
-//! Error handling
+//! Error handling.
 //!
 //! This module defines:
-//! - [`IcapError`]: the main error type for ICAP operations.
+//! - [`enum@Error`]: the main error type for ICAP operations.
 //! - [`IcapResult<T>`]: a convenient alias for `Result<T, IcapError>`.
 //! - [`ToIcapResult`]: a helper trait for converting generic `Result` into `IcapResult`.
 //!
@@ -20,9 +20,18 @@ pub enum Error {
     #[error("Network error: {0}")]
     Network(#[from] std::io::Error),
 
+    /// Client-side overall timeout while performing an ICAP operation.
+    ///
+    /// Returned by high-level client APIs when connecting, sending, or
+    /// receiving takes longer than the configured timeout.
     #[error("Network timeout after {0:?}")]
     ClientTimeout(Duration),
 
+    /// The peer closed the connection before a complete ICAP header block
+    /// was received (no terminating `CRLFCRLF`).
+    ///
+    /// Typically indicates the server aborted the connection or sent an
+    /// incomplete response.
     #[error("Peer closed before ICAP headers")]
     EarlyCloseWithoutHeaders,
 
@@ -54,7 +63,7 @@ pub enum Error {
     #[error("Invalid ISTag: {0}")]
     InvalidISTag(String),
 
-    /// Missing required ICAP header (e.g. Host / Encapsulated, IStag).
+    /// Missing required ICAP header (e.g. `Host`, `Encapsulated`, `ISTag`).
     #[error("Missing required header: {0}")]
     MissingHeader(&'static str),
 
@@ -166,7 +175,7 @@ pub type IcapResult<T> = Result<T, Error>;
 
 /// Converts a generic `Result<T, E>` into an `IcapResult<T>`.
 ///
-/// Any error is wrapped into [`IcapError::Unexpected`].
+/// Any error is wrapped into [`Error::Unexpected`].
 pub trait ToIcapResult<T> {
     fn to_icap_result(self) -> IcapResult<T>;
 }
