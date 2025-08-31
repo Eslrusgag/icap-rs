@@ -10,11 +10,11 @@ pub mod server;
 pub use client::Client;
 pub use request::{EmbeddedHttp, Method, Request};
 pub use response::{Response, StatusCode};
-pub use server::{RequestHandler, Server, ServerBuilder, ServiceOptions, TransferBehavior};
+pub use server::{Server, ServerBuilder, ServiceOptions, TransferBehavior};
 
-///Lib version
+/// Lib version.
 pub const LIB_VERSION: &str = env!("CARGO_PKG_VERSION");
-///Max Header size
+/// Max Header size.
 pub const MAX_HDR_BYTES: usize = 64 * 1024;
 /// Supported ICAP protocol version.
 pub const ICAP_VERSION: &str = "ICAP/1.0";

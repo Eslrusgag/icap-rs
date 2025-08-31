@@ -1,4 +1,4 @@
-//! # ICAP server
+//! # ICAP server implementation in Rust.
 //!
 //! ICAP server with per-service routing and **one handler that can serve multiple
 //! ICAP methods** (`REQMOD`, `RESPMOD`). The server:
@@ -81,13 +81,11 @@ pub use crate::server::options::{ServiceOptions, TransferBehavior};
 use crate::{EmbeddedHttp, Method, Request, Response, StatusCode};
 use smallvec::SmallVec;
 
-// Public alias so user code can write `ServiceOptions::new(..)` instead of `OptionsConfig::new(..)`.
-
 /// A per-service ICAP handler.
 ///
 /// One handler can serve multiple ICAP methods declared for a service via
 /// [`ServerBuilder::route`].
-pub type RequestHandler = Box<
+type RequestHandler = Box<
     dyn Fn(
             Request,
         ) -> std::pin::Pin<
@@ -176,7 +174,7 @@ impl Server {
                     Err(_) => {
                         warn!(client=%addr, "refusing connection: too many concurrent connections");
                         let resp =
-                            Response::new(StatusCode::ServiceUnavailable503, "Service Unavailable")
+                            Response::new(StatusCode::SERVICE_UNAVAILABLE, "Service Unavailable")
                                 .add_header("Connection", "close");
 
                         match resp.to_raw() {
@@ -377,7 +375,7 @@ impl Server {
                                 .unwrap_or_else(|| format!("{}-default-1.0", service_resolved));
 
                             let mut out =
-                                Response::new(StatusCode::Ok200, "OK").try_set_istag(&istag_now)?;
+                                Response::new(StatusCode::OK, "OK").try_set_istag(&istag_now)?;
 
                             match (&req.embedded, method) {
                                 (Some(EmbeddedHttp::Resp(http_resp)), Method::RespMod) => {
@@ -395,7 +393,7 @@ impl Server {
                             if let Some(h) = entry.handlers.get(&method) {
                                 h(req).await?
                             } else {
-                                Response::new(StatusCode::MethodNotAllowed405, "Method Not Allowed")
+                                Response::new(StatusCode::METHOD_NOT_ALLOWED, "Method Not Allowed")
                             }
                         }
                     }
@@ -407,14 +405,11 @@ impl Server {
                     &req,
                 )
             } else {
-                warn!(service=%service_resolved, "service not found");
-                Response::new(StatusCode::NotFound404, "Service Not Found")
+                trace!(service=%service_resolved, "service not found");
+                Response::new(StatusCode::NOT_FOUND, "Service Not Found")
             };
 
-            let should_close = !matches!(
-                resp.status_code,
-                StatusCode::Ok200 | StatusCode::NoContent204
-            );
+            let should_close = !matches!(resp.status_code, StatusCode::OK | StatusCode::NO_CONTENT);
 
             let resp = if should_close {
                 resp.add_header("Connection", "close")
@@ -658,7 +653,7 @@ mod tests {
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
     async fn handler_ok(_: Request) -> IcapResult<Response> {
-        Ok(Response::new(StatusCode::Ok200, "OK")
+        Ok(Response::new(StatusCode::OK, "OK")
             .add_header("Encapsulated", "null-body=0")
             .add_header("Content-Length", "0"))
     }

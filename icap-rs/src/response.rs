@@ -1,8 +1,11 @@
-//! ICAP response types and utilities.
+//! ICAP response types and helpers.
 //!
 //! This module defines:
-//! - [`StatusCode`]: enumeration of ICAP status codes (RFC 3507).
-//! - [`Response`]: representation of an ICAP response, including headers and optional body.
+//! - [`StatusCode`]: a re-export of [`http::StatusCode`]. ICAP uses the same
+//!   numeric status codes as HTTP. When emitting an ICAP status line, use
+//!   [`StatusCode::as_str`] to print the **numeric** code (e.g., `"200"`),
+//!   not the `Display` impl (which prints `"200 OK"`).
+//! - [`Response`]: representation of an ICAP response, including headers and an optional body.
 //!
 //! Features:
 //! - Parsing and serializing ICAP responses (`from_raw`, `to_raw`).
@@ -13,16 +16,16 @@
 //! # Examples
 //!
 //! ```rust
-//!
 //! use icap_rs::{Response, StatusCode};
 //!
-//! // Construct a simple 204 No Content response
+//! // Construct a minimal 204 No Content response.
+//! // Note: 204 MUST NOT have a body and MUST carry `Encapsulated: null-body=0`.
 //! let resp = Response::no_content()
-//!     .add_header("ISTag", "policy-123")
-//!     .with_body_string("optional body");
+//!     .try_set_istag("policy-123")
+//!     .unwrap();
 //!
 //! assert!(resp.is_success());
-//! assert_eq!(resp.status_code, StatusCode::NoContent204);
+//! assert_eq!(resp.status_code, StatusCode::NO_CONTENT);
 //! ```
 
 use crate::ICAP_VERSION;
@@ -30,86 +33,39 @@ use crate::error::{Error, IcapResult};
 use crate::parser::icap::find_double_crlf;
 use crate::parser::{serialize_http_request, serialize_http_response};
 use http::{HeaderMap, HeaderName, HeaderValue};
+use memchr::memchr;
 use std::fmt;
 use std::str::FromStr;
 use tracing::{trace, warn};
 
-/// ICAP status codes as defined in RFC 3507.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum StatusCode {
-    Continue100,
-    Ok200,
-    NoContent204,
-    PartialContent206,
-    BadRequest400,
-    NotFound404,
-    MethodNotAllowed405,
-    RequestEntityTooLarge413,
-    InternalServerError500,
-    ServiceUnavailable503,
-    GatewayTimeout504,
-}
-
-impl fmt::Display for StatusCode {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let s = match self {
-            StatusCode::Continue100 => "100",
-            StatusCode::Ok200 => "200",
-            StatusCode::NoContent204 => "204",
-            StatusCode::PartialContent206 => "206",
-            StatusCode::BadRequest400 => "400",
-            StatusCode::NotFound404 => "404",
-            StatusCode::MethodNotAllowed405 => "405",
-            StatusCode::RequestEntityTooLarge413 => "413",
-            StatusCode::InternalServerError500 => "500",
-            StatusCode::ServiceUnavailable503 => "503",
-            StatusCode::GatewayTimeout504 => "504",
-        };
-        write!(f, "{s}")
-    }
-}
-
-impl TryFrom<u16> for StatusCode {
-    type Error = &'static str;
-
-    fn try_from(v: u16) -> Result<Self, Self::Error> {
-        Ok(match v {
-            100 => StatusCode::Continue100,
-            200 => StatusCode::Ok200,
-            204 => StatusCode::NoContent204,
-            206 => StatusCode::PartialContent206,
-            400 => StatusCode::BadRequest400,
-            404 => StatusCode::NotFound404,
-            405 => StatusCode::MethodNotAllowed405,
-            413 => StatusCode::RequestEntityTooLarge413,
-            500 => StatusCode::InternalServerError500,
-            503 => StatusCode::ServiceUnavailable503,
-            504 => StatusCode::GatewayTimeout504,
-            _ => return Err("Invalid ICAP status code"),
-        })
-    }
-}
-
-impl FromStr for StatusCode {
-    type Err = &'static str;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(match s {
-            "100" => StatusCode::Continue100,
-            "200" => StatusCode::Ok200,
-            "204" => StatusCode::NoContent204,
-            "206" => StatusCode::PartialContent206,
-            "400" => StatusCode::BadRequest400,
-            "404" => StatusCode::NotFound404,
-            "405" => StatusCode::MethodNotAllowed405,
-            "413" => StatusCode::RequestEntityTooLarge413,
-            "500" => StatusCode::InternalServerError500,
-            "503" => StatusCode::ServiceUnavailable503,
-            "504" => StatusCode::GatewayTimeout504,
-            _ => return Err("Invalid ICAP status code"),
-        })
-    }
-}
+/// ICAP status codes.
+///
+/// ICAP reuses HTTP numeric status codes (RFC 3507), so this crate exposes
+/// `http::StatusCode` under `icap_rs::StatusCode`.
+///
+/// ICAP-specific note: do **not** use `Display` of `StatusCode` when writing
+/// the ICAP status line. Format it as:
+/// `ICAP/1.0 <code> <reason>`
+/// and obtain the numeric part via `as_str()` or `as_u16()`.
+///
+/// ICAP-specific behavior (e.g., ISTag requirements for 2xx, `Encapsulated`
+/// rules for 204/2xx) is implemented elsewhere in this crate.
+///
+/// # Examples
+/// ```
+/// use icap_rs::StatusCode;
+/// assert!(StatusCode::OK.is_success());
+/// assert_eq!(StatusCode::NO_CONTENT.as_str(), "204");
+/// ```
+///
+/// When serializing an ICAP status line:
+/// ```ignore
+/// write!(out, "{} {} {}\r\n",
+///        ICAP_VERSION,
+///        status_code.as_str(), // "200"
+///        status_text)?;        // "OK"
+/// ```
+pub type StatusCode = http::StatusCode;
 
 /// Representation of an ICAP response.
 ///
@@ -143,7 +99,7 @@ impl Response {
 
     /// Shortcut for a `204 No Content` response.
     pub fn no_content() -> Self {
-        Self::new(StatusCode::NoContent204, "No Content")
+        Self::new(StatusCode::NO_CONTENT, "No Content")
     }
 
     /// Shortcut for a `204 No Content` response with headers.
@@ -157,7 +113,7 @@ impl Response {
 
         Ok(Self {
             version: ICAP_VERSION.to_string(),
-            status_code: StatusCode::NoContent204,
+            status_code: StatusCode::NO_CONTENT,
             status_text: "No Content".to_string(),
             headers,
             body: Vec::new(),
@@ -169,7 +125,7 @@ impl Response {
     pub fn add_header(mut self, name: &str, value: &str) -> Self {
         if name.eq_ignore_ascii_case("ISTag") {
             if let Err(e) = validate_istag(value) {
-                tracing::warn!("ignoring invalid ISTag passed to add_header: {}", e);
+                trace!("ignoring invalid ISTag passed to add_header: {}", e);
                 return self;
             }
             let val = HeaderValue::from_str(value).expect("invalid ISTag header value");
@@ -209,10 +165,7 @@ impl Response {
     pub fn to_raw(&self) -> IcapResult<Vec<u8>> {
         let mut resp = self.clone();
 
-        let require_istag = matches!(
-            resp.status_code,
-            StatusCode::Ok200 | StatusCode::NoContent204 | StatusCode::PartialContent206
-        );
+        let require_istag = resp.status_code.is_success();
 
         if require_istag {
             let istag = resp
@@ -228,7 +181,7 @@ impl Response {
         }
 
         match resp.status_code {
-            StatusCode::NoContent204 => {
+            StatusCode::NO_CONTENT => {
                 if !resp.body.is_empty() {
                     return Err(Error::Body("204 must not carry a body".into()));
                 }
@@ -245,7 +198,7 @@ impl Response {
                     ));
                 }
             }
-            StatusCode::Ok200 | StatusCode::PartialContent206 => {
+            StatusCode::OK | StatusCode::PARTIAL_CONTENT => {
                 if !resp.headers.contains_key("Encapsulated") {
                     if resp.body.is_empty() {
                         return Err(Error::MissingHeader(
@@ -318,26 +271,19 @@ impl Response {
         self.headers.remove(name)
     }
 
-    /// Whether the response indicates success (200 or 204).
+    /// Whether the response indicates success (2XX).
     pub fn is_success(&self) -> bool {
-        matches!(
-            self.status_code,
-            StatusCode::Ok200 | StatusCode::NoContent204
-        )
+        self.status_code.is_success()
     }
 
-    /// Whether the response indicates an error (4xx/5xx).
-    pub fn is_error(&self) -> bool {
-        matches!(
-            self.status_code,
-            StatusCode::BadRequest400
-                | StatusCode::NotFound404
-                | StatusCode::MethodNotAllowed405
-                | StatusCode::RequestEntityTooLarge413
-                | StatusCode::InternalServerError500
-                | StatusCode::ServiceUnavailable503
-                | StatusCode::GatewayTimeout504
-        )
+    /// Whether the response indicates an client error (4xx).
+    pub fn is_client_error(&self) -> bool {
+        self.status_code.is_client_error()
+    }
+
+    /// Whether the response indicates an server error (5xx).
+    pub fn is_server_error(&self) -> bool {
+        self.status_code.is_server_error()
     }
 
     /// Attach an **embedded HTTP request** (for `REQMOD` flows).
@@ -369,19 +315,15 @@ impl Response {
     }
 }
 
-impl Default for Response {
-    fn default() -> Self {
-        Self::new(StatusCode::Ok200, "OK")
-    }
-}
-
 impl fmt::Display for Response {
     /// Formats the ICAP response for debugging: status line, headers, and body (if present).
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(
             f,
             "{} {} {}",
-            self.version, self.status_code, self.status_text
+            self.version,
+            self.status_code.as_str(),
+            self.status_text
         )?;
         for (name, value) in self.headers.iter() {
             writeln!(
@@ -461,17 +403,16 @@ pub(crate) fn parse_icap_response(raw: &[u8]) -> IcapResult<Response> {
         String::new()
     };
 
-    trace!(version = %version, code = %status_code, text = %status_text, "parsed status line");
+    trace!(version = %version, code = %status_code.as_str(), text = %status_text, "parsed status line");
 
     let mut headers = HeaderMap::new();
     let mut seen_encapsulated = false;
-    let mut encapsulated_value: Option<String> = None;
-
+    let mut encapsulated_value: Option<&str> = None;
     for line in lines {
         if line.is_empty() {
             break;
         }
-        if let Some(colon) = line.find(':') {
+        if let Some(colon) = memchr(b':', line.as_bytes()) {
             let name = &line[..colon];
             let value = line[colon + 1..].trim();
 
@@ -480,7 +421,7 @@ pub(crate) fn parse_icap_response(raw: &[u8]) -> IcapResult<Response> {
                     return Err(Error::Header("duplicate Encapsulated header".into()));
                 }
                 seen_encapsulated = true;
-                encapsulated_value = Some(value.to_string());
+                encapsulated_value = Some(value);
             }
 
             if name.eq_ignore_ascii_case("ISTag") {
@@ -494,10 +435,8 @@ pub(crate) fn parse_icap_response(raw: &[u8]) -> IcapResult<Response> {
         }
     }
 
-    let require_istag = matches!(
-        status_code,
-        StatusCode::Ok200 | StatusCode::NoContent204 | StatusCode::PartialContent206
-    );
+    let require_istag = status_code.is_success();
+
     if !headers.contains_key("ISTag") {
         if require_istag {
             return Err(Error::MissingHeader("ISTag"));
@@ -510,15 +449,11 @@ pub(crate) fn parse_icap_response(raw: &[u8]) -> IcapResult<Response> {
     trace!(body_len = body.len(), "parsed body");
     if require_istag {
         let enc_val = encapsulated_value
-            .or_else(|| {
-                headers
-                    .get("Encapsulated")
-                    .and_then(|v| v.to_str().ok().map(|s| s.to_string()))
-            })
+            .or_else(|| headers.get("Encapsulated").and_then(|v| v.to_str().ok()))
             .ok_or(Error::MissingHeader("Encapsulated"))?;
 
         match status_code {
-            StatusCode::NoContent204 => {
+            StatusCode::NO_CONTENT => {
                 if !enc_val.trim().eq_ignore_ascii_case("null-body=0") {
                     return Err(Error::Header(
                         "204 requires Encapsulated: null-body=0".into(),
@@ -528,7 +463,7 @@ pub(crate) fn parse_icap_response(raw: &[u8]) -> IcapResult<Response> {
                     return Err(Error::Body("204 must not carry a body".into()));
                 }
             }
-            StatusCode::Ok200 | StatusCode::PartialContent206 => {
+            StatusCode::OK | StatusCode::PARTIAL_CONTENT => {
                 let pairs = parse_encapsulated_pairs_strict(&enc_val)?;
                 validate_encapsulated_offsets(&pairs, body.len())?;
             }
@@ -663,7 +598,7 @@ mod tests {
 
     #[test]
     fn response_add_get_remove_header() {
-        let mut resp = Response::new(StatusCode::Ok200, "OK").add_header("Service", "Test");
+        let mut resp = Response::new(StatusCode::OK, "OK").add_header("Service", "Test");
         assert!(resp.has_header("Service"));
         assert_eq!(
             resp.get_header("Service").unwrap(),
@@ -708,24 +643,14 @@ mod tests {
     }
 
     #[test]
-    fn parse_errors_on_unknown_numeric_status_code() {
-        let raw = icap_bytes(
-            "ICAP/1.0 777 Weird\r\n\
-             \r\n",
-        );
-        let err = parse_icap_response(&raw).unwrap_err();
-        assert!(err.to_string().contains("Unknown ICAP status code: 777"));
-    }
-
-    #[test]
     fn add_header_istag_rejects_invalid_but_does_not_panic() {
-        let resp = Response::new(StatusCode::Ok200, "OK").add_header("ISTag", "BAD TAG WITH SPACE");
+        let resp = Response::new(StatusCode::OK, "OK").add_header("ISTag", "BAD TAG WITH SPACE");
         assert!(resp.get_header("ISTag").is_none());
     }
 
     #[test]
     fn add_header_istag_accepts_valid_value() {
-        let resp = Response::new(StatusCode::Ok200, "OK").add_header("ISTag", "ok-Tag.123");
+        let resp = Response::new(StatusCode::OK, "OK").add_header("ISTag", "ok-Tag.123");
         assert_eq!(
             resp.get_header("ISTag").unwrap(),
             &HeaderValue::from_static("ok-Tag.123")
@@ -734,14 +659,14 @@ mod tests {
 
     #[test]
     fn to_raw_errors_if_istag_missing() {
-        let resp = Response::new(StatusCode::Ok200, "OK").add_header("Service", "X");
+        let resp = Response::new(StatusCode::OK, "OK").add_header("Service", "X");
         let err = resp.to_raw().unwrap_err();
         assert!(matches!(err, Error::MissingHeader(h) if h == "ISTag"));
     }
 
     #[test]
     fn to_raw_ok_when_istag_is_valid() {
-        let resp = Response::new(StatusCode::Ok200, "OK")
+        let resp = Response::new(StatusCode::OK, "OK")
             .try_set_istag("ok-Tag.123")
             .unwrap()
             .add_header("Encapsulated", "res-hdr=0")
@@ -755,7 +680,7 @@ mod tests {
 
     #[test]
     fn to_raw_autogenerates_encapsulated_for_404_without_body() {
-        let resp = Response::new(StatusCode::NotFound404, "Not Found");
+        let resp = Response::new(StatusCode::NOT_FOUND, "Not Found");
         let raw = resp.to_raw().expect("serialize 404");
         let s = String::from_utf8(raw).unwrap();
         assert!(s.contains("Encapsulated: null-body=0"));
@@ -768,10 +693,23 @@ mod tests {
     #[test]
     fn to_raw_autogenerates_opt_body_for_non_http_body_on_error() {
         let resp =
-            Response::new(StatusCode::InternalServerError500, "Internal").with_body_string("oops");
+            Response::new(StatusCode::INTERNAL_SERVER_ERROR, "Internal").with_body_string("oops");
         let raw = resp.to_raw().expect("serialize 500 with body");
         let s = String::from_utf8(raw).unwrap();
         assert!(s.contains("Encapsulated: opt-body=0"));
+    }
+
+    #[test]
+    fn status_line_has_single_reason() {
+        let bytes = Response::new(http::StatusCode::OK, "OK")
+            .try_set_istag("x")
+            .unwrap()
+            .add_header("Encapsulated", "null-body=0")
+            .to_raw()
+            .unwrap();
+
+        let line = std::str::from_utf8(&bytes).unwrap().lines().next().unwrap();
+        assert_eq!(line, "ICAP/1.0 200 OK");
     }
 }
 
@@ -821,7 +759,7 @@ mod rfc_tests {
              \r\n",
         );
         let r = parse_icap_response(&raw).expect("parse ok");
-        assert_eq!(r.status_code, StatusCode::MethodNotAllowed405);
+        assert_eq!(r.status_code, StatusCode::METHOD_NOT_ALLOWED);
         assert_eq!(r.status_text, "Method Not Allowed");
     }
 
@@ -838,7 +776,7 @@ mod rfc_tests {
     fn istag_may_be_absent_in_404() {
         let raw = b"ICAP/1.0 404 Not Found\r\n\r\n";
         let r = parse_icap_response(raw).expect("lenient for non-2xx");
-        assert_eq!(r.status_code, StatusCode::NotFound404);
+        assert_eq!(r.status_code, StatusCode::NOT_FOUND);
         assert!(r.get_header("ISTag").is_none());
     }
 
@@ -970,7 +908,7 @@ mod rfc_tests {
              \r\n",
         );
         let r = parse_icap_response(&raw).expect("parse ok");
-        assert_eq!(r.status_code, StatusCode::NoContent204);
+        assert_eq!(r.status_code, StatusCode::NO_CONTENT);
         assert_eq!(
             r.get_header("Encapsulated").unwrap(),
             &HeaderValue::from_static("null-body=0")
@@ -1024,7 +962,7 @@ mod rfc_tests {
              \r\n",
         );
         let r = parse_icap_response(&raw).expect("parse ok");
-        assert_eq!(r.status_code, StatusCode::Continue100);
+        assert_eq!(r.status_code, StatusCode::CONTINUE);
     }
 
     #[test]
@@ -1034,7 +972,7 @@ mod rfc_tests {
              \r\n",
         );
         let r = parse_icap_response(&raw).expect("parse ok");
-        assert_eq!(r.status_code, StatusCode::NotFound404);
+        assert_eq!(r.status_code, StatusCode::NOT_FOUND);
         assert!(r.status_text.to_lowercase().contains("not"));
     }
 
@@ -1078,7 +1016,7 @@ mod rfc_tests {
              \r\n",
         );
         let r = parse_icap_response(&raw).expect("parse ok");
-        assert_eq!(r.status_code, StatusCode::Ok200);
+        assert_eq!(r.status_code, StatusCode::OK);
         assert_eq!(r.status_text, "");
     }
 
@@ -1094,6 +1032,6 @@ mod rfc_tests {
              \r\n",
         );
         let r = parse_icap_response(&raw).expect("parse ok");
-        assert_eq!(r.status_code, StatusCode::Ok200);
+        assert_eq!(r.status_code, StatusCode::OK);
     }
 }

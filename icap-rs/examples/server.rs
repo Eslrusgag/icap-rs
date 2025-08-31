@@ -118,7 +118,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         }
 
                         if let Some(EmbeddedHttp::Resp(http_resp)) = &request.embedded {
-                            return Ok(Response::new(StatusCode::Ok200, "OK")
+                            return Ok(Response::new(StatusCode::OK, "OK")
                                 .try_set_istag(&istag_now)?
                                 .with_http_response(http_resp)?
                                 .add_header("Server", "icap-rs/0.1.0"));
@@ -161,7 +161,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
                         let istag_now = t.read().unwrap().clone();
                         let http = build_block_403_http("Blocked!", &istag_now);
-                        Ok(Response::new(StatusCode::Ok200, "OK")
+                        Ok(Response::new(StatusCode::OK, "OK")
                             .try_set_istag(&istag_now)?
                             .with_http_response(&http)?)
                     }

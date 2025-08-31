@@ -438,14 +438,16 @@ async fn output_response(
             server_host, server_ip, server_port
         );
 
-        if matches!(response.status_code, IcapStatus::NoContent204) {
+        if matches!(response.status_code, IcapStatus::NO_CONTENT) {
             println!("No modification needed (Allow 204 response)\n");
         }
 
         println!("ICAP HEADERS:");
         println!(
             "\t{} {} {}",
-            response.version, response.status_code, response.status_text
+            response.version,
+            response.status_code.as_str(),
+            response.status_text
         );
         for (name, value) in response.headers() {
             let v = value.to_str().unwrap_or("<binary>");

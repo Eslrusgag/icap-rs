@@ -31,7 +31,6 @@ use std::sync::Arc;
 
 use crate::request::{Method, Request};
 use crate::response::{Response, StatusCode};
-use chrono::{DateTime, Utc};
 use smallvec::SmallVec;
 use std::collections::HashMap;
 
@@ -81,8 +80,7 @@ pub struct ServiceOptions {
     pub max_connections: Option<usize>,
     /// TTL (seconds) for caching the OPTIONS response (optional).
     pub options_ttl: Option<u32>,
-    /// Server date (optional). If set, formatted as HTTP-date (GMT).
-    pub date: Option<DateTime<Utc>>,
+
     /// Short service identifier (optional).
     pub service_id: Option<String>,
     /// Capabilities advertised in `Allow` (optional), e.g. `"204"`.
@@ -119,7 +117,6 @@ impl ServiceOptions {
             istag: IstagSource::Static("default".to_string()),
             max_connections: None,
             options_ttl: None,
-            date: None,
             service_id: None,
             allow: Vec::new(),
             preview: None,
@@ -177,12 +174,6 @@ impl ServiceOptions {
     /// Set `Options-TTL` (seconds).
     pub fn with_options_ttl(mut self, ttl: u32) -> Self {
         self.options_ttl = Some(ttl);
-        self
-    }
-
-    /// Set server date (UTC).
-    pub fn with_date(mut self, date: DateTime<Utc>) -> Self {
-        self.date = Some(date);
         self
     }
 
@@ -251,11 +242,9 @@ impl ServiceOptions {
     /// - `ISTag`   — resolved via the static string or dynamic provider
     /// - Standard headers (`Encapsulated`, `Service`, `Max-Connections`, etc.)
     ///
-    /// Assumes the router injected a non-empty `methods` list via [`set_methods`](Self::set_methods).
     pub fn build_response_for(&self, req: &Request) -> Response {
-        let mut response = Response::new(StatusCode::Ok200, "OK");
+        let mut response = Response::new(StatusCode::OK, "OK");
 
-        // Methods
         let methods_str = self
             .methods
             .iter()
@@ -284,12 +273,6 @@ impl ServiceOptions {
         }
         if let Some(ttl) = self.options_ttl {
             response = response.add_header("Options-TTL", &ttl.to_string());
-        }
-        if let Some(date) = self.date {
-            response = response.add_header(
-                "Date",
-                &date.format("%a, %d %b %Y %H:%M:%S GMT").to_string(),
-            );
         }
         if let Some(ref service_id) = self.service_id {
             response = response.add_header("Service-ID", service_id);

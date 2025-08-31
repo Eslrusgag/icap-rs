@@ -39,14 +39,16 @@ use http::{
     HeaderMap, HeaderName, HeaderValue, Request as HttpRequest, Response as HttpResponse,
     StatusCode as HttpStatus, Version,
 };
+use memchr::memchr;
+use memchr::memmem;
 use std::fmt;
+use std::str::FromStr;
 use tracing::trace;
 
 /// ICAP protocol methods recognized by the server/router.
 ///
 /// Defined by RFC 3507. In this crate:
 /// - `OPTIONS` is answered **automatically** by the server (capabilities discovery);
-/// - you register routes only for `REQMOD` and/or `RESPMOD` (see [`ServerBuilder::route`]).
 ///
 /// ### Methods
 /// - **REQMOD** — *Request modification*: the ICAP client (usually a proxy)
@@ -63,7 +65,6 @@ use tracing::trace;
 ///
 /// ### Conversions
 /// `Method` implements `From<&str>` / `From<String>` so you can pass
-/// `"REQMOD"` / `"RESPMOD"` (case-insensitive) to [`ServerBuilder::route`].
 /// Passing `"OPTIONS"` or an unknown string will **panic**.
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, Ord, PartialOrd)]
 pub enum Method {
@@ -75,18 +76,12 @@ pub enum Method {
     Options,
 }
 
-impl fmt::Display for Method {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Method::ReqMod => write!(f, "REQMOD"),
-            Method::RespMod => write!(f, "RESPMOD"),
-            Method::Options => write!(f, "OPTIONS"),
-        }
-    }
-}
-
 impl Method {
-    pub fn as_str(&self) -> &'static str {
+    /// Returns the canonical ICAP token for this method.
+    ///
+    /// Always uppercase: `"REQMOD"`, `"RESPMOD"`, or `"OPTIONS"`.
+    #[inline]
+    pub const fn as_str(&self) -> &'static str {
         match self {
             Method::ReqMod => "REQMOD",
             Method::RespMod => "RESPMOD",
@@ -95,20 +90,43 @@ impl Method {
     }
 }
 
-impl From<&str> for Method {
-    fn from(s: &str) -> Self {
-        match s.trim().to_ascii_uppercase().as_str() {
-            "REQMOD" => Method::ReqMod,
-            "RESPMOD" => Method::RespMod,
-            "OPTIONS" => Method::Options,
-            other => panic!("Unknown ICAP method string: {other}"),
+impl fmt::Display for Method {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for Method {
+    type Err = &'static str;
+
+    #[inline]
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let t = s.trim();
+        if t.eq_ignore_ascii_case("REQMOD") {
+            Ok(Method::ReqMod)
+        } else if t.eq_ignore_ascii_case("RESPMOD") {
+            Ok(Method::RespMod)
+        } else if t.eq_ignore_ascii_case("OPTIONS") {
+            Ok(Method::Options)
+        } else {
+            Err("Unknown ICAP method string")
         }
     }
 }
 
+impl From<&str> for Method {
+    #[inline]
+    fn from(s: &str) -> Self {
+        s.parse()
+            .unwrap_or_else(|_| panic!("Unknown ICAP method string: {s}"))
+    }
+}
+
 impl From<String> for Method {
+    #[inline]
     fn from(s: String) -> Self {
-        Method::from(s.as_str())
+        s.as_str().into()
     }
 }
 
@@ -244,7 +262,7 @@ pub(crate) fn parse_icap_request(data: &[u8]) -> IcapResult<Request> {
         other => return Err(format!("Unknown ICAP method: {other}").into()),
     };
 
-    let icap_uri = parts.next().ok_or("Invalid request line")?.to_string();
+    let icap_uri = parts.next().ok_or("Invalid request line")?;
     let version = parts.next().ok_or("Invalid request line")?;
 
     if !version.eq_ignore_ascii_case(ICAP_VERSION) {
@@ -252,13 +270,12 @@ pub(crate) fn parse_icap_request(data: &[u8]) -> IcapResult<Request> {
     }
     trace!("parse_icap_request: {} {}", method, icap_uri);
 
-    // ICAP headers
     let mut icap_headers = HeaderMap::new();
     for line in lines {
         if line.is_empty() {
             break;
         }
-        if let Some(colon) = line.find(':') {
+        if let Some(colon) = memchr(b':', line.as_bytes()) {
             let name = &line[..colon];
             let value = line[colon + 1..].trim();
             icap_headers.insert(
@@ -303,12 +320,18 @@ pub(crate) fn parse_icap_request(data: &[u8]) -> IcapResult<Request> {
     let embedded = if rest.is_empty() {
         None
     } else if let Some(http_hdr_end) = find_double_crlf(rest) {
-        let http_head = &rest[..http_hdr_end];
-        let http_head_str = std::str::from_utf8(http_head)?;
+        let http_head_bytes = &rest[..http_hdr_end];
+
+        let first_line_end =
+            memmem::find(http_head_bytes, b"\r\n").unwrap_or(http_head_bytes.len());
+        let start_bytes = &http_head_bytes[..first_line_end];
+        let is_response = start_bytes.starts_with(b"HTTP/");
+
+        let http_head_str = std::str::from_utf8(http_head_bytes)?;
         let mut hlines = http_head_str.split("\r\n");
         let start = hlines.next().unwrap_or_default();
 
-        if start.starts_with("HTTP/") {
+        if is_response {
             // HTTP Response
             let mut p = start.split_whitespace();
             let _ver = p.next().unwrap_or("HTTP/1.1");
@@ -320,7 +343,7 @@ pub(crate) fn parse_icap_request(data: &[u8]) -> IcapResult<Request> {
                 if line.is_empty() {
                     break;
                 }
-                if let Some(colon) = line.find(':') {
+                if let Some(colon) = memchr(b':', line.as_bytes()) {
                     let name = &line[..colon];
                     let value = line[colon + 1..].trim();
                     http_headers.insert(
@@ -355,7 +378,7 @@ pub(crate) fn parse_icap_request(data: &[u8]) -> IcapResult<Request> {
                 if line.is_empty() {
                     break;
                 }
-                if let Some(colon) = line.find(':') {
+                if let Some(colon) = memchr(b':', line.as_bytes()) {
                     let name = &line[..colon];
                     let value = line[colon + 1..].trim();
                     http_headers.insert(

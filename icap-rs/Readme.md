@@ -1,10 +1,8 @@
-# icap-rs
-
-A Rust implementation of the **ICAP** protocol ([RFC 3507]) providing a practical client API and a server.
+A Rust implementation of the **ICAP** protocol ([RFC 3507]) providing a client API and a server.
 
 [RFC 3507]: https://www.rfc-editor.org/rfc/rfc3507
 
-## Status
+# Status
 
 **Work in progress.**
 
@@ -16,20 +14,23 @@ A Rust implementation of the **ICAP** protocol ([RFC 3507]) providing a practica
 
 ---
 
-## Install
+# Install
 
 Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-icap-rs = "0.0.2"
+icap-rs = "actual-version"
 ```
 
+Or
+
+```bash
+cargo add icap-rs
+```
 ---
 
-## Features
-
-### Client
+# Client
 
 - Builder-based configuration (host/port, keep-alive, default headers, timeouts).
 - ICAP requests: `OPTIONS`, `REQMOD`, `RESPMOD`.
@@ -37,23 +38,6 @@ icap-rs = "0.0.2"
 - **Preview** negotiation, including `Preview: 0` with optional `ieof` hint (fast 204 path).
 - Stream large bodies from disk after `100 Continue`.
 - Generate exact wire bytes for debugging without sending.
-
-### Server
-
-- Minimal async ICAP server built on Tokio.
-- **Routing per service**, with **one handler** able to serve multiple methods.
-- **Automatic `OPTIONS`** per service: `Methods` injected from registered routes; `Max-Connections` inherited from
-  global limit.
-- **Dynamic ISTag provider**: `ServiceOptions::with_istag_provider` lets you compute `ISTag` per request (incl.
-  `OPTIONS`).
-- **RFC guard**: if the request has **no** `Allow: 204` and **no** `Preview`, the server **must not** reply `204`;
-  it will automatically send `200 OK` and **echo back** the embedded HTTP message (request for `REQMOD`, response for
-  `RESPMOD`).
-- **Duplicate route detection**: registering the same `(service, method)` twice panics with a clear message (axum-like
-  DX).
-- Reads encapsulated *chunked* bodies to completion before invoking handlers.
-
----
 
 ## Quick start — Client
 
@@ -74,7 +58,7 @@ async fn main() -> icap_rs::error::IcapResult<()> {
     let req = Request::options("respmod"); // becomes icap://<host>/respmod
 
     let resp = client.send(&req).await?;
-    println!("ICAP: {} {}", resp.status_code, resp.status_text);
+    println!("ICAP: {} {}", resp.status_code.as_str(), resp.status_text);
     Ok(())
 }
 ```
@@ -107,10 +91,10 @@ async fn main() -> icap_rs::error::IcapResult<()> {
 
     let resp = client.send(&icap_req).await?;
 
-    if resp.status_code == StatusCode::NoContent204 {
+    if resp.status_code == StatusCode::NO_CONTENT {
         println!("No modification needed (Allow 204)");
     } else {
-        println!("{} {}", resp.status_code, resp.status_text);
+        println!("{} {}", resp.status_code.as_str(), resp.status_text);
         if !resp.body.is_empty() {
             println!("Body ({} bytes)", resp.body.len());
         }
@@ -119,6 +103,36 @@ async fn main() -> icap_rs::error::IcapResult<()> {
 }
 ```
 
+---
+
+# Server
+
+- Minimal async ICAP server built on Tokio.
+- **Routing per service**, with **one handler** able to serve multiple methods.
+- **Automatic `OPTIONS`** per service: `Methods` injected from registered routes; `Max-Connections` inherited from
+  global limit.
+- **Dynamic ISTag provider**: `ServiceOptions::with_istag_provider` lets you compute `ISTag` per request (incl.
+  `OPTIONS`).
+- **RFC guard**: if the request has **no** `Allow: 204` and **no** `Preview`, the server **must not** reply `204`;
+  it will automatically send `200 OK` and **echo back** the embedded HTTP message (request for `REQMOD`, response for
+  `RESPMOD`).
+- **Duplicate route detection**: registering the same `(service, method)` twice panics with a clear message (axum-like
+  DX).
+- Reads encapsulated *chunked* bodies to completion before invoking handlers.
+
+---
+
+## ICAP status codes (re-exported from `http`)
+
+ICAP reuses the **HTTP numeric status codes** (RFC 3507). This crate exposes them via a type alias:
+
+```rust
+pub type StatusCode = http::StatusCode;
+```
+
+Use `StatusCode::OK`, `StatusCode::NO_CONTENT`, etc. ICAP-specific rules (e.g., **`ISTag` is required on 2xx**,
+`Encapsulated`
+constraints, and **204 must not carry a body**) are enforced by `icap-rs` during parsing and serialization.
 ---
 
 ## Quick start — Server
@@ -198,7 +212,7 @@ async fn main() -> IcapResult<()> {
                 Method::RespMod => {
                     // Return 200 with embedded HTTP.
                     let http = make_http("hello from icap");
-                    Response::new(StatusCode::Ok200, "OK")
+                    Response::new(StatusCode::OK, "OK")
                         .try_set_istag(ISTAG)?
                         .with_http_response(&http)?
                 }
@@ -286,6 +300,8 @@ Key types re-exported at the crate root:
 
 - ICAP and embedded HTTP headers are case-insensitive. When **serializing ICAP** headers, this crate uses canonical
   title-casing (e.g., `ISTag`, `Encapsulated`). Embedded HTTP header names follow the `http` crate’s representation.
+- **ICAP status line formatting:** you must format `ICAP/1.0 <code> <reason>` yourself; do not print `StatusCode`
+  with `Display` to avoid getting `"200 OK"` as the code token.
 - Connections are kept open by default on the server side; the client can reuse a single idle connection when configured
   to `keep_alive(true)`.
 - For preview handling, servers typically respond with `100 Continue` before the client streams the remaining body.
