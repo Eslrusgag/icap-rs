@@ -1,7 +1,6 @@
 use crate::error::IcapResult;
 use std::io::Write;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Parse a single chunk: returns (next_pos, is_final_zero, size).
 pub fn parse_one_chunk(buf: &[u8], from: usize) -> Option<(usize, bool, usize)> {
@@ -31,11 +30,14 @@ pub fn parse_one_chunk(buf: &[u8], from: usize) -> Option<(usize, bool, usize)> 
 }
 
 /// Drain ICAP chunked body until zero chunk. Returns position after final CRLF.
-pub async fn read_chunked_to_end(
-    stream: &mut TcpStream,
+pub async fn read_chunked_to_end<S>(
+    stream: &mut S,
     buf: &mut Vec<u8>,
     mut pos: usize,
-) -> IcapResult<usize> {
+) -> IcapResult<usize>
+where
+    S: AsyncRead + Unpin,
+{
     loop {
         match parse_one_chunk(buf, pos) {
             Some((next_pos, is_final, _)) => {
@@ -43,7 +45,7 @@ pub async fn read_chunked_to_end(
                     pos = next_pos;
                     while buf.len() < pos + 2 {
                         let mut tmp = [0u8; 4096];
-                        let n = stream.read(&mut tmp).await?;
+                        let n = AsyncReadExt::read(stream, &mut tmp).await?;
                         if n == 0 {
                             return Err("Unexpected EOF after zero chunk".into());
                         }
@@ -59,7 +61,7 @@ pub async fn read_chunked_to_end(
             }
             None => {
                 let mut tmp = [0u8; 4096];
-                let n = stream.read(&mut tmp).await?;
+                let n = AsyncReadExt::read(stream, &mut tmp).await?;
                 if n == 0 {
                     return Err("Unexpected EOF while reading ICAP chunked body".into());
                 }
@@ -70,7 +72,10 @@ pub async fn read_chunked_to_end(
 }
 
 /// Write one chunk to socket.
-pub async fn write_chunk(stream: &mut TcpStream, data: &[u8]) -> IcapResult<()> {
+pub async fn write_chunk<S>(stream: &mut S, data: &[u8]) -> IcapResult<()>
+where
+    S: AsyncWrite + Unpin,
+{
     let mut buf = Vec::with_capacity(16 + data.len() + 2);
     write!(&mut buf, "{:X}\r\n", data.len())?;
     if !data.is_empty() {

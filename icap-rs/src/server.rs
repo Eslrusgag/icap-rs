@@ -86,11 +86,8 @@ use smallvec::SmallVec;
 /// One handler can serve multiple ICAP methods declared for a service via
 /// [`ServerBuilder::route`].
 type RequestHandler = Box<
-    dyn Fn(
-            Request,
-        ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = IcapResult<Response>> + Send + Sync>,
-        > + Send
+    dyn Fn(Request) -> std::pin::Pin<Box<dyn Future<Output = IcapResult<Response>> + Send + Sync>>
+        + Send
         + Sync,
 >;
 
@@ -564,7 +561,7 @@ impl ServerBuilder {
     ) -> Self
     where
         F: Fn(Request) -> Fut + Send + Sync + 'static,
-        Fut: std::future::Future<Output = IcapResult<Response>> + Send + Sync + 'static,
+        Fut: Future<Output = IcapResult<Response>> + Send + Sync + 'static,
     {
         self.route(service, [Method::ReqMod], handler, options)
     }
@@ -578,7 +575,7 @@ impl ServerBuilder {
     ) -> Self
     where
         F: Fn(Request) -> Fut + Send + Sync + 'static,
-        Fut: std::future::Future<Output = IcapResult<Response>> + Send + Sync + 'static,
+        Fut: Future<Output = IcapResult<Response>> + Send + Sync + 'static,
     {
         self.route(service, [Method::RespMod], handler, options)
     }

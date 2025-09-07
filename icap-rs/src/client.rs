@@ -7,6 +7,15 @@
 //! - ICAP Preview (including `ieof`) and streaming upload.
 //! - Keep-Alive reuse of a single idle connection.
 //! - Encapsulated header calculation and chunked bodies.
+//!
+//! TLS backends:
+//! - Plain TCP by default.
+//! - Enable `tls-rustls` or `tls-openssl` Cargo features to use TLS.
+//! - `icaps://` URIs automatically switch to TLS; which backend is used
+//!   depends on enabled features or explicit selection in the builder.
+
+mod tls;
+
 use crate::error::{Error, IcapResult};
 use crate::parser::parse_encapsulated_header;
 use crate::parser::{canon_icap_header, read_chunked_to_end, write_chunk, write_chunk_into};
@@ -14,13 +23,20 @@ use crate::request::{Request, serialize_embedded_http};
 use crate::response::{Response, parse_icap_response};
 
 use crate::Method;
+use crate::client::tls::{AnyTlsConnector, TlsBackend, TlsConnector};
 use crate::parser::icap::find_double_crlf;
+
 use http::{HeaderMap, HeaderName, HeaderValue};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
+
+#[cfg(feature = "tls-rustls")]
+use rustls::pki_types::CertificateDer;
+
+use crate::net::Conn;
 use tokio::fs::File as TokioFile;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio::time::timeout;
@@ -44,7 +60,9 @@ struct ClientRef {
     default_headers: HeaderMap,
     connection_policy: ConnectionPolicy,
     read_timeout: Option<Duration>,
-    idle_conn: Mutex<Option<TcpStream>>,
+    tls: AnyTlsConnector,
+    idle_conn: Mutex<Option<Conn>>,
+    sni_hostname: Option<String>,
 }
 
 /// Policy for connection lifetime management.
@@ -75,6 +93,14 @@ pub struct ClientBuilder {
     default_headers: HeaderMap,
     connection_policy: ConnectionPolicy,
     read_timeout: Option<Duration>,
+
+    // TLS (plain by default)
+    tls_backend: Option<TlsBackend>, // None => plain
+    danger_disable_verify: bool,
+    sni_hostname: Option<String>,
+
+    #[cfg(feature = "tls-rustls")]
+    extra_roots: Vec<CertificateDer<'static>>,
 }
 
 impl ClientBuilder {
@@ -162,20 +188,105 @@ impl ClientBuilder {
     ///
     /// This extracts `host` and `port` for use in the TCP connection. The service path,
     /// if present in the URI, is ignored here and should be set on the request itself.
+    /// Configure from `icap://` or `icaps://` (`icaps` enables TLS).
     pub fn from_uri(mut self, uri: &str) -> IcapResult<Self> {
-        let (host, port) = parse_authority(uri)?;
+        let (host, port, tls) = parse_authority_with_scheme(uri)?;
         self.host = Some(host);
         self.port = Some(port);
+        if tls {
+            #[cfg(feature = "tls-rustls")]
+            {
+                self = self.use_rustls();
+            }
+            #[cfg(all(not(feature = "tls-rustls"), feature = "tls-openssl"))]
+            {
+                self = self.use_openssl();
+            }
+            #[cfg(all(not(feature = "tls-rustls"), not(feature = "tls-openssl")))]
+            {
+                return Err("`icaps://` requested but crate built without TLS features".into());
+            }
+        }
         Ok(self)
     }
 
-    /// Build a [`Client`] from this builder.
-    ///
-    /// # Panics
-    /// Panics if the host is not set prior to calling `build()`.
+    #[cfg(feature = "tls-rustls")]
+    pub fn use_rustls(mut self) -> Self {
+        self.tls_backend = Some(TlsBackend::Rustls);
+        self
+    }
+
+    #[cfg(feature = "tls-openssl")]
+    pub fn use_openssl(mut self) -> Self {
+        self.tls_backend = Some(TlsBackend::Openssl);
+        self
+    }
+
+    /// Custom SNI hostname to use for TLS handshakes.
+    pub fn sni_hostname(mut self, s: &str) -> Self {
+        self.sni_hostname = Some(s.into());
+        self
+    }
+
+    /// Disable certificate verification
+    pub fn danger_disable_cert_verify(mut self, yes: bool) -> Self {
+        self.danger_disable_verify = yes;
+        self
+    }
+
+    /// Add root CAs from a PEM file (rustls only).
+    #[cfg(feature = "tls-rustls")]
+    pub fn add_root_ca_pem_file(mut self, path: impl AsRef<std::path::Path>) -> IcapResult<Self> {
+        use std::fs::File;
+        use std::io::BufReader;
+
+        let f = File::open(path.as_ref())?;
+        let mut rdr = BufReader::new(f);
+
+        let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+            rustls_pemfile::certs(&mut rdr)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("PEM parse error: {e}"))?;
+
+        self.extra_roots.extend(certs);
+        Ok(self)
+    }
+
     pub fn build(self) -> Client {
         let host = self.host.expect("ClientBuilder: host is required");
         let port = self.port.unwrap_or(1344);
+
+        let any_tls = match self.tls_backend {
+            None => AnyTlsConnector::plain(),
+            Some(TlsBackend::Rustls) => {
+                #[cfg(feature = "tls-rustls")]
+                {
+                    use crate::client::tls::rustls::RustlsConfig;
+                    AnyTlsConnector::rustls(RustlsConfig {
+                        danger_disable_verify: self.danger_disable_verify,
+                        extra_roots: self.extra_roots,
+                    })
+                }
+                #[cfg(not(feature = "tls-rustls"))]
+                {
+                    panic!("enable `tls-rustls` feature")
+                }
+            }
+            Some(TlsBackend::Openssl) => {
+                #[cfg(feature = "tls-openssl")]
+                {
+                    use crate::client::tls::openssl::OpensslConfig;
+                    AnyTlsConnector::openssl(OpensslConfig {
+                        danger_disable_verify: self.danger_disable_verify,
+                    })
+                }
+                #[cfg(not(feature = "tls-openssl"))]
+                {
+                    panic!("enable `tls-openssl` feature")
+                }
+            }
+        };
+
         Client {
             inner: Arc::new(ClientRef {
                 host,
@@ -184,7 +295,9 @@ impl ClientBuilder {
                 default_headers: self.default_headers,
                 connection_policy: self.connection_policy,
                 read_timeout: self.read_timeout,
+                tls: any_tls,
                 idle_conn: Mutex::new(None),
+                sni_hostname: self.sni_hostname,
             }),
         }
     }
@@ -193,18 +306,22 @@ impl ClientBuilder {
 impl Default for ClientBuilder {
     fn default() -> Self {
         Self {
-            host: None,
-            port: None,
+            host: Some("localost".to_string()),
+            port: Some(1344),
             host_override: None,
             default_headers: HeaderMap::new(),
             connection_policy: ConnectionPolicy::Close,
             read_timeout: None,
+            tls_backend: None, // plain by default
+            danger_disable_verify: false,
+            sni_hostname: None,
+            #[cfg(feature = "tls-rustls")]
+            extra_roots: Vec::new(),
         }
     }
 }
 
 impl Client {
-    /// Create a new [`ClientBuilder`] to configure and build a [`Client`].
     pub fn builder() -> ClientBuilder {
         ClientBuilder::default()
     }
@@ -235,23 +352,23 @@ impl Client {
                 if let Some(s) = self.inner.idle_conn.lock().await.take() {
                     s
                 } else {
-                    TcpStream::connect((&*self.inner.host, self.inner.port)).await?
+                    self.inner.connect().await?
                 }
             }
-            ConnectionPolicy::Close => {
-                TcpStream::connect((&*self.inner.host, self.inner.port)).await?
-            }
+            ConnectionPolicy::Close => self.inner.connect().await?,
         };
 
-        // non-blocking early probe (e.g., ICAP/1.0 503) before writing anything
-        if let Some(resp) = Self::try_read_early_response_now(&mut stream).await? {
-            // Do not return this connection to idle pool — server likely closed it.
+        // If the server already sent a response on a kept-alive *plain* TCP socket,
+        // consume it now and return early.
+        if let Conn::Plain { inner } = &mut stream
+            && let Some(resp) = Self::try_read_early_response_now(inner).await?
+        {
             return Ok(resp);
         }
 
         let built = self.build_icap_request_bytes(req, false, req.preview_ieof)?;
-        stream.write_all(&built.bytes).await?;
-        stream.flush().await?;
+        AsyncWriteExt::write_all(&mut stream, &built.bytes).await?;
+        AsyncWriteExt::flush(&mut stream).await?;
 
         if req.method == Method::Options {
             let (_code, mut buf) =
@@ -265,7 +382,6 @@ impl Client {
             return parse_icap_response(&buf);
         }
 
-        // Handle 100-Continue for Preview
         if built.expect_continue {
             let (code, hdr_buf) =
                 Self::with_timeout(self.inner.read_timeout, read_icap_headers(&mut stream)).await?;
@@ -275,8 +391,8 @@ impl Client {
                 {
                     write_chunk(&mut stream, &rest).await?;
                 }
-                stream.write_all(b"0\r\n\r\n").await?;
-                stream.flush().await?;
+                AsyncWriteExt::write_all(&mut stream, b"0\r\n\r\n").await?;
+                AsyncWriteExt::flush(&mut stream).await?;
 
                 let (_code2, mut response) =
                     Self::with_timeout(self.inner.read_timeout, read_icap_headers(&mut stream))
@@ -289,7 +405,6 @@ impl Client {
                 maybe_put_back(self.inner.connection_policy, &self.inner.idle_conn, stream).await;
                 parse_icap_response(&response)
             } else {
-                // server decided final without continue (e.g., 204)
                 let mut response = hdr_buf;
                 Self::with_timeout(
                     self.inner.read_timeout,
@@ -301,7 +416,6 @@ impl Client {
             };
         }
 
-        // No preview — read final
         let (_code, mut response) =
             Self::with_timeout(self.inner.read_timeout, read_icap_headers(&mut stream)).await?;
         Self::with_timeout(
@@ -313,10 +427,7 @@ impl Client {
         parse_icap_response(&response)
     }
 
-    /// Send an ICAP request where the embedded HTTP body is streamed from disk.
-    ///
-    /// Use this for large payloads: the file is sent in chunks after a `100 Continue`
-    /// is received from the server.
+    /// Send a request and stream the body from a file using ICAP chunked encoding.
     pub async fn send_streaming<P: AsRef<Path>>(
         &self,
         req: &Request,
@@ -334,32 +445,30 @@ impl Client {
                 if let Some(s) = self.inner.idle_conn.lock().await.take() {
                     s
                 } else {
-                    TcpStream::connect((&*self.inner.host, self.inner.port)).await?
+                    self.inner.connect().await?
                 }
             }
-            ConnectionPolicy::Close => {
-                TcpStream::connect((&*self.inner.host, self.inner.port)).await?
-            }
+            ConnectionPolicy::Close => self.inner.connect().await?,
         };
 
-        // non-blocking early probe (e.g., ICAP/1.0 503)
-        if let Some(resp) = Self::try_read_early_response_now(&mut stream).await? {
+        if let Conn::Plain { inner } = &mut stream
+            && let Some(resp) = Self::try_read_early_response_now(inner).await?
+        {
             return Ok(resp);
         }
 
-        // force_has_body=true (body will be streamed), preview0_ieof=false (classic)
+        // force_has_body=true (body will be streamed), preview0_ieof=false
         let built = self.build_icap_request_bytes(req, true, false)?;
-        stream.write_all(&built.bytes).await?;
-        stream.flush().await?;
+        AsyncWriteExt::write_all(&mut stream, &built.bytes).await?;
+        AsyncWriteExt::flush(&mut stream).await?;
 
-        // If Preview:0 — close preview immediately, otherwise server may hang waiting.
         if matches!(req.preview_size, Some(0)) {
             if req.preview_ieof {
-                stream.write_all(b"0; ieof\r\n\r\n").await?;
+                AsyncWriteExt::write_all(&mut stream, b"0; ieof\r\n\r\n").await?;
             } else {
-                stream.write_all(b"0\r\n\r\n").await?;
+                AsyncWriteExt::write_all(&mut stream, b"0\r\n\r\n").await?;
             }
-            stream.flush().await?;
+            AsyncWriteExt::flush(&mut stream).await?;
         }
 
         let (code, hdr_buf) =
@@ -374,8 +483,8 @@ impl Client {
                 }
                 write_chunk(&mut stream, &buf[..n]).await?;
             }
-            stream.write_all(b"0\r\n\r\n").await?;
-            stream.flush().await?;
+            AsyncWriteExt::write_all(&mut stream, b"0\r\n\r\n").await?;
+            AsyncWriteExt::flush(&mut stream).await?;
 
             let (_code2, mut response) =
                 Self::with_timeout(self.inner.read_timeout, read_icap_headers(&mut stream)).await?;
@@ -387,7 +496,6 @@ impl Client {
             maybe_put_back(self.inner.connection_policy, &self.inner.idle_conn, stream).await;
             parse_icap_response(&response)
         } else {
-            // final immediately (e.g., 204)
             let mut response = hdr_buf;
             Self::with_timeout(
                 self.inner.read_timeout,
@@ -399,10 +507,7 @@ impl Client {
         }
     }
 
-    /// Return the full ICAP request as it would appear on the wire (no I/O).
-    ///
-    /// If `streaming` is `true` or the request uses `Preview: 0`, the `Encapsulated`
-    /// header will include `*-body`, and a zero-chunk will be appended.
+    /// Build the exact wire representation of a request, including preview tail when applicable.
     pub fn get_request_wire(&self, req: &Request, streaming: bool) -> IcapResult<Vec<u8>> {
         let built = self.build_icap_request_bytes(
             req,
@@ -434,11 +539,6 @@ impl Client {
         }
     }
 
-    /// Build ICAP request bytes (headers + embedded HTTP + initial preview/chunks).
-    ///
-    /// - `force_has_body = true` → `Encapsulated` will contain `*-body`
-    ///   even if the current body is empty.
-    /// - `preview0_ieof = true` → when `Preview: 0`, use `0; ieof` (fast-204 hint).
     fn build_icap_request_bytes(
         &self,
         req: &Request,
@@ -596,22 +696,18 @@ impl Client {
         loop {
             match stream.try_read(&mut tmp) {
                 Ok(0) => {
-                    // Peer closed without headers — treat as no early response.
                     return Ok(None);
                 }
                 Ok(n) => {
                     buf.extend_from_slice(&tmp[..n]);
                     if find_double_crlf(&buf).is_some() {
-                        // There are headers. We'll finish reading the body if Encapsulated points to it.
-                        // read_icap_body_if_any will only wait if there really is a body.
                         let _ = read_icap_body_if_any(stream, &mut buf).await;
                         return parse_icap_response(&buf).map(Some);
                     }
-                    // Continue reading while the core gives out data in one fell swoop.
                     continue;
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    return Ok(None); // Nothing ready - we write a request.
+                    return Ok(None);
                 }
                 Err(e) => return Err(e.into()),
             }
@@ -619,15 +715,22 @@ impl Client {
     }
 }
 
-/// Return connection back to idle slot if keep-alive is enabled.
-async fn maybe_put_back(
-    policy: ConnectionPolicy,
-    slot: &Mutex<Option<TcpStream>>,
-    stream: TcpStream,
-) {
-    if let ConnectionPolicy::KeepAlive = policy
-        && stream.peer_addr().is_ok()
-    {
+impl ClientRef {
+    async fn connect(&self) -> IcapResult<Conn> {
+        let tcp = TcpStream::connect((&*self.host, self.port)).await?;
+        // Priority order for SNI selection: user-provided SNI → host_override → host
+        let sni = self
+            .sni_hostname
+            .as_ref()
+            .cloned()
+            .or_else(|| self.host_override.clone())
+            .unwrap_or_else(|| self.host.clone());
+        self.tls.connect(tcp, &sni).await
+    }
+}
+
+async fn maybe_put_back(policy: ConnectionPolicy, slot: &Mutex<Option<Conn>>, stream: Conn) {
+    if let ConnectionPolicy::KeepAlive = policy {
         *slot.lock().await = Some(stream);
     }
 }
@@ -639,7 +742,12 @@ struct BuiltIcap {
     remaining_body: Option<Vec<u8>>,
 }
 
-async fn read_icap_body_if_any(stream: &mut TcpStream, buf: &mut Vec<u8>) -> IcapResult<()> {
+/// If the ICAP response has an encapsulated body (req-body or res-body),
+/// read it to the end (chunked) and append to `buf`.
+async fn read_icap_body_if_any<S>(stream: &mut S, buf: &mut Vec<u8>) -> IcapResult<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let Some(h_end) = find_double_crlf(buf) else {
         return Err("Corrupted ICAP headers".into());
     };
@@ -652,7 +760,7 @@ async fn read_icap_body_if_any(stream: &mut TcpStream, buf: &mut Vec<u8>) -> Ica
 
         while buf.len() < body_abs {
             let mut tmp = [0u8; 4096];
-            let n = stream.read(&mut tmp).await?;
+            let n = AsyncReadExt::read(stream, &mut tmp).await?;
             if n == 0 {
                 return Err("EOF before body".into());
             }
@@ -665,23 +773,34 @@ async fn read_icap_body_if_any(stream: &mut TcpStream, buf: &mut Vec<u8>) -> Ica
     }
 }
 
-fn parse_authority(uri: &str) -> IcapResult<(String, u16)> {
+fn parse_authority_with_scheme(uri: &str) -> IcapResult<(String, u16, bool)> {
     let s = uri.trim();
-    let rest = s
-        .strip_prefix("icap://")
-        .ok_or("Authority URI must start with icap://")?;
+    let (tls, rest) = if let Some(r) = s.strip_prefix("icaps://") {
+        (true, r)
+    } else if let Some(r) = s.strip_prefix("icap://") {
+        (false, r)
+    } else {
+        return Err("URI must start with icap:// or icaps://".into());
+    };
+
     let authority = rest.split('/').next().unwrap_or(rest);
     let (host, port) = if let Some(i) = authority.rfind(':') {
         let h = &authority[..i];
         let p: u16 = authority[i + 1..].parse().map_err(|_| "Invalid port")?;
         (h.to_string(), p)
     } else {
-        (authority.to_string(), 1344)
+        (authority.to_string(), if tls { 11344 } else { 1344 })
     };
+
     if host.is_empty() {
         return Err("Empty host in authority".into());
     }
-    Ok((host, port))
+    Ok((host, port, tls))
+}
+
+/// Back-compat helper used in some tests (icap:// only).
+fn parse_authority(uri: &str) -> IcapResult<(String, u16)> {
+    parse_authority_with_scheme(uri).map(|(h, p, _)| (h, p))
 }
 
 fn append_to_allow(headers: &mut HeaderMap, code: &str) {
@@ -703,20 +822,21 @@ fn append_to_allow(headers: &mut HeaderMap, code: &str) {
     }
 }
 
-async fn read_icap_headers(stream: &mut TcpStream) -> IcapResult<(u16, Vec<u8>)> {
+async fn read_icap_headers<S>(stream: &mut S) -> IcapResult<(u16, Vec<u8>)>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let mut buf = Vec::new();
     let mut tmp = [0u8; 4096];
 
-    // Returns the position of the first CRLF (end of the status line).
     let first_crlf_pos = |b: &Vec<u8>| b.windows(2).position(|w| w == b"\r\n");
 
-    // Helper: try to parse status code if we have at least one CRLF (status line complete).
     let parse_status_if_possible = |b: &Vec<u8>| -> Result<Option<u16>, &'static str> {
         if let Some(line_end) = first_crlf_pos(b) {
             let status_line = &b[..line_end];
             let s = std::str::from_utf8(status_line).map_err(|_| "bad utf8 in status line")?;
             let mut parts = s.split_whitespace();
-            let _ver = parts.next(); // "ICAP/1.0"
+            let _ver = parts.next();
             let code_str = parts.next().ok_or("missing status code")?;
             let code = code_str.parse::<u16>().map_err(|_| "bad status code")?;
             Ok(Some(code))
@@ -726,14 +846,13 @@ async fn read_icap_headers(stream: &mut TcpStream) -> IcapResult<(u16, Vec<u8>)>
     };
 
     loop {
-        let n = stream.read(&mut tmp).await.map_err(Error::Network)?;
+        let n = AsyncReadExt::read(stream, &mut tmp)
+            .await
+            .map_err(Error::Network)?;
 
         if n == 0 {
-            // Peer closed before we saw \r\n\r\n.
-            // Some non-strict servers send only a single CRLF and then close.
-            // If we already have a status line, normalize to \r\n\r\n for compatibility.
             if first_crlf_pos(&buf).is_some() && find_double_crlf(&buf).is_none() {
-                buf.extend_from_slice(b"\r\n"); // synthesize the missing empty line
+                buf.extend_from_slice(b"\r\n");
             } else {
                 return Err(Error::EarlyCloseWithoutHeaders);
             }
@@ -741,7 +860,6 @@ async fn read_icap_headers(stream: &mut TcpStream) -> IcapResult<(u16, Vec<u8>)>
             buf.extend_from_slice(&tmp[..n]);
         }
 
-        // 1) Fast path: canonical end-of-headers found.
         if let Some(_hdr_end) = find_double_crlf(&buf) {
             let line_end = first_crlf_pos(&buf).unwrap_or(buf.len());
             let status_line = &buf[..line_end];
@@ -749,7 +867,7 @@ async fn read_icap_headers(stream: &mut TcpStream) -> IcapResult<(u16, Vec<u8>)>
             let code = {
                 let s = std::str::from_utf8(status_line).map_err(|_| "bad utf8 in status line")?;
                 let mut parts = s.split_whitespace();
-                let _ver = parts.next(); // "ICAP/1.0"
+                let _ver = parts.next();
                 let code_str = parts.next().ok_or("missing status code")?;
                 code_str.parse::<u16>().map_err(|_| "bad status code")?
             };
@@ -757,22 +875,15 @@ async fn read_icap_headers(stream: &mut TcpStream) -> IcapResult<(u16, Vec<u8>)>
             return Ok((code, buf));
         }
 
-        // 2) Lenient error handling:
-        // If we have a complete status line and it's an error (4xx/5xx),
-        // some servers send only one CRLF and keep the connection open.
-        // To avoid hanging forever, accept a single-CRLF terminator for error responses
-        // by normalizing it to \r\n\r\n and returning immediately.
         if let Some(code) = parse_status_if_possible(&buf).map_err(|e| e.to_string())?
             && (400..=599).contains(&code)
         {
             if find_double_crlf(&buf).is_none() {
-                buf.extend_from_slice(b"\r\n"); // synthesize the missing empty line
+                buf.extend_from_slice(b"\r\n");
             }
             return Ok((code, buf));
         }
-        // TODO: Consider if this limit makes sense on the client side as well.
-        // It can protect against a misbehaving server sending unbounded headers,
-        // but may be unnecessary if all peers are trusted.
+
         if buf.len() > crate::MAX_HDR_BYTES {
             return Err(Error::Header(format!(
                 "Headers too large: {} bytes (max {})",
@@ -803,11 +914,11 @@ fn build_preview_and_chunks(
                     out.extend_from_slice(b"0; ieof\r\n\r\n");
                     Ok((out, false, None))
                 } else {
-                    out.extend_from_slice(b"0\r\n\r\n"); // expect 100 Continue
+                    out.extend_from_slice(b"0\r\n\r\n");
                     Ok((out, true, Some(Vec::new())))
                 }
             } else {
-                out.extend_from_slice(b"0\r\n\r\n"); // expect 100 Continue
+                out.extend_from_slice(b"0\r\n\r\n");
                 Ok((out, true, Some(body)))
             }
         }
@@ -904,7 +1015,7 @@ mod tests {
         let mut h = HeaderMap::new();
         append_to_allow(&mut h, "204");
         append_to_allow(&mut h, "206");
-        append_to_allow(&mut h, "204"); // duplicate
+        append_to_allow(&mut h, "204");
         let s = h.get("allow").unwrap().to_str().unwrap().to_string();
         assert!(s.contains("204"));
         assert!(s.contains("206"));
@@ -983,7 +1094,7 @@ mod tests {
         assert_eq!(
             &wire[http_start + off_num..http_start + off_num + 2],
             b"4\r"
-        ); // first chunk of preview
+        );
         let tail_str = bytes_to_string_prefix(&wire[http_start + off_num..], 64);
         assert!(tail_str.contains("\r\n0\r\n\r\n"));
     }
@@ -1069,11 +1180,8 @@ mod tests {
             .expect("client hung on single-CRLF 404")
             .expect("read_icap_headers failed");
 
-        assert_eq!(code, 404, "status code should be 404");
-        assert!(
-            buf.ends_with(b"\r\n\r\n"),
-            "buffer should end with CRLFCRLF"
-        );
+        assert_eq!(code, 404);
+        assert!(buf.ends_with(b"\r\n\r\n"));
     }
 
     /// 2) 404 with headers and proper CRLFCRLF.
@@ -1097,7 +1205,6 @@ mod tests {
     }
 
     /// 3) 404 with headers but EOF before CRLFCRLF.
-    /// Expectation: method normalizes on EOF and returns.
     #[tokio::test]
     async fn error_404_headers_then_eof_before_double_crlf() {
         let (mut client, server) = connect_pair().await;
@@ -1112,10 +1219,7 @@ mod tests {
             .expect("read_icap_headers failed");
 
         assert_eq!(code, 404);
-        assert!(
-            buf.ends_with(b"\r\n\r\n"),
-            "buffer should be normalized to CRLFCRLF on EOF"
-        );
+        assert!(buf.ends_with(b"\r\n\r\n"), "normalized to CRLFCRLF on EOF");
         let text = String::from_utf8(buf.clone()).unwrap();
         assert!(
             text.contains("ISTag: y"),
@@ -1124,16 +1228,13 @@ mod tests {
     }
 
     /// 4) Non-error: 200 OK + single CRLF, connection kept open.
-    /// Expectation: in strict mode for non-errors, method should NOT return quickly (we expect timeout).
+    /// Expectation: in strict mode for non-errors, method should NOT return     #[tokio::test]
     #[tokio::test]
     async fn non_error_200_single_crlf_kept_open_times_out() {
         let (mut client, server) = connect_pair().await;
 
         tokio::spawn(server_write(server, b"ICAP/1.0 200 OK\r\n", true));
         let res = timeout(Duration::from_millis(50), read_icap_headers(&mut client)).await;
-        assert!(
-            res.is_err(),
-            "non-error single-CRLF should not complete; expected timeout"
-        );
+        assert!(res.is_err());
     }
 }

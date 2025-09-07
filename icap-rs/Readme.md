@@ -1,8 +1,12 @@
-A Rust implementation of the **ICAP** protocol ([RFC 3507]) providing a client API and a server.
+# icap-rs — ICAP protocol for Rust (client & mini server)
 
-[RFC 3507]: https://www.rfc-editor.org/rfc/rfc3507
+A Rust implementation of the **ICAP** protocol ([RFC&nbsp;3507]) providing a client API and a small server.
 
-# Status
+[RFC&nbsp;3507]: https://www.rfc-editor.org/rfc/rfc3507
+
+---
+
+## Status
 
 **Work in progress.**
 
@@ -14,7 +18,19 @@ A Rust implementation of the **ICAP** protocol ([RFC 3507]) providing a client A
 
 ---
 
-# Install
+## Features
+
+- Client with builder (`Client::builder()`).
+- ICAP requests: `OPTIONS`, `REQMOD`, `RESPMOD`.
+- Embedded HTTP request/response serialization on the ICAP wire.
+- **Preview** negotiation (incl. `Preview: 0` and `ieof` fast path).
+- Chunked uploads, streaming large bodies after `100 Continue`.
+- Keep-Alive: reuse a single idle connection.
+- **ICAPS (TLS)** with either `rustls` or `OpenSSL` backends.
+
+---
+
+## Install
 
 Add to your `Cargo.toml`:
 
@@ -23,25 +39,20 @@ Add to your `Cargo.toml`:
 icap-rs = "actual-version"
 ```
 
-Or
+Or:
 
 ```bash
 cargo add icap-rs
 ```
+
 ---
 
-# Client
+## Client
 
-- Builder-based configuration (host/port, keep-alive, default headers, timeouts).
-- ICAP requests: `OPTIONS`, `REQMOD`, `RESPMOD`.
-- Embedded HTTP request/response (serialize on the ICAP wire).
-- **Preview** negotiation, including `Preview: 0` with optional `ieof` hint (fast 204 path).
-- Stream large bodies from disk after `100 Continue`.
-- Generate exact wire bytes for debugging without sending.
+Builder-based configuration (host/port, keep-alive, default headers, timeouts).  
+Generate exact wire bytes for debugging without sending.
 
-## Quick start — Client
-
-### 1) Basic `OPTIONS`
+### Quick start — `OPTIONS`
 
 ```rust,no_run
 use icap_rs::{Client, Request};
@@ -63,7 +74,7 @@ async fn main() -> icap_rs::error::IcapResult<()> {
 }
 ```
 
-### 2) `REQMOD` with embedded HTTP and Preview
+### `REQMOD` with embedded HTTP and Preview
 
 ```rust,no_run
 use http::Request as HttpRequest;
@@ -103,9 +114,171 @@ async fn main() -> icap_rs::error::IcapResult<()> {
 }
 ```
 
+### Streaming from disk after `100 Continue`
+
+```rust,no_run
+use icap_rs::{Client, Request};
+use http::{Request as HttpRequest, header, Version};
+
+#[tokio::main]
+async fn main() -> icap_rs::error::IcapResult<()> {
+    let client = Client::builder().from_uri("icap://127.0.0.1:1344")?.build();
+
+    // Tell the ICAP server we will have a body, but send Preview: 0
+    let http_req = HttpRequest::builder()
+        .method("POST")
+        .uri("/upload")
+        .version(Version::HTTP_11)
+        .header(header::HOST, "app")
+        .header(header::CONTENT_LENGTH, "10000000")
+        .body(Vec::<u8>::new()) // empty now; we'll stream from a file
+        .unwrap();
+
+    let req = Request::reqmod("upload").preview(0).with_http_request(http_req);
+
+    // After the server replies 100 Continue, the client streams the file
+    let resp = client.send_streaming(&req, "/path/to/large.bin").await?;
+    println!("{} {}", resp.status_code.as_str(), resp.status_text);
+    Ok(())
+}
+```
+
 ---
 
-# Server
+## TLS (ICAPS)
+
+The client supports **TLS (“ICAPS”)**. You can enable one of two TLS stacks:
+
+- **rustls** (recommended):
+  - Enable `tls-rustls` **and pick exactly one provider**:
+    - `tls-rustls-ring` **or**
+    - `tls-rustls-aws-lc`
+- **OpenSSL**:
+  - Enable `tls-openssl`
+
+> If you enable both rustls providers or none, the crate fails to compile with a clear error.  
+> When you use an `icaps://…` URI but build without any TLS feature, the client returns an error.
+
+### Cargo features
+
+```toml
+# Choose ONE rustls provider:
+[dependencies.icap-rs]
+version = "actual-version"
+features = ["tls-rustls", "tls-rustls-ring"]      # or: ["tls-rustls", "tls-rustls-aws-lc"]
+
+# — OR — use OpenSSL instead:
+# features = ["tls-openssl"]
+```
+
+### ICAPS quick start (system roots)
+
+`icaps://` switches the client into TLS mode automatically. If you omit the port, the default for ICAPS is **11344**.
+
+```rust,no_run
+use icap_rs::{Client, Request};
+
+#[tokio::main]
+async fn main() -> icap_rs::error::IcapResult<()> {
+    let client = Client::builder()
+        .from_uri("icaps://icap.example")? // TLS on port 11344 by default
+        .keep_alive(true)
+        .build();
+
+    let req = Request::options("respmod");
+    let resp = client.send(&req).await?;
+    println!("ICAP: {} {}", resp.status_code.as_str(), resp.status_text);
+    Ok(())
+}
+```
+
+### rustls: trust a local CA (self-signed)
+
+If your server uses a self-signed certificate, add its **CA** to the client trust store (PEM).  
+This method is available only with the `tls-rustls` feature.
+
+```rust,no_run
+use icap_rs::{Client, Request};
+
+#[tokio::main]
+async fn main() -> icap_rs::error::IcapResult<()> {
+    let client = Client::builder()
+        .from_uri("icaps://localhost:2346")?
+        .sni_hostname("localhost")                    // SNI to match cert
+        .add_root_ca_pem_file("/var/tmp/test/ca.crt")? // trust our CA
+        .keep_alive(true)
+        .build();
+
+    let resp = client.send(&Request::options("test")).await?;
+    println!("{} {}", resp.status_code.as_str(), resp.status_text);
+    Ok(())
+}
+```
+
+### SNI override
+
+By default SNI is the ICAP host (or `host_override` if set). You can override it:
+
+```rust,no_run
+use icap_rs::Client;
+# fn demo() -> Result<(), Box<dyn std::error::Error>> {
+  let client = Client::builder()
+          .from_uri("icaps://10.0.0.5:2346")?   // this returns Result, so `?` is fine
+          .sni_hostname("icap.internal.example") // this returns the builder; no `?` here
+          .build();
+  # Ok(())
+  # }
+# demo().unwrap();
+```
+
+### OpenSSL backend (testing only: disable verify)
+
+With the OpenSSL backend you can temporarily disable verification (e.g., quick local tests).  
+**Do not** use this in production.
+
+```rust,no_run
+use icap_rs::{Client, Request};
+
+#[tokio::main]
+async fn main() -> icap_rs::error::IcapResult<()> {
+    let client = Client::builder()
+        .from_uri("icaps://localhost:2346")?
+        .keep_alive(true)
+        .danger_disable_cert_verify(true) // OpenSSL: disables verify; rustls: ignored
+        .build();
+
+    let resp = client.send(&Request::options("test")).await?;
+    println!("{} {}", resp.status_code.as_str(), resp.status_text);
+    Ok(())
+}
+```
+
+### Notes & limitations
+
+- **rustls 0.23**: certificate verification **cannot be disabled** via public API.  
+  The builder’s `danger_disable_cert_verify(true)` flag is **ignored** under rustls (kept only for API compatibility).
+- **Client auth (mTLS)**: the client currently does **not** present a certificate (no client-auth).  
+  If your server *requires* a client certificate, the handshake will fail.
+- **Default ICAPS port**: if no port is specified for `icaps://host`, the client uses **11344**.  
+  For `icap://host` (plaintext), the default is **1344**.
+
+---
+
+## Example CLI (optional)
+
+This repository may include a demo binary, `rs-icap-client`, that exercises the client API.
+
+```bash
+# OPTIONS over TLS (rustls), trusting a local CA file and setting SNI
+cargo run --bin rs-icap-client --   -u icaps://localhost:2346/test   --tls-backend rustls   --tls-ca /var/tmp/test/ca.crt   --sni localhost   -v -d 4
+```
+
+Common flags: `--method`, `--req`, `--resp`, `--xheader`, `--hx`, `--rhx`, `--preview-size`, `--ieof`, `--stream-io`,
+`--print-request`, etc.
+
+---
+
+## Server
 
 - Minimal async ICAP server built on Tokio.
 - **Routing per service**, with **one handler** able to serve multiple methods.
@@ -120,9 +293,7 @@ async fn main() -> icap_rs::error::IcapResult<()> {
   DX).
 - Reads encapsulated *chunked* bodies to completion before invoking handlers.
 
----
-
-## ICAP status codes (re-exported from `http`)
+### ICAP status codes (re-exported from `http`)
 
 ICAP reuses the **HTTP numeric status codes** (RFC 3507). This crate exposes them via a type alias:
 
@@ -131,11 +302,10 @@ pub type StatusCode = http::StatusCode;
 ```
 
 Use `StatusCode::OK`, `StatusCode::NO_CONTENT`, etc. ICAP-specific rules (e.g., **`ISTag` is required on 2xx**,
-`Encapsulated`
-constraints, and **204 must not carry a body**) are enforced by `icap-rs` during parsing and serialization.
----
+`Encapsulated` constraints, and **204 must not carry a body**) are enforced by `icap-rs` during parsing and
+serialization.
 
-## Quick start — Server
+### Quick start — Server
 
 A minimal server exposing two services (`reqmod`, `respmod`) and replying `204 No Content`.
 
@@ -227,9 +397,7 @@ async fn main() -> IcapResult<()> {
 }
 ```
 
----
-
-## Dynamic ISTag (per-request)
+### Dynamic ISTag (per-request)
 
 If your service tag reflects a mutable policy (e.g., a filtering rule-set version), you can compute `ISTag`
 **per request** (including `OPTIONS`):
@@ -249,9 +417,7 @@ let opts = ServiceOptions::new()
     .add_allow("204");
 ```
 
----
-
-## 204 policy & automatic 200 echo
+### 204 policy & automatic 200 echo
 
 To align with RFC 3507 semantics:
 
@@ -262,37 +428,6 @@ To align with RFC 3507 semantics:
   - for `RESPMOD` — echoes the HTTP response.
 
 When `Allow: 204` is present or `Preview` is used, your handler is free to return `204` where appropriate.
-
----
-
-## Handlers and request parsing
-
-Handlers receive a parsed `icap_rs::Request`, including ICAP headers and (if present) an embedded HTTP request/response
-with its headers/body. The server reads and buffers the ICAP chunked body before invoking the handler, so your handler
-logic can inspect `req.embedded` safely.
-
----
-
-## API overview
-
-Key types re-exported at the crate root:
-
-- `Client` — high-level ICAP client with connection reuse.
-- `Request` — build `OPTIONS`/`REQMOD`/`RESPMOD` (set Preview, `Allow: 204/206`, attach embedded HTTP).
-- `Response`, `StatusCode` — build and serialize ICAP responses.
-  - `Response::with_http_response(&http::Response<Vec<u8>>)` — attach embedded HTTP **response**.
-  - `Response::with_http_request(&http::Request<Vec<u8>>)` — attach embedded HTTP **request**.
-- `server::options::ServiceOptions` — construct per-service `OPTIONS` responses (router injects `Methods`).
-  - `ServiceOptions::with_istag_provider(F: Fn(&Request) -> String + Send + Sync + 'static)` — **dynamic ISTag** per
-    request.
-- `error::{IcapError, IcapResult}` — error handling.
-
-**Routing API highlights**
-
-- `ServerBuilder::route(service, methods, handler, options)` — `methods` can be enum values or strings like
-  `"REQMOD"`, `"RESPMOD"` (case-insensitive). `options` is `Option<ServiceOptions>`.
-- `ServerBuilder::route_reqmod(service, handler, options)` / `route_respmod(service, handler, options)` — sugar.
-- Duplicate `(service, method)` registrations **panic** with a clear message.
 
 ---
 
@@ -308,9 +443,45 @@ Key types re-exported at the crate root:
 
 ---
 
+## Testing locally (plain or TLS)
+
+Quick ad‑hoc servers for development:
+
+### Plain TCP with `socat`
+
+```bash
+socat -v TCP-LISTEN:1344,reuseaddr,fork   SYSTEM:'printf "ICAP/1.0 200 OK\r\nISTag: test\r\nEncapsulated: null-body=0\r\n\r\n"; sleep 1'
+```
+
+### TLS with `openssl s_server` (self-signed)
+
+```bash
+# Generate a local CA and server cert (example only!)
+# ... or use your existing cert and key:
+openssl req -x509 -newkey rsa:2048 -nodes -days 1   -keyout server.key -out server.crt -subj "/CN=localhost"
+
+# Start a toy TLS server that writes a single OPTIONS response
+openssl s_server -quiet -accept 2346 -cert server.crt -key server.key -nocache -www <<'EOF'
+ICAP/1.0 200 OK
+ISTag: test
+Encapsulated: null-body=0
+
+EOF
+```
+
+Then run the client (trusting your CA/cert as needed).
+
+---
+
 ## Roadmap
 
-- TLS/ICAPS (likely via `rustls`).
 - Richer server APIs (streaming to handler, trailers, backpressure, graceful shutdown).
 - More complete `OPTIONS` helpers and better defaults.
+- TLS client auth (mTLS).
 - Connection pooling beyond a single keep-alive connection.
+
+---
+
+## License
+
+Dual-license or project-specific license TBD. Replace this section with your actual license details.

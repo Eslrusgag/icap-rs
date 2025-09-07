@@ -1,4 +1,4 @@
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use http::{
     HeaderName, HeaderValue, Method, Request as HttpRequest, Response as HttpResponse, StatusCode,
     Version,
@@ -58,6 +58,12 @@ pub fn cli_styles() -> clap::builder::Styles {
         )
 }
 
+#[derive(ValueEnum, Clone, Debug)]
+enum TlsBackendCli {
+    Rustls,
+    Openssl,
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "rs-icap-client",
@@ -66,7 +72,7 @@ pub fn cli_styles() -> clap::builder::Styles {
     disable_version_flag = true,
 )]
 struct Args {
-    /// Full ICAP URI like icap://host[:port]/service
+    /// Full ICAP URI like icap://host[:port]/service or icaps://host[:port]/service
     #[arg(short = 'u', long, default_value = "icap://127.0.0.1:1344/")]
     uri: String,
 
@@ -102,7 +108,7 @@ struct Args {
     #[arg(long, action = clap::ArgAction::SetTrue)]
     noreshdr: bool,
 
-    /// Force c-icap semantics: Preview: 0 (no ieof). Server replies 100, then stream the body.
+    /// Force c-icap semantics: Preview: 0 (no ieof).
     #[arg(long, action = clap::ArgAction::SetTrue)]
     nopreview: bool,
 
@@ -125,6 +131,22 @@ struct Args {
     /// Extra HTTP response headers (repeatable): --rhx "Header: Value"
     #[arg(long = "rhx")]
     rhx_header: Vec<String>,
+
+    /// Select TLS backend (only effective for icaps://)
+    #[arg(long = "tls-backend", value_enum)]
+    tls_backend: Option<TlsBackendCli>,
+
+    /// Disable certificate verification (may be ignored for rustls 0.23)
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    insecure: bool,
+
+    /// Use extra CA bundle (PEM) for TLS (rustls only)
+    #[arg(long = "tls-ca", value_name = "PEM_FILE")]
+    tls_ca: Option<String>,
+
+    /// Override SNI hostname (used with TLS)
+    #[arg(long = "sni", value_name = "HOSTNAME")]
+    sni: Option<String>,
 
     /// Force Preview: N explicitly (advanced). If not set, negotiated via OPTIONS.
     #[arg(short = 'w', long)]
@@ -159,7 +181,6 @@ struct IcapCaps {
 async fn main() -> IcapResult<()> {
     let args = Args::parse();
 
-    // Logging
     let debug_level = args.debug_level.unwrap_or(0);
     if debug_level > 0 {
         tracing_subscriber::fmt()
@@ -179,7 +200,6 @@ async fn main() -> IcapResult<()> {
     );
     debug!("Arguments: {:?}", args);
 
-    // Pick method: with -f default to RESPMOD like c-icap-client
     let icap_method = if let Some(m) = args.method.as_deref() {
         m.to_uppercase()
     } else if args.req_url.is_some() {
@@ -190,7 +210,6 @@ async fn main() -> IcapResult<()> {
         "OPTIONS".to_string()
     };
 
-    // Resolve authority for display
     let (server_host, server_port, _service_for_print) = parse_authority_and_service(&args.uri)
         .unwrap_or_else(|| ("127.0.0.1".into(), 1344, "/".into()));
     let server_ip = tokio::net::lookup_host((server_host.as_str(), server_port))
@@ -207,8 +226,70 @@ async fn main() -> IcapResult<()> {
         icap_rs::LIB_VERSION
     );
 
-    let client = Client::builder()
-        .from_uri(&args.uri)?
+    let mut builder = Client::builder().from_uri(&args.uri)?;
+    let is_tls_uri = args.uri.starts_with("icaps://");
+
+    if let Some(be) = &args.tls_backend {
+        if is_tls_uri {
+            match be {
+                TlsBackendCli::Rustls => {
+                    #[cfg(feature = "tls-rustls")]
+                    {
+                        builder = builder.use_rustls();
+                    }
+                    #[cfg(not(feature = "tls-rustls"))]
+                    {
+                        eprintln!("This binary was built without feature `tls-rustls`");
+                        std::process::exit(2);
+                    }
+                }
+                TlsBackendCli::Openssl => {
+                    #[cfg(feature = "tls-openssl")]
+                    {
+                        builder = builder.use_openssl();
+                    }
+                    #[cfg(not(feature = "tls-openssl"))]
+                    {
+                        eprintln!("This binary was built without feature `tls-openssl`");
+                        std::process::exit(2);
+                    }
+                }
+            }
+        } else {
+            eprintln!("Note: --tls-backend is ignored for icap:// (use icaps:// to enable TLS).");
+        }
+    }
+
+    if let Some(sni) = &args.sni {
+        builder = builder.sni_hostname(sni);
+    }
+
+    #[cfg(feature = "tls-rustls")]
+    {
+        if let Some(pem_path) = &args.tls_ca {
+            if is_tls_uri {
+                builder = builder.add_root_ca_pem_file(pem_path)?;
+            } else {
+                eprintln!("Note: --tls-ca is ignored for icap:// (TLS is off).");
+            }
+        }
+    }
+    #[cfg(not(feature = "tls-rustls"))]
+    {
+        if args.tls_ca.is_some() {
+            eprintln!("--tls-ca requires a binary built with feature `tls-rustls`.");
+        }
+    }
+
+    if args.insecure {
+        builder = builder.danger_disable_cert_verify(true);
+        #[cfg(all(feature = "tls-rustls", not(feature = "tls-openssl")))]
+        eprintln!(
+            "Warning: rustls 0.23 does not provide a public no-verify API; --insecure may be ignored."
+        );
+    }
+
+    let client = builder
         .read_timeout(args.timeout.map(Duration::from_secs))
         .user_agent(&ua)
         .build();
@@ -267,7 +348,7 @@ async fn main() -> IcapResult<()> {
         icap_req = icap_req.preview(n);
     }
 
-    // Prepare embedded HTTP and body source (in-memory vs streaming)
+    // Prepare embedded HTTP and body source
     let (file_bytes, file_path_opt, file_len_opt) = if let Some(filename) = &args.filename {
         let p = PathBuf::from(filename);
         if args.stream_io || caps.preview == Some(0) || args.nopreview {
@@ -295,34 +376,31 @@ async fn main() -> IcapResult<()> {
         if icap_method == "REQMOD" {
             // Build embedded HTTP request
             let (host_hdr, uri) = match args.req_url.as_deref() {
-                Some(url) => {
-                    let host = host_from_url(url).map(|s| s.to_string());
-                    (host, url.to_string())
-                }
+                Some(url) => (host_from_url(url).map(|s| s.to_string()), url.to_string()),
                 None => (Some("localhost".into()), "/rs-icap-client".into()),
             };
 
             let body_vec = file_bytes.clone().unwrap_or_default();
             let use_post = !body_vec.is_empty() || file_len_opt.unwrap_or(0) > 0;
 
-            let mut builder = HttpRequest::builder()
+            let mut httpb = HttpRequest::builder()
                 .method(if use_post { Method::POST } else { Method::GET })
                 .version(Version::HTTP_10)
                 .uri(uri);
 
             if let Some(h) = host_hdr.as_deref() {
-                builder = builder.header("Host", h);
+                httpb = httpb.header("Host", h);
             }
             if args.stream_io
                 && let Some(len) = file_len_opt
             {
-                builder = builder.header("Content-Length", len.to_string());
+                httpb = httpb.header("Content-Length", len.to_string());
             }
 
             for h in &args.hx_header {
                 match parse_header_line(h) {
                     Ok((k, v)) => {
-                        builder = builder.header(
+                        httpb = httpb.header(
                             HeaderName::from_bytes(k.as_bytes())?,
                             HeaderValue::from_str(&v)?,
                         );
@@ -331,13 +409,11 @@ async fn main() -> IcapResult<()> {
                 }
             }
 
-            let http_req = builder
-                .body(body_vec)
-                .expect("failed to build HTTP request");
+            let http_req = httpb.body(body_vec).expect("failed to build HTTP request");
             icap_req = icap_req.with_http_request(http_req);
         } else {
             // Build embedded HTTP response (HTTP/1.0 by default, like c-icap-client)
-            let mut builder = HttpResponse::builder()
+            let mut httpb = HttpResponse::builder()
                 .status(StatusCode::OK)
                 .version(Version::HTTP_10);
 
@@ -345,18 +421,18 @@ async fn main() -> IcapResult<()> {
             let now_local = Local::now();
             let http_date_simple = now_local.format("%a %b %d %H:%M:%S %Y").to_string();
 
-            builder = builder
+            httpb = httpb
                 .header("Date", http_date_simple.as_str())
                 .header("Last-Modified", http_date_simple.as_str());
 
             if let Some(len) = file_len_opt {
-                builder = builder.header("Content-Length", len.to_string());
+                httpb = httpb.header("Content-Length", len.to_string());
             }
 
             for h in &args.rhx_header {
                 match parse_header_line(h) {
                     Ok((k, v)) => {
-                        builder = builder.header(
+                        httpb = httpb.header(
                             HeaderName::from_bytes(k.as_bytes())?,
                             HeaderValue::from_str(&v)?,
                         );
@@ -365,13 +441,11 @@ async fn main() -> IcapResult<()> {
                 }
             }
             if let Some(u) = &args.resp_url {
-                builder = builder.header("X-Resp-Source", u);
+                httpb = httpb.header("X-Resp-Source", u);
             }
 
             let body_vec = file_bytes.clone().unwrap_or_default();
-            let http_resp = builder
-                .body(body_vec)
-                .expect("failed to build HTTP response");
+            let http_resp = httpb.body(body_vec).expect("failed to build HTTP response");
             icap_req = icap_req.with_http_response(http_resp);
         }
 
@@ -464,7 +538,6 @@ async fn output_response(
         }
     } else {
         println!("ICAP/1.0 {} {}", response.status_code, response.status_text);
-
         if let Some(output_file) = &args.output {
             let mut file = File::create(output_file).await?;
             file.write_all(&response.body).await?;
@@ -477,7 +550,9 @@ async fn output_response(
 }
 
 fn service_from_uri(uri: &str) -> Option<String> {
-    let rest = uri.strip_prefix("icap://")?;
+    let rest = uri
+        .strip_prefix("icap://")
+        .or_else(|| uri.strip_prefix("icaps://"))?;
     let slash = rest.find('/')?;
     Some(rest[slash..].to_string())
 }
@@ -505,8 +580,14 @@ fn parse_header_line(line: &str) -> Result<(String, String), &'static str> {
 }
 
 fn parse_authority_and_service(uri: &str) -> Option<(String, u16, String)> {
-    let s = uri.trim();
-    let rest = s.strip_prefix("icap://")?;
+    let (tls, rest) = if let Some(r) = uri.strip_prefix("icaps://") {
+        (true, r)
+    } else if let Some(r) = uri.strip_prefix("icap://") {
+        (false, r)
+    } else {
+        return None;
+    };
+
     let mut parts = rest.splitn(2, '/');
     let authority = parts.next().unwrap_or(rest);
     let service = format!("/{}", parts.next().unwrap_or(""));
@@ -516,7 +597,7 @@ fn parse_authority_and_service(uri: &str) -> Option<(String, u16, String)> {
         let p = authority[i + 1..].parse::<u16>().ok()?;
         (h.to_string(), p)
     } else {
-        (authority.to_string(), 1344)
+        (authority.to_string(), if tls { 11344 } else { 1344 })
     };
     Some((host, port, service))
 }
@@ -568,7 +649,6 @@ async fn send_with_preview(
     cli_stream_io: bool,
     cli_nopreview: bool,
 ) -> IcapResult<IcapResponse> {
-    // If --nopreview or negotiated Preview:0 → enforce streaming path
     if cli_nopreview || negotiated_or_forced_preview == Some(0) {
         icap_req = icap_req.preview(0);
         return client
@@ -576,19 +656,16 @@ async fn send_with_preview(
             .await;
     }
 
-    // If Preview > 0 → send in-memory (client will handle preview + finalization)
     if let Some(n) = negotiated_or_forced_preview
         && n > 0
     {
         return client.send(&icap_req).await;
     }
 
-    // If preview is unknown but --stream-io requested → behave like Preview:0
     if cli_stream_io && let Some(file_path) = file_path_opt {
         icap_req = icap_req.preview(0);
         return client.send_streaming(&icap_req, file_path).await;
     }
 
-    // Default: in-memory send
     client.send(&icap_req).await
 }

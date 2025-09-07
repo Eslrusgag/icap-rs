@@ -464,7 +464,7 @@ pub(crate) fn parse_icap_response(raw: &[u8]) -> IcapResult<Response> {
                 }
             }
             StatusCode::OK | StatusCode::PARTIAL_CONTENT => {
-                let pairs = parse_encapsulated_pairs_strict(&enc_val)?;
+                let pairs = parse_encapsulated_pairs_strict(enc_val)?;
                 validate_encapsulated_offsets(&pairs, body.len())?;
             }
             _ => {}
