@@ -6,11 +6,12 @@
 use std::sync::{Arc, RwLock};
 
 use http::{HeaderMap, Response as HttpResponse, StatusCode as HttpStatus, Version};
-use icap_rs::Method;
-use icap_rs::request::{EmbeddedHttp, Request};
+use icap_rs::request::{BodyRead, EmbeddedHttp, Request};
 use icap_rs::response::{Response, StatusCode};
 use icap_rs::server::Server;
 use icap_rs::server::options::ServiceOptions;
+use icap_rs::{Body, Method};
+use tokio::io::AsyncReadExt;
 use tracing::{error, info, warn};
 
 const ISTAG_REQMOD_INIT: &str = "reqmod-1.0";
@@ -71,8 +72,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     async move {
                         info!("REQMOD called: {}", request.service);
 
-                        if let Some(EmbeddedHttp::Req(http_req)) = &request.embedded {
-                            info!("HTTP {} {}", http_req.method(), http_req.uri());
+                        if let Some(EmbeddedHttp::Req { head, .. }) = &request.embedded {
+                            info!("HTTP {} {}", head.method(), head.uri());
                         } else {
                             warn!("REQMOD without embedded HTTP request");
                         }
@@ -103,27 +104,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     async move {
                         info!("RESPMOD called: {}", request.service);
 
-                        if let Some(EmbeddedHttp::Resp(http_resp)) = &request.embedded {
-                            info!("HTTP status: {}", http_resp.status());
+                        if let Some(EmbeddedHttp::Resp { head, .. }) = &request.embedded {
+                            info!("HTTP status: {}", head.status());
                         } else {
                             warn!("RESPMOD without embedded HTTP response");
                         }
 
                         let istag_now = t.read().unwrap().clone();
 
-                        if can_return_204(&request.icap_headers) {
+                        if request.preview_size.is_some() && can_return_204(&request.icap_headers) {
                             return Ok(Response::no_content()
                                 .try_set_istag(&istag_now)?
                                 .add_header("Server", "icap-rs/0.1.0"));
                         }
 
-                        if let Some(EmbeddedHttp::Resp(http_resp)) = &request.embedded {
-                            return Ok(Response::new(StatusCode::OK, "OK")
-                                .try_set_istag(&istag_now)?
-                                .with_http_response(http_resp)?
-                                .add_header("Server", "icap-rs/0.1.0"));
-                        }
+                        if let Some(EmbeddedHttp::Resp { head, body }) = &request.embedded {
+                            if let Body::Full { reader } = body {
+                                let mut builder = http::Response::builder()
+                                    .status(head.status())
+                                    .version(head.version());
+                                if let Some(h) = builder.headers_mut() {
+                                    h.extend(head.headers().clone());
+                                    h.remove(http::header::TRANSFER_ENCODING);
+                                    h.insert(
+                                        http::header::CONTENT_LENGTH,
+                                        http::HeaderValue::from_str(&reader.len().to_string())
+                                            .unwrap(),
+                                    );
+                                }
+                                let http_resp = builder
+                                    .body(reader.clone())
+                                    .map_err(|e| format!("build http::Response: {e}"))?;
 
+                                return Ok(Response::new(StatusCode::OK, "OK")
+                                    .try_set_istag(&istag_now)?
+                                    .with_http_response(&http_resp)?
+                                    .add_header("Server", "icap-rs/0.1.0"));
+                            }
+                        }
                         Ok(Response::no_content()
                             .try_set_istag(&istag_now)?
                             .add_header("Server", "icap-rs/0.1.0"))
@@ -142,18 +160,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     let t = Arc::clone(&t);
                     async move {
                         if request.method == Method::ReqMod {
-                            if let Some(EmbeddedHttp::Req(http_req)) = &request.embedded {
-                                info!(
-                                    "BLOCKER REQMOD for {} {}",
-                                    http_req.method(),
-                                    http_req.uri()
-                                );
+                            if let Some(EmbeddedHttp::Req { head, .. }) = &request.embedded {
+                                info!("BLOCKER REQMOD for {} {}", head.method(), head.uri());
                             } else {
                                 warn!("BLOCKER: REQMOD without embedded HTTP request");
                             }
                         } else if request.method == Method::RespMod {
-                            if let Some(EmbeddedHttp::Resp(http_resp)) = &request.embedded {
-                                info!("BLOCKER RESPMOD, upstream status {}", http_resp.status());
+                            if let Some(EmbeddedHttp::Resp { head, .. }) = &request.embedded {
+                                info!("BLOCKER RESPMOD, upstream status {}", head.status());
                             } else {
                                 warn!("BLOCKER: RESPMOD without embedded HTTP response");
                             }

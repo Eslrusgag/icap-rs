@@ -12,7 +12,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .body(r#"{"name":"John Doe","email":"john@example.com"}"#.as_bytes().to_vec())?;
 
     let client = Client::builder()
-        .from_uri("icap://localhost:1344")?
+        .with_uri("icap://localhost:1344")?
         .keep_alive(true)
         .build();
 

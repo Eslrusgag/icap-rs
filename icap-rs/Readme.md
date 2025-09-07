@@ -61,7 +61,7 @@ use icap_rs::{Client, Request};
 async fn main() -> icap_rs::error::IcapResult<()> {
     // Transport (where to connect)
     let client = Client::builder()
-        .from_uri("icap://127.0.0.1:1344")?
+        .with_uri("icap://127.0.0.1:1344")?
         .keep_alive(true)
         .build();
 
@@ -82,7 +82,9 @@ use icap_rs::{Client, Request, StatusCode};
 
 #[tokio::main]
 async fn main() -> icap_rs::error::IcapResult<()> {
-    let client = Client::builder().from_uri("icap://127.0.0.1:1344")?.build();
+    let client = Client::builder()
+    .with_uri("icap://127.0.0.1:1344")?
+    .build();
 
     // Build the HTTP message to embed
     let http_req = HttpRequest::builder()
@@ -122,7 +124,9 @@ use http::{Request as HttpRequest, header, Version};
 
 #[tokio::main]
 async fn main() -> icap_rs::error::IcapResult<()> {
-    let client = Client::builder().from_uri("icap://127.0.0.1:1344")?.build();
+    let client = Client::builder()
+    .with_uri("icap://127.0.0.1:1344")?
+    .build();
 
     // Tell the ICAP server we will have a body, but send Preview: 0
     let http_req = HttpRequest::builder()
@@ -181,7 +185,7 @@ use icap_rs::{Client, Request};
 #[tokio::main]
 async fn main() -> icap_rs::error::IcapResult<()> {
     let client = Client::builder()
-        .from_uri("icaps://icap.example")? // TLS on port 11344 by default
+        .with_uri("icaps://icap.example")? // TLS on port 11344 by default
         .keep_alive(true)
         .build();
 
@@ -203,7 +207,7 @@ use icap_rs::{Client, Request};
 #[tokio::main]
 async fn main() -> icap_rs::error::IcapResult<()> {
     let client = Client::builder()
-        .from_uri("icaps://localhost:13443")?
+        .with_uri("icaps://localhost:13443")?
         .sni_hostname("localhost")                     // SNI to match cert
         .add_root_ca_pem_file("test_data/certs/ca.pem")? // trust our CA
         .keep_alive(true)
@@ -223,7 +227,7 @@ By default SNI is the ICAP host (or `host_override` if set). You can override it
 use icap_rs::Client;
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
   let client = Client::builder()
-          .from_uri("icaps://10.0.0.5:13443")?   // explicit port to match the server
+          .with_uri("icaps://10.0.0.5:13443")?   // explicit port to match the server
           .sni_hostname("icap.internal.example") // this returns the builder; no `?` here
           .build();
   # Ok(())
@@ -241,7 +245,7 @@ use icap_rs::{Client, Request};
 #[tokio::main]
 async fn main() -> icap_rs::error::IcapResult<()> {
     let client = Client::builder()
-        .from_uri("icaps://localhost:13443")?
+        .with_uri("icaps://localhost:13443")?
         .keep_alive(true)
         .danger_disable_cert_verify(true) // OpenSSL: disables verify; rustls: ignored
         .build();
