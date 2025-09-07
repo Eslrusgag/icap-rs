@@ -62,13 +62,15 @@
 
 pub mod options;
 
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::{RootCertStore, ServerConfig};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::future::Future;
+use std::path::PathBuf;
 use std::str;
 use std::sync::Arc;
-
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tracing::{error, trace, warn};
@@ -80,6 +82,7 @@ use crate::request::parse_icap_request;
 pub use crate::server::options::{ServiceOptions, TransferBehavior};
 use crate::{EmbeddedHttp, Method, Request, Response, StatusCode};
 use smallvec::SmallVec;
+use tokio_rustls::TlsAcceptor;
 
 /// A per-service ICAP handler.
 ///
@@ -139,12 +142,13 @@ pub struct Server {
     advertised_max_conn: Option<usize>,
     aliases: Arc<HashMap<String, String>>,
     default_service: Option<String>,
+    #[cfg(feature = "tls-rustls")]
+    tls: Option<TlsAcceptor>,
 }
-
 impl Server {
     /// Create a new [`ServerBuilder`].
     pub fn builder() -> ServerBuilder {
-        ServerBuilder::new()
+        ServerBuilder::default()
     }
 
     /// Accept loop:
@@ -162,66 +166,109 @@ impl Server {
         trace!(addr=%local_addr, "ICAP server started");
 
         loop {
-            let (mut socket, addr) = self.listener.accept().await?;
+            let (socket, addr) = self.listener.accept().await?;
             trace!(client=%addr, "new connection");
 
-            let maybe_permit = if let Some(sem) = &self.conn_limit {
+            let (permit_opt, over_limit) = if let Some(sem) = &self.conn_limit {
                 match sem.clone().try_acquire_owned() {
-                    Ok(p) => Some(p),
-                    Err(_) => {
-                        warn!(client=%addr, "refusing connection: too many concurrent connections");
-                        let resp =
-                            Response::new(StatusCode::SERVICE_UNAVAILABLE, "Service Unavailable")
-                                .add_header("Connection", "close");
-
-                        match resp.to_raw() {
-                            Ok(bytes) => {
-                                if let Err(e) = socket.write_all(&bytes).await {
-                                    warn!(client=%addr, error=%e, "failed to send 503");
-                                } else {
-                                    let _ =
-                                        socket.set_linger(Some(std::time::Duration::from_secs(1)));
-
-                                    let mut tmp = [0u8; 1024];
-                                    loop {
-                                        match socket.try_read(&mut tmp) {
-                                            Ok(0) => break,
-                                            Ok(_n) => continue,
-                                            Err(ref e)
-                                                if e.kind() == std::io::ErrorKind::WouldBlock =>
-                                            {
-                                                break;
-                                            }
-                                            Err(_e) => break,
-                                        }
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                warn!(client=%addr, error=%e, "failed to serialize 503");
-                            }
-                        }
-                        continue;
-                    }
+                    Ok(p) => (Some(p), false),
+                    Err(_) => (None, true),
                 }
             } else {
-                None
+                (None, false)
             };
 
-            // Clone shared state into the task
             let routes = Arc::clone(&self.routes);
             let aliases = Arc::clone(&self.aliases);
             let default_service = self.default_service.clone();
             let advertised_max = self.advertised_max_conn;
 
+            #[cfg(feature = "tls-rustls")]
+            let tls = self.tls.clone();
+
             tokio::spawn(async move {
-                let _permit = maybe_permit;
+                let _permit = permit_opt;
+
+                if over_limit {
+                    let resp =
+                        Response::new(StatusCode::SERVICE_UNAVAILABLE, "Service Unavailable")
+                            .add_header("Connection", "close");
+                    match resp.to_raw() {
+                        Ok(bytes) => {
+                            #[cfg(feature = "tls-rustls")]
+                            {
+                                if let Some(acceptor) = tls {
+                                    match acceptor.accept(socket).await {
+                                        Ok(mut tls_stream) => {
+                                            let _ = tls_stream.write_all(&bytes).await;
+                                            let _ = tls_stream.shutdown().await;
+                                        }
+                                        Err(e) => {
+                                            warn!(client=%addr, error=%e, "TLS handshake failed on overload");
+                                        }
+                                    }
+                                    return;
+                                }
+                            }
+                            let mut sock = socket;
+                            if let Err(e) = sock.write_all(&bytes).await {
+                                warn!(client=%addr, error=%e, "failed to send 503");
+                            } else {
+                                let _ = sock.set_linger(Some(std::time::Duration::from_secs(1)));
+                                let mut tmp = [0u8; 1024];
+                                loop {
+                                    match sock.try_read(&mut tmp) {
+                                        Ok(0) => break,
+                                        Ok(_) => continue,
+                                        Err(ref e)
+                                            if e.kind() == std::io::ErrorKind::WouldBlock =>
+                                        {
+                                            break;
+                                        }
+                                        Err(_) => break,
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => warn!(client=%addr, error=%e, "failed to serialize 503"),
+                    }
+                    return;
+                }
+
+                #[cfg(feature = "tls-rustls")]
+                {
+                    if let Some(acceptor) = tls {
+                        match acceptor.accept(socket).await {
+                            Ok(stream) => {
+                                if let Err(e) = Self::handle_connection(
+                                    stream,
+                                    routes,
+                                    aliases,
+                                    default_service,
+                                    advertised_max,
+                                    addr,
+                                )
+                                .await
+                                {
+                                    error!(client=%addr, error=%e, "error handling TLS connection");
+                                }
+                            }
+                            Err(e) => {
+                                warn!(client=%addr, error=%e, "TLS handshake failed");
+                            }
+                        }
+                        return;
+                    }
+                }
+
+                // Plain TCP
                 if let Err(e) = Self::handle_connection(
                     socket,
                     routes,
                     aliases,
                     default_service,
                     advertised_max,
+                    addr,
                 )
                 .await
                 {
@@ -265,23 +312,44 @@ impl Server {
     ///
     /// Reads one full ICAP message (headers + chunked body if any), parses and dispatches it,
     /// writes the response, then repeats until the peer closes the connection.
-    async fn handle_connection(
-        mut socket: TcpStream,
+    /// Handle a single client connection (persistent / keep-alive).
+    ///
+    /// Reads one full ICAP message (headers + chunked body if any), parses and dispatches it,
+    /// writes the response, then repeats until the peer closes the connection.
+    async fn handle_connection<S>(
+        mut socket: S,
         routes: Arc<HashMap<String, RouteEntry>>,
         aliases: Arc<HashMap<String, String>>,
         default_service: Option<String>,
         advertised_max_conn: Option<usize>,
-    ) -> IcapResult<()> {
+        addr: std::net::SocketAddr,
+    ) -> IcapResult<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         let mut buf: Vec<u8> = Vec::with_capacity(16 * 1024);
         let mut tmp = [0u8; 8192];
 
         loop {
-            // === Read one full ICAP message (headers + maybe chunked body) ===
+            // === Read headers ===
             let h_end = loop {
                 if let Some(end) = find_double_crlf(&buf) {
                     break end;
                 }
-                let n = socket.read(&mut tmp).await?;
+
+                let n = match socket.read(&mut tmp).await {
+                    Ok(n) => n,
+                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                        // Нормальное завершение сессии на стадии ожидания следующего запроса.
+                        return if buf.is_empty() {
+                            Ok(())
+                        } else {
+                            Err("EOF before complete ICAP headers".into())
+                        };
+                    }
+                    Err(e) => return Err(e.into()),
+                };
+
                 if n == 0 {
                     return if buf.is_empty() {
                         Ok(())
@@ -297,7 +365,6 @@ impl Server {
             let enc = crate::parser::parse_encapsulated_header(hdr_text);
             let mut msg_end = h_end;
 
-            // If body is present, ensure we read the whole chunked body into buf
             if let Some(body_rel) = enc.req_body.or(enc.res_body) {
                 let body_abs = h_end + body_rel;
                 while buf.len() < body_abs {
@@ -310,24 +377,25 @@ impl Server {
                 msg_end = read_chunked_to_end(&mut socket, &mut buf, body_abs).await?;
             }
 
-            // === Parse request and route ===
+            // === Parse + route ===
             let req = parse_icap_request(&buf[..msg_end])?;
             let method = req.method;
             let raw_service: &str = req.service.rsplit('/').next().unwrap_or(&req.service);
-
             let service_resolved =
                 Self::resolve_service(raw_service, &aliases, default_service.as_deref());
-
-            trace!(method=?method, service=%service_resolved, "received request");
+            trace!(
+                client = %addr,
+                method = ?method,
+                service = %service_resolved,
+                "received request"
+            );
 
             let resp = if let Some(entry) = routes.get(service_resolved.as_ref()) {
                 match method {
                     Method::Options => {
-                        // Build per-request OPTIONS with dynamic ISTag
                         let mut allowed: SmallVec<Method, 2> =
                             entry.handlers.keys().copied().collect();
                         allowed.sort_unstable();
-
                         let mut cfg = if let Some(cfg) = &entry.options {
                             cfg.clone()
                         } else {
@@ -336,32 +404,25 @@ impl Server {
                                 .with_options_ttl(3600)
                                 .add_allow("204")
                         };
-
                         cfg.set_methods(allowed);
-
                         if cfg.service.is_none() {
                             cfg = cfg.with_service(&format!(
                                 "ICAP Service {}",
                                 service_resolved.as_ref()
                             ));
                         }
-
                         if let (Some(n), None) = (advertised_max_conn, cfg.max_connections) {
                             cfg.with_max_connections(n);
                         }
-
                         cfg.build_response_for(&req)
                     }
                     _ => {
-                        // --- RFC guard for 204 ---
-                        // If no Allow: 204 and no Preview -> MUST NOT return 204; echo original HTTP back with 200.
                         let allow_204 = req
                             .icap_headers
                             .get("Allow")
                             .and_then(|v| v.to_str().ok())
                             .map(|s| s.split(',').any(|t| t.trim() == "204"))
                             .unwrap_or(false);
-
                         let has_preview = req.icap_headers.get("Preview").is_some();
 
                         if !allow_204 && !has_preview {
@@ -370,28 +431,22 @@ impl Server {
                                 .as_ref()
                                 .map(|opts| opts.istag_for(&req))
                                 .unwrap_or_else(|| format!("{}-default-1.0", service_resolved));
-
                             let mut out =
                                 Response::new(StatusCode::OK, "OK").try_set_istag(&istag_now)?;
-
                             match (&req.embedded, method) {
                                 (Some(EmbeddedHttp::Resp(http_resp)), Method::RespMod) => {
-                                    out = out.with_http_response(http_resp)?;
+                                    out = out.with_http_response(http_resp)?
                                 }
                                 (Some(EmbeddedHttp::Req(http_req)), Method::ReqMod) => {
-                                    out = out.with_http_request(http_req)?;
+                                    out = out.with_http_request(http_req)?
                                 }
                                 _ => {}
                             }
-
                             out
+                        } else if let Some(h) = entry.handlers.get(&method) {
+                            h(req).await?
                         } else {
-                            // allowed to return 204 (either Allow: 204 present or Preview in use)
-                            if let Some(h) = entry.handlers.get(&method) {
-                                h(req).await?
-                            } else {
-                                Response::new(StatusCode::METHOD_NOT_ALLOWED, "Method Not Allowed")
-                            }
+                            Response::new(StatusCode::METHOD_NOT_ALLOWED, "Method Not Allowed")
                         }
                     }
                 }
@@ -402,28 +457,29 @@ impl Server {
                     &req,
                 )
             } else {
-                trace!(service=%service_resolved, "service not found");
+                trace!(client=%addr, service=%service_resolved, "service not found");
                 Response::new(StatusCode::NOT_FOUND, "Service Not Found")
             };
 
             let should_close = !matches!(resp.status_code, StatusCode::OK | StatusCode::NO_CONTENT);
-
             let resp = if should_close {
                 resp.add_header("Connection", "close")
             } else {
                 resp
             };
 
-            // === Write response ===
             let bytes = resp.to_raw()?;
             socket.write_all(&bytes).await?;
-            trace!("Response sent with status {}", resp.status_code);
+            trace!(
+                client = %addr,
+                "Response sent with status {}",
+                resp.status_code
+            );
 
             if should_close {
                 let _ = socket.shutdown().await;
                 return Ok(());
             }
-
             buf.drain(..msg_end);
         }
     }
@@ -446,6 +502,15 @@ impl Server {
     }
 }
 
+#[derive(Clone)]
+struct TlsParams {
+    cert_path: PathBuf,
+    key_path: PathBuf,
+    ca_path: Option<PathBuf>,
+    require_client_auth: bool,
+    alpn_icap: bool,
+}
+
 /// Builder for [`Server`].
 ///
 /// Construct with [`Server::builder`], register routes, then call [`ServerBuilder::build`].
@@ -458,18 +523,135 @@ pub struct ServerBuilder {
     max_connections_global: Option<usize>,
     aliases: HashMap<String, String>,
     default_service: Option<String>,
+    tls: Option<TlsParams>,
 }
 
 impl ServerBuilder {
-    /// Create a new builder.
-    pub fn new() -> Self {
-        Self {
-            bind_addr: None,
-            routes: HashMap::new(),
-            max_connections_global: None,
-            aliases: HashMap::new(),
-            default_service: None,
-        }
+    #[cfg(feature = "tls-rustls")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "tls-rustls")))]
+    /// Enables ICAPS (ICAP over TLS) using Rustls by loading the server certificate
+    /// chain and private key from PEM files.
+    ///
+    /// The TLS handshake is terminated inside the server via Rustls. By default,
+    /// the server advertises the `icap` ALPN identifier (clients that ignore ALPN
+    /// remain compatible). **Client authentication is not required**; for mTLS use
+    /// [`with_mtls_from_pem_files`].
+    ///
+    /// This method is only available when the `tls-rustls` feature is enabled.
+    ///
+    /// # Parameters
+    /// - `cert_pem`: Path to a PEM file containing the server certificate chain
+    ///   (leaf first, followed by intermediates if any).
+    /// - `key_pem`: Path to a PEM file containing the server’s private key
+    ///   (PKCS#8 or legacy RSA formats are supported).
+    ///
+    /// # Example
+    /// ```no_run
+    /// use icap_rs::{Server, Method, Request, Response};
+    /// use icap_rs::error::IcapResult;
+    /// use icap_rs::server::options::ServiceOptions;
+    ///
+    /// const ISTAG: &str = "scan-1.0";
+    ///
+    /// #[tokio::main]
+    /// async fn main() -> IcapResult<()> {
+    ///     let server = Server::builder()
+    ///         .bind("0.0.0.0:13443") // ICAPS port
+    ///         .with_tls_from_pem_files("certs/server.crt", "certs/server.key")
+    ///         .route(
+    ///             "test",
+    ///             [Method::ReqMod, Method::RespMod],
+    ///             |_req: Request| async move {
+    ///                 Ok(Response::no_content().try_set_istag(ISTAG)?)
+    ///             },
+    ///             Some(ServiceOptions::new()
+    ///                 .with_static_istag(ISTAG)
+    ///                 .with_preview(2048)
+    ///                 .add_allow("204")),
+    ///         )
+    ///         .build().await?;
+    ///
+    ///     server.run().await
+    /// }
+    /// ```
+    pub fn with_tls_from_pem_files(
+        mut self,
+        cert_pem: impl Into<PathBuf>,
+        key_pem: impl Into<PathBuf>,
+    ) -> Self {
+        self.tls = Some(TlsParams {
+            cert_path: cert_pem.into(),
+            key_path: key_pem.into(),
+            ca_path: None,
+            require_client_auth: false,
+            alpn_icap: true,
+        });
+        self
+    }
+
+    #[cfg(feature = "tls-rustls")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "tls-rustls")))]
+    /// Enables **mutual TLS (mTLS)** using Rustls: clients must present a certificate
+    /// that validates against the provided CA bundle.
+    ///
+    /// The server performs client-certificate validation using the given CA(s).
+    /// By default, the server advertises the `icap` ALPN identifier.
+    ///
+    /// This method is only available when the `tls-rustls` feature is enabled.
+    ///
+    /// # Parameters
+    /// - `cert_pem`: Path to the server certificate chain in PEM (leaf → intermediates).
+    /// - `key_pem`: Path to the server private key in PEM (PKCS#8 or RSA).
+    /// - `ca_pem`: Path to a PEM file containing one or more CA roots used to verify
+    ///   client certificates.
+    ///
+    /// # Example
+    /// ```no_run
+    /// use icap_rs::{Server, Method, Request, Response};
+    /// use icap_rs::error::IcapResult;
+    /// use icap_rs::server::options::ServiceOptions;
+    ///
+    /// const ISTAG: &str = "scan-1.0";
+    ///
+    /// #[tokio::main]
+    /// async fn main() -> IcapResult<()> {
+    ///     let server = Server::builder()
+    ///         .bind("0.0.0.0:13443")
+    ///         .with_mtls_from_pem_files(
+    ///             "certs/server.crt",
+    ///             "certs/server.key",
+    ///             "certs/ca.pem", // trusted CA(s) for client-auth verification
+    ///         )
+    ///         .route(
+    ///             "scan",
+    ///             [Method::ReqMod, Method::RespMod],
+    ///             |_req: Request| async move {
+    ///                 Ok(Response::no_content().try_set_istag(ISTAG)?)
+    ///             },
+    ///             Some(ServiceOptions::new()
+    ///                 .with_static_istag(ISTAG)
+    ///                 .with_preview(2048)
+    ///                 .add_allow("204")),
+    ///         )
+    ///         .build().await?;
+    ///
+    ///     server.run().await
+    /// }
+    /// ```
+    pub fn with_mtls_from_pem_files(
+        mut self,
+        cert_pem: impl Into<PathBuf>,
+        key_pem: impl Into<PathBuf>,
+        ca_pem: impl Into<PathBuf>,
+    ) -> Self {
+        self.tls = Some(TlsParams {
+            cert_path: cert_pem.into(),
+            key_path: key_pem.into(),
+            ca_path: Some(ca_pem.into()),
+            require_client_auth: true,
+            alpn_icap: true,
+        });
+        self
     }
 
     /// Set the bind address, e.g. `"127.0.0.1:1344"`.
@@ -626,6 +808,21 @@ impl ServerBuilder {
             .map(|n| Arc::new(Semaphore::new(n)));
         let advertised_max_conn = self.max_connections_global;
 
+        // TLS (only when feature is enabled)
+        #[cfg(feature = "tls-rustls")]
+        let tls_acceptor: Option<TlsAcceptor> = if let Some(tls) = &self.tls {
+            Some(load_rustls_acceptor(tls)?)
+        } else {
+            None
+        };
+
+        #[cfg(not(feature = "tls-rustls"))]
+        {
+            if self.tls.is_some() {
+                return Err("This build has no TLS support. Enable feature `tls-rustls`.".into());
+            }
+        }
+
         Ok(Server {
             listener,
             routes: Arc::new(self.routes),
@@ -633,13 +830,127 @@ impl ServerBuilder {
             advertised_max_conn,
             aliases: Arc::new(self.aliases),
             default_service: self.default_service,
+
+            #[cfg(feature = "tls-rustls")]
+            tls: tls_acceptor,
         })
     }
 }
 
+#[cfg(any(feature = "tls-rustls-ring", feature = "tls-rustls-aws-lc"))]
+fn install_rustls_provider_once() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        #[cfg(feature = "tls-rustls-ring")]
+        {
+            rustls::crypto::ring::default_provider()
+                .install_default()
+                .expect("install ring crypto provider");
+        }
+        #[cfg(all(feature = "tls-rustls-aws-lc", not(feature = "tls-rustls-ring")))]
+        {
+            rustls::crypto::aws_lc_rs::default_provider()
+                .install_default()
+                .expect("install aws-lc-rs crypto provider");
+        }
+    });
+}
+
+#[cfg(feature = "tls-rustls")]
+fn load_rustls_acceptor(tls: &TlsParams) -> Result<TlsAcceptor, String> {
+    // Ensure a crypto provider is installed (rustls 0.23 requirement)
+    #[cfg(any(feature = "tls-rustls-ring", feature = "tls-rustls-aws-lc"))]
+    install_rustls_provider_once();
+
+    use std::io::BufReader;
+
+    // Certificates
+    let mut cert_r = BufReader::new(
+        std::fs::File::open(&tls.cert_path).map_err(|e| format!("TLS: open cert: {e}"))?,
+    );
+    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_r)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("TLS: parse certs: {e}"))?;
+
+    // Private key: try PKCS#8 first, then RSA
+    let mut key_r = BufReader::new(
+        std::fs::File::open(&tls.key_path).map_err(|e| format!("TLS: open key: {e}"))?,
+    );
+
+    let mut keys: Vec<PrivateKeyDer<'static>> = rustls_pemfile::pkcs8_private_keys(&mut key_r)
+        .map(|res| res.map(Into::into))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("TLS: parse pkcs8 key: {e}"))?;
+
+    if keys.is_empty() {
+        let mut key_r = BufReader::new(
+            std::fs::File::open(&tls.key_path)
+                .map_err(|e| format!("TLS: reopen key (rsa): {e}"))?,
+        );
+        keys = rustls_pemfile::rsa_private_keys(&mut key_r)
+            .map(|res| res.map(Into::into))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("TLS: parse rsa key: {e}"))?;
+    }
+    let key = keys.into_iter().next().ok_or("TLS: no private key found")?;
+
+    // Server config (+ optional mTLS)
+    let server_config = if tls.require_client_auth {
+        // Load client CA(s)
+        let ca_path = tls
+            .ca_path
+            .clone()
+            .ok_or("TLS: ca_pem path is required for mTLS")?;
+        let mut ca_r = BufReader::new(
+            std::fs::File::open(&ca_path).map_err(|e| format!("TLS: open ca: {e}"))?,
+        );
+        let cas: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut ca_r)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("TLS: parse ca: {e}"))?;
+
+        let mut roots = RootCertStore::empty();
+        for c in cas {
+            roots.add(c).map_err(|e| format!("TLS: add CA: {e}"))?;
+        }
+
+        let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+            .build()
+            .map_err(|e| format!("TLS: build client verifier: {e}"))?;
+
+        let mut cfg = ServerConfig::builder()
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(certs, key)
+            .map_err(|e| format!("TLS: build server config (mtls): {e}"))?;
+
+        if tls.alpn_icap {
+            cfg.alpn_protocols.push(b"icap".to_vec());
+        }
+        cfg
+    } else {
+        let mut cfg = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .map_err(|e| format!("TLS: build server config: {e}"))?;
+        if tls.alpn_icap {
+            cfg.alpn_protocols.push(b"icap".to_vec());
+        }
+        cfg
+    };
+
+    Ok(TlsAcceptor::from(Arc::new(server_config)))
+}
+
 impl Default for ServerBuilder {
     fn default() -> Self {
-        Self::new()
+        Self {
+            bind_addr: None,
+            routes: HashMap::new(),
+            max_connections_global: None,
+            aliases: HashMap::new(),
+            default_service: None,
+            tls: None,
+        }
     }
 }
 
