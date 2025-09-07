@@ -61,7 +61,7 @@ pub fn cli_styles() -> clap::builder::Styles {
 #[derive(ValueEnum, Clone, Debug)]
 enum TlsBackendCli {
     Rustls,
-    Openssl,
+    //Openssl,
 }
 
 #[derive(Parser, Debug)]
@@ -242,18 +242,17 @@ async fn main() -> IcapResult<()> {
                         eprintln!("This binary was built without feature `tls-rustls`");
                         std::process::exit(2);
                     }
-                }
-                TlsBackendCli::Openssl => {
-                    #[cfg(feature = "tls-openssl")]
-                    {
-                        builder = builder.use_openssl();
-                    }
-                    #[cfg(not(feature = "tls-openssl"))]
-                    {
-                        eprintln!("This binary was built without feature `tls-openssl`");
-                        std::process::exit(2);
-                    }
-                }
+                } // TlsBackendCli::Openssl => {
+                  //     #[cfg(feature = "tls-openssl")]
+                  //     {
+                  //         builder = builder.use_openssl();
+                  //     }
+                  //     #[cfg(not(feature = "tls-openssl"))]
+                  //     {
+                  //         eprintln!("This binary was built without feature `tls-openssl`");
+                  //         std::process::exit(2);
+                  //     }
+                  // }
             }
         } else {
             eprintln!("Note: --tls-backend is ignored for icap:// (use icaps:// to enable TLS).");
