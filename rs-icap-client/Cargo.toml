@@ -10,7 +10,7 @@ license = "MIT"
 default = ["tls-rustls"]
 
 tls-rustls = ["icap-rs/tls-rustls"]
-tls-openssl = ["icap-rs/tls-openssl"]
+#tls-openssl = ["icap-rs/tls-openssl"]
 #tls-openssl-vendored = ["icap-rs/tls-openssl-vendored"]
 
 [dependencies]
