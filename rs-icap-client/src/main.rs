@@ -226,7 +226,7 @@ async fn main() -> IcapResult<()> {
         icap_rs::LIB_VERSION
     );
 
-    let mut builder = Client::builder().from_uri(&args.uri)?;
+    let mut builder = Client::builder().with_uri(&args.uri)?;
     let is_tls_uri = args.uri.starts_with("icaps://");
 
     if let Some(be) = &args.tls_backend {

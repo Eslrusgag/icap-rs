@@ -18,7 +18,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Build ICAP client with explicit settings
     let mut builder = Client::builder()
-        .from_uri(URI)?
+        .with_uri(URI)?
         .keep_alive(true)
         .user_agent("ICAP-Client/1.0")
         .sni_hostname(SNI);

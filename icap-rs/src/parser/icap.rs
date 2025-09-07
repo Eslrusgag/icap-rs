@@ -95,7 +95,6 @@ pub fn http_version_str(v: Version) -> &'static str {
 // }
 
 pub fn serialize_icap_response(resp: &Response) -> IcapResult<Vec<u8>> {
-    // Status line
     let mut head = String::new();
     write!(
         &mut head,
@@ -105,8 +104,6 @@ pub fn serialize_icap_response(resp: &Response) -> IcapResult<Vec<u8>> {
         resp.status_text
     )
     .unwrap();
-
-    // Canonicalize header names on output
     for (name, value) in resp.headers.iter() {
         let canon = canon_icap_header(name.as_str());
         write!(
@@ -120,7 +117,6 @@ pub fn serialize_icap_response(resp: &Response) -> IcapResult<Vec<u8>> {
     head.push_str("\r\n");
 
     let mut out = head.into_bytes();
-
     if resp.body.is_empty() {
         return Ok(out);
     }
@@ -132,28 +128,17 @@ pub fn serialize_icap_response(resp: &Response) -> IcapResult<Vec<u8>> {
         .map(|s| s.to_ascii_lowercase())
         .unwrap_or_default();
 
-    let is_http_embedded = encapsulated.contains("req-hdr=") || encapsulated.contains("res-hdr=");
+    let is_embedded_http = encapsulated.contains("req-hdr=") || encapsulated.contains("res-hdr=");
 
-    if is_http_embedded && let Some(pos) = resp.body.windows(4).position(|w| w == b"\r\n\r\n") {
-        let http_hdr_end = pos + 4;
-
-        // 1) raw HTTP headers
-        out.extend_from_slice(&resp.body[..http_hdr_end]);
-
-        // 2) HTTP body → ICAP chunked
-        let http_body = &resp.body[http_hdr_end..];
-        if !http_body.is_empty() {
-            let size_line = format!("{:X}\r\n", http_body.len());
-            out.extend_from_slice(size_line.as_bytes());
-            out.extend_from_slice(http_body);
-            out.extend_from_slice(b"\r\n0\r\n\r\n");
-        } else {
-            out.extend_from_slice(b"0\r\n\r\n");
-        }
+    if is_embedded_http {
+        out.extend_from_slice(&resp.body);
         return Ok(out);
     }
 
+    let size_line = format!("{:X}\r\n", resp.body.len());
+    out.extend_from_slice(size_line.as_bytes());
     out.extend_from_slice(&resp.body);
+    out.extend_from_slice(b"\r\n0\r\n\r\n");
     Ok(out)
 }
 

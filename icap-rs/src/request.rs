@@ -1,15 +1,19 @@
 //! ICAP request types and helpers.
 //!
 //! This module defines:
-//! - [`EmbeddedHttp`]: an enum for embedded HTTP messages (request/response).
-//! - [`Request`]: the single, public ICAP request type used by the client.
+//! - [`Body`]: a generic HTTP body container used for embedded HTTP messages.
+//! - [`EmbeddedHttp`]: an enum for embedded HTTP messages (request/response) that
+//!   always carries `head` and `body` together.
+//! - [`Request<R>`]: a single, public ICAP request type used by both **client** and
+//!   **server**, parameterized by the body carrier `R`.
+//! ## Preview (server-side)
+//! When the server receives a Preview (`Preview: N`), it should construct
+//! `EmbeddedHttp<BodyRead>` with `Body::Preview { bytes, ieof, remainder }`.
+//! Calling `Body<BodyRead>::ensure_full()` will (lazily) send `ICAP/1.0 100 Continue`
+//! if needed and convert the body to `Body::Full`, returning a unified reader that
+//! yields `preview-bytes` followed by the remainder stream.
 //!
-//! The [`Request`] type is used by `icap_rs::Client` to build and send ICAP
-//! messages (`OPTIONS`, `REQMOD`, `RESPMOD`), including Preview negotiation
-//! and optional fast-204 (`ieof`) hints. Attach embedded HTTP via
-//! [`Request::with_http_request`] / [`Request::with_http_response`].
-//!
-//! # Example (REQMOD with embedded HTTP request)
+//! ## Example (client: REQMOD with an embedded HTTP request)
 //! ```rust
 //! use http::Request as HttpRequest;
 //! use icap_rs::{Method, Request};
@@ -21,20 +25,34 @@
 //!     .body(Vec::new())
 //!     .unwrap();
 //!
-//! let icap_req = Request::reqmod("icap/test")
+//! let icap_req: Request = Request::reqmod("icap/test")
 //!     .allow_204()
 //!     .preview(4)
 //!     .with_http_request(http_req);
 //!
-//!assert_eq!(icap_req.method, Method::ReqMod);
+//! assert_eq!(icap_req.method, Method::ReqMod);
 //! assert!(icap_req.allow_204);
 //! assert_eq!(icap_req.preview_size, Some(4));
+//! ```
+//!
+//! ## Example (server: lazy continue)
+//! ```ignore
+//! // server handler (pseudocode):
+//! async fn handle(mut req: Request<BodyRead>) -> IcapResult<Response> {
+//!     if let Some(EmbeddedHttp::Resp { head: _, body }) = &mut req.embedded {
+//!         // Decide on preview; if more bytes are needed:
+//!         let _reader = body.ensure_full().await?; // sends 100 Continue if required
+//!         // ...read/process...
+//!     }
+//!     Ok(Response::no_content())
+//! }
 //! ```
 
 use crate::ICAP_VERSION;
 use crate::error::{Error, IcapResult};
 use crate::parser::icap::find_double_crlf;
 use crate::parser::{serialize_http_request, serialize_http_response, split_http_bytes};
+use bytes::Bytes;
 use http::{
     HeaderMap, HeaderName, HeaderValue, Request as HttpRequest, Response as HttpResponse,
     StatusCode as HttpStatus, Version,
@@ -42,8 +60,13 @@ use http::{
 use memchr::memchr;
 use memchr::memmem;
 use std::fmt;
+use std::future::Future;
 use std::str::FromStr;
 use tracing::trace;
+
+use std::io::Read as _;
+use std::pin::Pin;
+use tokio::io::AsyncRead;
 
 /// ICAP protocol methods recognized by the server/router.
 ///
@@ -52,20 +75,16 @@ use tracing::trace;
 ///
 /// ### Methods
 /// - **REQMOD** — *Request modification*: the ICAP client (usually a proxy)
-///   sends an embedded HTTP **request** to be adapted. Typical uses:
-///   URL/category filtering, DLP on outbound requests, antivirus before fetching
-///   the origin response, header normalization/enrichment.
+///   sends an embedded HTTP **request** to be adapted.
 /// - **RESPMOD** — *Response modification*: the ICAP client sends an embedded
-///   HTTP **response** to be adapted. Typical uses: antivirus scanning of
-///   downloaded content, content rewriting, compliance filtering, response
-///   header/body adjustments.
+///   HTTP **response** to be adapted.
 /// - **OPTIONS** — *Capability discovery*: clients learn which methods and
 ///   features a service supports. **Handled automatically** by the server; do
 ///   not register a handler for `OPTIONS`.
 ///
 /// ### Conversions
 /// `Method` implements `From<&str>` / `From<String>` so you can pass
-/// Passing `"OPTIONS"` or an unknown string will **panic**.
+/// strings in a builder-style API. Passing an unknown string will **panic**.
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, Ord, PartialOrd)]
 pub enum Method {
     /// Request modification (`REQMOD`).
@@ -130,28 +149,268 @@ impl From<String> for Method {
     }
 }
 
-/// Embedded HTTP message inside an ICAP request.
-#[derive(Debug, Clone)]
-pub enum EmbeddedHttp {
-    /// Embedded HTTP request (typical for `REQMOD`).
-    Req(HttpRequest<Vec<u8>>),
-    /// Embedded HTTP response (typical for `RESPMOD`).
-    Resp(HttpResponse<Vec<u8>>),
+type BoxedUnitFut = Pin<Box<dyn Future<Output = IcapResult<()>> + Send>>;
+
+/// A one-shot handle to send `ICAP/1.0 100 Continue` when the handler decides
+/// to read past the preview boundary (server-side only).
+pub struct ContinueHandle {
+    send: Option<Box<dyn FnOnce() -> BoxedUnitFut + Send>>,
 }
 
-pub(crate) fn serialize_embedded_http(e: &EmbeddedHttp) -> (Vec<u8>, Option<Vec<u8>>) {
-    match e {
-        EmbeddedHttp::Req(r) => split_http_bytes(&serialize_http_request(r)),
-        EmbeddedHttp::Resp(r) => split_http_bytes(&serialize_http_response(r)),
+impl ContinueHandle {
+    pub fn new<F, Fut>(f: F) -> Self
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = IcapResult<()>> + Send + 'static,
+    {
+        Self {
+            send: Some(Box::new(move || Box::pin(f()))),
+        }
+    }
+
+    pub async fn send_100_continue(&mut self) -> IcapResult<()> {
+        if let Some(f) = self.send.take() {
+            f().await
+        } else {
+            Ok(())
+        }
     }
 }
 
-/// Single public ICAP request type used by the client.
+/// The remainder of an HTTP body after the preview boundary.
+///
+/// `cont` is present only when `ieof=false` (i.e., more data exists and
+/// requires a `100 Continue` before the client sends it).
+pub struct Remainder<R> {
+    reader: R,
+    cont: Option<ContinueHandle>,
+}
+
+impl<R> Remainder<R> {
+    pub fn new(reader: R, cont: Option<ContinueHandle>) -> Self {
+        Self { reader, cont }
+    }
+    pub async fn continue_if_needed(&mut self) -> IcapResult<()> {
+        if let Some(mut c) = self.cont.take() {
+            c.send_100_continue().await
+        } else {
+            Ok(())
+        }
+    }
+    pub fn take_reader(self) -> R {
+        self.reader
+    }
+}
+
+impl<R> fmt::Debug for Remainder<R> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Remainder")
+            .field("cont_present", &self.cont.is_some())
+            .finish()
+    }
+}
+
+/// Generic HTTP body used inside `EmbeddedHttp<R>`.
+///
+/// - `Empty` — no body (e.g., GET without payload, or OPTIONS).
+/// - `Preview` — the first `N` bytes are available in `bytes`, followed by the
+///   `remainder` stream. `ieof=true` indicates the whole body already fits into
+///   the preview and no `100 Continue` is needed.
+/// - `Full` — the complete body is available via `reader`.
+pub enum Body<R> {
+    Empty,
+    Preview {
+        bytes: Bytes,
+        ieof: bool,
+        remainder: Remainder<R>,
+    },
+    Full {
+        reader: R,
+    },
+}
+
+impl<R> fmt::Debug for Body<R> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Body::Empty => f.write_str("Body::Empty"),
+            Body::Full { .. } => f.write_str("Body::Full"),
+            Body::Preview {
+                bytes,
+                ieof,
+                remainder,
+            } => f
+                .debug_struct("Body::Preview")
+                .field("bytes_len", &bytes.len())
+                .field("ieof", ieof)
+                .field("remainder", remainder)
+                .finish(),
+        }
+    }
+}
+
+/// Trait-object body reader used by the server side for streaming.
+pub type BodyRead = Box<dyn AsyncRead + Unpin + Send>;
+
+/// An in-memory, non-blocking reader over bytes (used to feed preview bytes into AsyncRead).
+struct CursorReader<T>(std::io::Cursor<T>);
+
+impl<T: AsRef<[u8]> + Unpin> AsyncRead for CursorReader<T> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let mut tmp = [0u8; 8192];
+        let want = buf.remaining().min(tmp.len());
+        match self.0.read(&mut tmp[..want]) {
+            Ok(n) => {
+                if n > 0 {
+                    buf.put_slice(&tmp[..n]);
+                }
+                std::task::Poll::Ready(Ok(()))
+            }
+            Err(e) => std::task::Poll::Ready(Err(e)),
+        }
+    }
+}
+impl Body<BodyRead> {
+    /// Ensure a full stream is available.
+    ///
+    /// If the body is currently `Preview { .. }` and `ieof=false`, this will
+    /// send `ICAP/1.0 100 Continue` **exactly once**, then convert the body into
+    /// `Full { reader }` where `reader` yields `preview-bytes` followed by the
+    /// remainder stream.
+    /// Ensure a full stream is available (SAFE version, no `unsafe`).
+    pub async fn ensure_full(&mut self) -> IcapResult<&mut (dyn AsyncRead + Unpin + Send)> {
+        struct Concat<A, B>(Option<A>, B);
+
+        impl<A: AsyncRead + Unpin, B: AsyncRead + Unpin> AsyncRead for Concat<A, B> {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+                buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                if let Some(a) = self.0.as_mut() {
+                    let mut tmp = [0u8; 8192];
+                    let want = buf.remaining().min(tmp.len());
+                    let mut sub = tokio::io::ReadBuf::new(&mut tmp[..want]);
+
+                    match std::pin::Pin::new(a).poll_read(cx, &mut sub) {
+                        std::task::Poll::Pending => return std::task::Poll::Pending,
+                        std::task::Poll::Ready(Err(e)) => return std::task::Poll::Ready(Err(e)),
+                        std::task::Poll::Ready(Ok(())) => {
+                            let n = sub.filled().len();
+                            if n > 0 {
+                                buf.put_slice(sub.filled());
+                                return std::task::Poll::Ready(Ok(()));
+                            }
+                            self.0 = None;
+                        }
+                    }
+                }
+
+                std::pin::Pin::new(&mut self.1).poll_read(cx, buf)
+            }
+        }
+
+        match self {
+            Body::Empty => Err("no body".into()),
+            Body::Full { reader } => Ok(reader.as_mut()),
+            Body::Preview {
+                bytes,
+                ieof,
+                remainder,
+            } => {
+                if !*ieof {
+                    remainder.continue_if_needed().await?;
+                }
+
+                let preview_reader: BodyRead =
+                    Box::new(CursorReader(std::io::Cursor::new(std::mem::take(bytes))));
+
+                let rem = std::mem::replace(
+                    remainder,
+                    Remainder::new(Box::new(tokio::io::empty()), None),
+                );
+                let tail = rem.take_reader();
+
+                let concat: BodyRead = Box::new(Concat(Some(preview_reader), tail));
+                *self = Body::Full { reader: concat };
+
+                match self {
+                    Body::Full { reader } => Ok(reader.as_mut()),
+                    _ => unreachable!(),
+                }
+            }
+        }
+    }
+}
+
+/// Embedded HTTP message inside an ICAP request.
+///
+/// Stores HTTP **head** and **body** together to avoid duplication.
+#[derive(Debug)]
+pub enum EmbeddedHttp<R> {
+    /// Embedded HTTP request (typical for `REQMOD`).
+    Req {
+        head: HttpRequest<()>,
+        body: Body<R>,
+    },
+    /// Embedded HTTP response (typical for `RESPMOD`).
+    Resp {
+        head: HttpResponse<()>,
+        body: Body<R>,
+    },
+}
+
+/// Serialize embedded HTTP (client-side).
+///
+/// Returns `(bytes_of_http_head, optional_http_body_bytes)`.
+pub(crate) fn serialize_embedded_http(e: &EmbeddedHttp<Vec<u8>>) -> (Vec<u8>, Option<Vec<u8>>) {
+    match e {
+        EmbeddedHttp::Req { head, body } => {
+            // Rebuild http::Request<Vec<u8>> for serializer
+            let mut builder = HttpRequest::builder()
+                .method(head.method().clone())
+                .uri(head.uri().clone())
+                .version(head.version());
+            {
+                let headers_mut = builder.headers_mut().expect("headers_mut");
+                headers_mut.extend(head.headers().clone());
+            }
+            let body_bytes = match body {
+                Body::Empty => Vec::new(),
+                Body::Full { reader } => reader.clone(),
+                Body::Preview { .. } => Vec::new(), // client shouldn't serialize Preview
+            };
+            let req = builder.body(body_bytes).expect("build request");
+            split_http_bytes(&serialize_http_request(&req))
+        }
+        EmbeddedHttp::Resp { head, body } => {
+            let mut builder = HttpResponse::builder()
+                .status(head.status())
+                .version(head.version());
+            {
+                let headers_mut = builder.headers_mut().expect("headers_mut");
+                headers_mut.extend(head.headers().clone());
+            }
+            let body_bytes = match body {
+                Body::Empty => Vec::new(),
+                Body::Full { reader } => reader.clone(),
+                Body::Preview { .. } => Vec::new(),
+            };
+            let resp = builder.body(body_bytes).expect("build response");
+            split_http_bytes(&serialize_http_response(&resp))
+        }
+    }
+}
+
+/// Single public ICAP request type used by both client and server.
 ///
 /// This structure carries ICAP method/service and flags that influence how
 /// the request is serialized on the wire (Preview, Allow: 204/206, ieof).
-#[derive(Debug, Clone)]
-pub struct Request {
+#[derive(Debug)]
+pub struct Request<R = Vec<u8>> {
     /// ICAP method: `"OPTIONS" | "REQMOD" | "RESPMOD"`.
     pub method: Method,
     /// Service path like `"icap/test"` or `"respmod"`. Leading slash is allowed.
@@ -159,7 +418,7 @@ pub struct Request {
     /// ICAP headers (case-insensitive).
     pub icap_headers: HeaderMap,
     /// Optional embedded HTTP message (request/response).
-    pub embedded: Option<EmbeddedHttp>,
+    pub embedded: Option<EmbeddedHttp<R>>,
     /// `Preview: n` (if set).
     pub preview_size: Option<usize>,
     /// Whether `Allow: 204` should be advertised.
@@ -170,7 +429,7 @@ pub struct Request {
     pub preview_ieof: bool,
 }
 
-impl Request {
+impl<R> Request<R> {
     /// Create a new ICAP request.
     pub fn new<M: Into<Method>>(method: M, service: impl Into<String>) -> Self {
         Self {
@@ -185,15 +444,15 @@ impl Request {
         }
     }
 
-    ///Construct Options Request.
+    /// Construct `OPTIONS` request.
     pub fn options(service: impl Into<String>) -> Self {
         Self::new(Method::Options, service)
     }
-    ///Construct ReqMod Request.
+    /// Construct `REQMOD` request.
     pub fn reqmod(service: impl Into<String>) -> Self {
         Self::new(Method::ReqMod, service)
     }
-    ///Construct RespMod Request.
+    /// Construct `RESPMOD` request.
     pub fn respmod(service: impl Into<String>) -> Self {
         Self::new(Method::RespMod, service)
     }
@@ -216,7 +475,7 @@ impl Request {
         self
     }
 
-    /// Advertise Allow: 204/206.
+    /// Advertise `Allow: 204` / `Allow: 206`.
     pub fn allow_204(mut self) -> Self {
         self.allow_204 = true;
         self
@@ -226,24 +485,40 @@ impl Request {
         self
     }
 
-    /// True for REQMOD/RESPMOD.
+    /// True for `REQMOD`/`RESPMOD`.
     #[inline]
     pub fn is_mod(&self) -> bool {
         matches!(self.method, Method::ReqMod | Method::RespMod)
     }
+}
 
-    /// Attach embedded HTTP.
+/// Client-side convenience: attach embedded HTTP with **owned bytes**.
+impl Request<Vec<u8>> {
     pub fn with_http_request(mut self, req: HttpRequest<Vec<u8>>) -> Self {
-        self.embedded = Some(EmbeddedHttp::Req(req));
+        let (parts, body) = req.into_parts();
+        let head = HttpRequest::from_parts(parts, ());
+        self.embedded = Some(EmbeddedHttp::Req {
+            head,
+            body: Body::Full { reader: body },
+        });
         self
     }
     pub fn with_http_response(mut self, resp: HttpResponse<Vec<u8>>) -> Self {
-        self.embedded = Some(EmbeddedHttp::Resp(resp));
+        let (parts, body) = resp.into_parts();
+        let head = HttpResponse::from_parts(parts, ());
+        self.embedded = Some(EmbeddedHttp::Resp {
+            head,
+            body: Body::Full { reader: body },
+        });
         self
     }
 }
 
-pub(crate) fn parse_icap_request(data: &[u8]) -> IcapResult<Request> {
+/// Parse ICAP request from bytes (used in tests and simple flows).
+///
+/// Note: this parser constructs `Request<Vec<u8>>`, i.e. a fully buffered
+/// embedded HTTP body when present.
+pub(crate) fn parse_icap_request(data: &[u8]) -> IcapResult<Request<Vec<u8>>> {
     trace!("parse_icap_request: len={}", data.len());
     let hdr_end = find_double_crlf(data).ok_or("ICAP request headers not complete")?;
     let head = &data[..hdr_end];
@@ -362,10 +637,13 @@ pub(crate) fn parse_icap_request(data: &[u8]) -> IcapResult<Request> {
                     .ok_or("response builder: headers_mut is None")?;
                 headers_mut.extend(http_headers);
             }
-            let resp = builder
-                .body(body)
-                .map_err(|e| format!("build http::Response: {e}"))?;
-            Some(EmbeddedHttp::Resp(resp))
+            let head = builder
+                .body(())
+                .map_err(|e| format!("build http::Response head: {e}"))?;
+            Some(EmbeddedHttp::Resp {
+                head,
+                body: Body::Full { reader: body },
+            })
         } else {
             // HTTP Request
             let mut p = start.split_whitespace();
@@ -398,10 +676,13 @@ pub(crate) fn parse_icap_request(data: &[u8]) -> IcapResult<Request> {
                     .ok_or("request builder: headers_mut is None")?;
                 headers_mut.extend(http_headers);
             }
-            let req = builder
-                .body(body)
-                .map_err(|e| format!("build http::Request: {e}"))?;
-            Some(EmbeddedHttp::Req(req))
+            let head = builder
+                .body(())
+                .map_err(|e| format!("build http::Request head: {e}"))?;
+            Some(EmbeddedHttp::Req {
+                head,
+                body: Body::Full { reader: body },
+            })
         }
     } else {
         None
@@ -423,8 +704,8 @@ pub(crate) fn parse_icap_request(data: &[u8]) -> IcapResult<Request> {
 mod tests {
     use super::*;
     use http::{
-        HeaderValue, Request as HttpRequest, Response as HttpResponse, StatusCode as HttpStatus,
-        Version,
+        HeaderValue, Method as HttpMethod, Request as HttpRequest, Response as HttpResponse,
+        StatusCode as HttpStatus, Version,
     };
     use rstest::rstest;
 
@@ -449,23 +730,23 @@ mod tests {
 
     #[test]
     fn builder_creates_basic_requests() {
-        let o = Request::options("icap/test");
+        let o: Request = Request::options("icap/test");
         assert_eq!(o.method, Method::Options);
         assert_eq!(o.service, "icap/test");
         assert!(!o.is_mod());
 
-        let r = Request::reqmod("svc");
+        let r: Request = Request::reqmod("svc");
         assert_eq!(r.method, Method::ReqMod);
         assert!(r.is_mod());
 
-        let s = Request::respmod("svc");
+        let s: Request = Request::respmod("svc");
         assert_eq!(s.method, Method::RespMod);
         assert!(s.is_mod());
     }
 
     #[test]
     fn builder_flags_preview_allow() {
-        let req = Request::reqmod("icap/test")
+        let req: Request = Request::reqmod("icap/test")
             .allow_204()
             .allow_206()
             .preview(16)
@@ -479,7 +760,7 @@ mod tests {
 
     #[test]
     fn builder_sets_and_overrides_headers() {
-        let req = Request::options("icap/test")
+        let req: Request = Request::options("icap/test")
             .icap_header("Host", "icap.example.org")
             .icap_header("Host", "icap2.example.org");
 
@@ -498,8 +779,8 @@ mod tests {
             .body(Vec::<u8>::new())
             .unwrap();
 
-        let req = Request::reqmod("svc").with_http_request(http_req);
-        matches!(req.embedded, Some(EmbeddedHttp::Req(_)));
+        let req: Request = Request::reqmod("svc").with_http_request(http_req);
+        assert!(matches!(req.embedded, Some(EmbeddedHttp::Req { .. })));
 
         let http_resp = HttpResponse::builder()
             .status(HttpStatus::OK)
@@ -507,8 +788,8 @@ mod tests {
             .body(Vec::<u8>::new())
             .unwrap();
 
-        let req2 = Request::respmod("svc").with_http_response(http_resp);
-        matches!(req2.embedded, Some(EmbeddedHttp::Resp(_)));
+        let req2: Request = Request::respmod("svc").with_http_response(http_resp);
+        assert!(matches!(req2.embedded, Some(EmbeddedHttp::Resp { .. })));
     }
 
     // ---------- Version & framing ----------
@@ -650,14 +931,17 @@ mod tests {
         );
         let r = parse_icap_request(&raw).expect("parse");
         match r.embedded {
-            Some(EmbeddedHttp::Req(ref req)) => {
-                assert_eq!(req.method(), "GET");
-                assert_eq!(req.uri(), "/");
+            Some(EmbeddedHttp::Req { ref head, ref body }) => {
+                assert_eq!(head.method(), &HttpMethod::GET);
+                assert_eq!(head.uri(), "/");
                 assert_eq!(
-                    req.headers().get("Host").unwrap(),
+                    head.headers().get("Host").unwrap(),
                     &HeaderValue::from_static("example.com")
                 );
-                assert_eq!(req.body(), b"body...");
+                match body {
+                    Body::Full { reader } => assert_eq!(reader, b"body..."),
+                    _ => panic!("expected Full body"),
+                }
             }
             _ => panic!("expected embedded HTTP request"),
         }
@@ -695,7 +979,6 @@ mod rfc_tests {
     //! - Embedded HTTP request/response extraction
     //! - Case-insensitive headers
     //! - Request-line/headers framing errors
-
     use super::*;
     use http::{HeaderValue, StatusCode as HttpStatus};
 
@@ -713,7 +996,6 @@ mod rfc_tests {
     #[test]
     #[should_panic(expected = "Unknown ICAP method string")]
     fn method_from_str_unknown_panics() {
-        // By contract, unknown methods are a programmer error in this crate.
         let _ = Method::from("PATCH");
     }
 
@@ -737,6 +1019,7 @@ mod rfc_tests {
         let r2 = parse_icap_request(&raw2).expect("parse");
         assert_eq!(r2.service, "respmod");
     }
+
     #[test]
     fn headers_are_case_insensitive_allow_parsed_with_whitespace() {
         let raw = icap_bytes(
@@ -757,11 +1040,11 @@ mod rfc_tests {
 
     #[test]
     fn preview_zero_does_not_imply_ieof() {
-        let r = Request::reqmod("svc").preview(0);
+        let r: Request = Request::reqmod("svc").preview(0);
         assert_eq!(r.preview_size, Some(0));
         assert!(!r.preview_ieof);
 
-        let r2 = Request::reqmod("svc").preview(0).preview_ieof();
+        let r2: Request = Request::reqmod("svc").preview(0).preview_ieof();
         assert_eq!(r2.preview_size, Some(0));
         assert!(r2.preview_ieof);
     }
@@ -792,10 +1075,13 @@ mod rfc_tests {
         );
         let r = parse_icap_request(&raw).expect("parse");
         match r.embedded {
-            Some(EmbeddedHttp::Resp(ref resp)) => {
-                assert_eq!(resp.status(), HttpStatus::OK);
-                assert_eq!(resp.headers().get("Content-Length").unwrap(), "5");
-                assert_eq!(resp.body(), b"hello");
+            Some(EmbeddedHttp::Resp { ref head, ref body }) => {
+                assert_eq!(head.status(), HttpStatus::OK);
+                assert_eq!(head.headers().get("Content-Length").unwrap(), "5");
+                match body {
+                    Body::Full { reader } => assert_eq!(reader, b"hello"),
+                    _ => panic!("expected Full body"),
+                }
             }
             _ => panic!("expected embedded HTTP response"),
         }

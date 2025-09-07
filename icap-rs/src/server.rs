@@ -62,6 +62,7 @@
 
 pub mod options;
 
+use memchr::{memchr, memmem};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::{RootCertStore, ServerConfig};
 use std::borrow::Cow;
@@ -71,14 +72,14 @@ use std::path::PathBuf;
 use std::str;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tracing::{error, trace, warn};
 
 use crate::error::IcapResult;
 use crate::parser::icap::find_double_crlf;
 use crate::parser::read_chunked_to_end;
-use crate::request::parse_icap_request;
+use crate::request::{Body, parse_icap_request};
 pub use crate::server::options::{ServiceOptions, TransferBehavior};
 use crate::{EmbeddedHttp, Method, Request, Response, StatusCode};
 use smallvec::SmallVec;
@@ -89,7 +90,7 @@ use tokio_rustls::TlsAcceptor;
 /// One handler can serve multiple ICAP methods declared for a service via
 /// [`ServerBuilder::route`].
 type RequestHandler = Box<
-    dyn Fn(Request) -> std::pin::Pin<Box<dyn Future<Output = IcapResult<Response>> + Send + Sync>>
+    dyn Fn(Request) -> std::pin::Pin<Box<dyn Future<Output = IcapResult<Response>> + Send>>
         + Send
         + Sync,
 >;
@@ -340,7 +341,6 @@ impl Server {
                 let n = match socket.read(&mut tmp).await {
                     Ok(n) => n,
                     Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                        // Нормальное завершение сессии на стадии ожидания следующего запроса.
                         return if buf.is_empty() {
                             Ok(())
                         } else {
@@ -375,6 +375,16 @@ impl Server {
                     buf.extend_from_slice(&tmp[..n]);
                 }
                 msg_end = read_chunked_to_end(&mut socket, &mut buf, body_abs).await?;
+                if msg_end > body_abs {
+                    let decoded = dechunk_icap_entity(&buf[body_abs..msg_end])
+                        .map_err(|e| format!("dechunk ICAP entity: {e}"))?;
+                    let dest_len = decoded.len();
+                    if buf.len() < body_abs + dest_len {
+                        buf.resize(body_abs + dest_len, 0);
+                    }
+                    buf[body_abs..body_abs + dest_len].copy_from_slice(&decoded);
+                    msg_end = body_abs + dest_len;
+                }
             }
 
             // === Parse + route ===
@@ -431,17 +441,45 @@ impl Server {
                                 .as_ref()
                                 .map(|opts| opts.istag_for(&req))
                                 .unwrap_or_else(|| format!("{}-default-1.0", service_resolved));
+
                             let mut out =
                                 Response::new(StatusCode::OK, "OK").try_set_istag(&istag_now)?;
+
                             match (&req.embedded, method) {
-                                (Some(EmbeddedHttp::Resp(http_resp)), Method::RespMod) => {
-                                    out = out.with_http_response(http_resp)?
+                                (Some(EmbeddedHttp::Resp { head, body }), Method::RespMod) => {
+                                    if let Body::Full { reader } = body {
+                                        let mut builder = http::Response::builder()
+                                            .status(head.status())
+                                            .version(head.version());
+                                        if let Some(h) = builder.headers_mut() {
+                                            h.extend(head.headers().clone());
+                                        }
+                                        let http_resp =
+                                            builder.body(reader.clone()).map_err(|e| {
+                                                format!("build http::Response from embedded: {e}")
+                                            })?;
+                                        out = out.with_http_response(&http_resp)?;
+                                    }
                                 }
-                                (Some(EmbeddedHttp::Req(http_req)), Method::ReqMod) => {
-                                    out = out.with_http_request(http_req)?
+                                (Some(EmbeddedHttp::Req { head, body }), Method::ReqMod) => {
+                                    if let Body::Full { reader } = body {
+                                        let mut builder = http::Request::builder()
+                                            .method(head.method().clone())
+                                            .uri(head.uri().clone())
+                                            .version(head.version());
+                                        if let Some(h) = builder.headers_mut() {
+                                            h.extend(head.headers().clone());
+                                        }
+                                        let http_req =
+                                            builder.body(reader.clone()).map_err(|e| {
+                                                format!("build http::Request from embedded: {e}")
+                                            })?;
+                                        out = out.with_http_request(&http_req)?;
+                                    }
                                 }
                                 _ => {}
                             }
+
                             out
                         } else if let Some(h) = entry.handlers.get(&method) {
                             h(req).await?
@@ -502,6 +540,41 @@ impl Server {
     }
 }
 
+fn dechunk_icap_entity(mut data: &[u8]) -> Result<Vec<u8>, String> {
+    let mut out = Vec::with_capacity(data.len());
+
+    loop {
+        let crlf_pos = memmem::find(data, b"\r\n").ok_or("chunk size line without CRLF")?;
+        let (size_line, rest) = data.split_at(crlf_pos);
+        data = &rest[2..];
+
+        let size_hex = memchr(b';', size_line)
+            .map(|i| &size_line[..i])
+            .unwrap_or(size_line);
+
+        let size_str = core::str::from_utf8(size_hex).map_err(|_| "chunk size not utf8")?;
+        let size = usize::from_str_radix(size_str.trim(), 16).map_err(|_| "chunk size not hex")?;
+
+        if size == 0 {
+            if data.starts_with(b"\r\n") {
+                data = &data[2..];
+            }
+            break;
+        }
+
+        if data.len() < size + 2 {
+            return Err("incomplete chunk data".into());
+        }
+        out.extend_from_slice(&data[..size]);
+        if &data[size..size + 2] != b"\r\n" {
+            return Err("missing CRLF after chunk".into());
+        }
+        data = &data[size + 2..];
+    }
+
+    Ok(out)
+}
+
 #[derive(Clone)]
 struct TlsParams {
     cert_path: PathBuf,
@@ -517,6 +590,7 @@ struct TlsParams {
 ///
 /// Duplicate registration of the **same (service, method)** panics with a clear error,
 /// like axum.
+#[derive(Default)]
 pub struct ServerBuilder {
     bind_addr: Option<String>,
     routes: HashMap<String, RouteEntry>,
@@ -685,7 +759,7 @@ impl ServerBuilder {
         MIt: IntoIterator<Item = MItem>,
         MItem: Into<Method>,
         F: Fn(Request) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = IcapResult<Response>> + Send + Sync + 'static,
+        Fut: Future<Output = IcapResult<Response>> + Send + 'static,
     {
         use std::collections::hash_map::Entry;
 
@@ -743,7 +817,7 @@ impl ServerBuilder {
     ) -> Self
     where
         F: Fn(Request) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = IcapResult<Response>> + Send + Sync + 'static,
+        Fut: Future<Output = IcapResult<Response>> + Send + 'static,
     {
         self.route(service, [Method::ReqMod], handler, options)
     }
@@ -757,7 +831,7 @@ impl ServerBuilder {
     ) -> Self
     where
         F: Fn(Request) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = IcapResult<Response>> + Send + Sync + 'static,
+        Fut: std::future::Future<Output = IcapResult<Response>> + Send + 'static,
     {
         self.route(service, [Method::RespMod], handler, options)
     }
@@ -939,19 +1013,6 @@ fn load_rustls_acceptor(tls: &TlsParams) -> Result<TlsAcceptor, String> {
     };
 
     Ok(TlsAcceptor::from(Arc::new(server_config)))
-}
-
-impl Default for ServerBuilder {
-    fn default() -> Self {
-        Self {
-            bind_addr: None,
-            routes: HashMap::new(),
-            max_connections_global: None,
-            aliases: HashMap::new(),
-            default_service: None,
-            tls: None,
-        }
-    }
 }
 
 #[cfg(test)]

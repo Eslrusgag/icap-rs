@@ -65,7 +65,7 @@ async fn do_options_once(
     timeout_secs: Option<u64>,
 ) -> IcapResult<icap_rs::response::Response> {
     let client = Client::builder()
-        .from_uri(uri)?
+        .with_uri(uri)?
         .read_timeout(timeout_secs.map(Duration::from_secs))
         .build();
     let req = Request::options("/");

@@ -84,7 +84,7 @@ pub enum ConnectionPolicy {
 /// By default:
 /// - `ConnectionPolicy` is `Close`;
 /// - no host/port are set until you call [`ClientBuilder::host`] / [`ClientBuilder::port`]
-///   or [`ClientBuilder::from_uri`].
+///   or [`ClientBuilder::with_uri`].
 #[derive(Debug)]
 pub struct ClientBuilder {
     host: Option<String>,
@@ -189,7 +189,7 @@ impl ClientBuilder {
     /// This extracts `host` and `port` for use in the TCP connection. The service path,
     /// if present in the URI, is ignored here and should be set on the request itself.
     /// Configure from `icap://` or `icaps://` (`icaps` enables TLS).
-    pub fn from_uri(mut self, uri: &str) -> IcapResult<Self> {
+    pub fn with_uri(mut self, uri: &str) -> IcapResult<Self> {
         let (host, port, tls) = parse_authority_with_scheme(uri)?;
         self.host = Some(host);
         self.port = Some(port);
@@ -742,6 +742,64 @@ struct BuiltIcap {
     remaining_body: Option<Vec<u8>>,
 }
 
+fn http_content_length(http_head: &[u8]) -> Option<usize> {
+    for line in http_head.split(|&b| b == b'\n') {
+        let line = if let Some(b) = line.strip_suffix(b"\r") {
+            b
+        } else {
+            line
+        };
+        let lower = line
+            .iter()
+            .map(|c| c.to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        if lower.starts_with(b"content-length:") {
+            let v = &line[b"Content-Length:".len()..].trim_ascii();
+            return std::str::from_utf8(v).ok()?.trim().parse::<usize>().ok();
+        }
+    }
+    None
+}
+
+fn http_has_te_chunked(http_head: &[u8]) -> bool {
+    for line in http_head.split(|&b| b == b'\n') {
+        let line = if let Some(b) = line.strip_suffix(b"\r") {
+            b
+        } else {
+            line
+        };
+        let lower = line
+            .iter()
+            .map(|c| c.to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        if lower.starts_with(b"transfer-encoding:")
+            && std::str::from_utf8(&line[b"Transfer-Encoding:".len()..])
+                .ok()
+                .map(|v| v.to_ascii_lowercase().contains("chunked"))
+                .unwrap_or(false)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+async fn read_until_len<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    buf: &mut Vec<u8>,
+    need: usize,
+) -> IcapResult<()> {
+    let mut tmp = [0u8; 4096];
+    while buf.len() < need {
+        let n = AsyncReadExt::read(stream, &mut tmp).await?;
+        if n == 0 {
+            return Err("Unexpected EOF while reading response body".into());
+        }
+        buf.extend_from_slice(&tmp[..n]);
+    }
+    Ok(())
+}
+
 /// If the ICAP response has an encapsulated body (req-body or res-body),
 /// read it to the end (chunked) and append to `buf`.
 async fn read_icap_body_if_any<S>(stream: &mut S, buf: &mut Vec<u8>) -> IcapResult<()>
@@ -755,22 +813,50 @@ where
     let hdr_text = std::str::from_utf8(&buf[..h_end]).map_err(|_| "Invalid headers utf8")?;
     let enc = parse_encapsulated_header(hdr_text);
 
-    if let Some(body_rel) = enc.req_body.or(enc.res_body) {
-        let body_abs = h_end + body_rel;
+    if let Some(http_rel) = enc.req_hdr.or(enc.res_hdr) {
+        let http_abs = h_end + http_rel;
 
-        while buf.len() < body_abs {
+        let http_hdr_end_abs = loop {
+            if let Some(rel) = find_double_crlf(&buf[http_abs..]) {
+                break http_abs + rel;
+            }
             let mut tmp = [0u8; 4096];
             let n = AsyncReadExt::read(stream, &mut tmp).await?;
             if n == 0 {
-                return Err("EOF before body".into());
+                return Err("Unexpected EOF before end of embedded HTTP headers".into());
             }
             buf.extend_from_slice(&tmp[..n]);
+        };
+
+        let has_http_body = enc.req_body.is_some() || enc.res_body.is_some();
+        if !has_http_body {
+            return Ok(());
         }
 
-        read_chunked_to_end(stream, buf, body_abs).await.map(|_| ())
-    } else {
-        Ok(())
+        let http_head = &buf[http_abs..http_hdr_end_abs];
+        if let Some(cl) = http_content_length(http_head) {
+            let want = http_hdr_end_abs + cl;
+            read_until_len(stream, buf, want).await?;
+            return Ok(());
+        }
+
+        if http_has_te_chunked(http_head) {
+            let _end = read_chunked_to_end(stream, buf, http_hdr_end_abs).await?;
+            return Ok(());
+        }
+
+        return Ok(());
     }
+
+    if let Some(body_rel) = enc.req_body.or(enc.res_body) {
+        let body_abs = h_end + body_rel;
+        if buf.len() < body_abs {
+            read_until_len(stream, buf, body_abs).await?;
+        }
+        let _end = read_chunked_to_end(stream, buf, body_abs).await?;
+    }
+
+    Ok(())
 }
 
 fn parse_authority_with_scheme(uri: &str) -> IcapResult<(String, u16, bool)> {
