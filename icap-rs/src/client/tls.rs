@@ -9,8 +9,8 @@
 #[cfg(feature = "tls-rustls")]
 pub mod rustls;
 
-#[cfg(feature = "tls-openssl")]
-pub mod openssl;
+// #[cfg(feature = "tls-openssl")]
+// pub mod openssl;
 
 use crate::error::IcapResult;
 use crate::net::Conn;
