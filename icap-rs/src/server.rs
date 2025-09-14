@@ -13,9 +13,6 @@
 //! - Reads encapsulated **chunked bodies to completion** before parsing (avoids premature close
 //!   observed by clients like `c-icap-client`);
 //! - Can limit concurrent connections via a semaphore.
-//!
-//! **Status:** experimental; APIs may change.
-//!
 //! ## Quick example
 //!
 //! ```rust,no_run
@@ -374,10 +371,13 @@ impl Server {
                     }
                     buf.extend_from_slice(&tmp[..n]);
                 }
+
                 msg_end = read_chunked_to_end(&mut socket, &mut buf, body_abs).await?;
                 if msg_end > body_abs {
-                    let decoded = dechunk_icap_entity(&buf[body_abs..msg_end])
+                    let mut chunked_slice = &buf[body_abs..msg_end];
+                    let decoded = dechunk_icap_entity(&mut chunked_slice)
                         .map_err(|e| format!("dechunk ICAP entity: {e}"))?;
+
                     let dest_len = decoded.len();
                     if buf.len() < body_abs + dest_len {
                         buf.resize(body_abs + dest_len, 0);
@@ -540,14 +540,24 @@ impl Server {
     }
 }
 
-fn dechunk_icap_entity(mut data: &[u8]) -> Result<Vec<u8>, String> {
-    let mut out = Vec::with_capacity(data.len());
+// Dechunk ICAP entity-body (HTTP chunked framing) in-place-like.
+// - Consumes from the input slice by advancing `*data`.
+// - Returns a Vec with the dechunked payload.
+// - On success, `*data` points to the first byte after the entity (usually CRLF/next part).
+fn dechunk_icap_entity(data: &mut &[u8]) -> Result<Vec<u8>, String> {
+    // Pre-size result to the remaining input upper bound (cheap heuristic).
+    let mut out = Vec::with_capacity((*data).len());
+    // Work on a local moving window, then publish the final position back to caller.
+    let mut d = *data;
 
     loop {
-        let crlf_pos = memmem::find(data, b"\r\n").ok_or("chunk size line without CRLF")?;
-        let (size_line, rest) = data.split_at(crlf_pos);
-        data = &rest[2..];
+        // Find the CRLF ending the chunk-size line.
+        let crlf_pos = memmem::find(d, b"\r\n").ok_or("chunk size line without CRLF")?;
+        let (size_line, rest) = d.split_at(crlf_pos);
+        // Skip the CRLF
+        d = &rest[2..];
 
+        // Strip optional chunk extensions starting with ';'
         let size_hex = memchr(b';', size_line)
             .map(|i| &size_line[..i])
             .unwrap_or(size_line);
@@ -556,20 +566,28 @@ fn dechunk_icap_entity(mut data: &[u8]) -> Result<Vec<u8>, String> {
         let size = usize::from_str_radix(size_str.trim(), 16).map_err(|_| "chunk size not hex")?;
 
         if size == 0 {
-            if data.starts_with(b"\r\n") {
-                data = &data[2..];
+            // Trailing CRLF after the 0-size chunk is optional in some impls; tolerate both.
+            if d.starts_with(b"\r\n") {
+                d = &d[2..];
             }
+            // Publish how much we consumed back to the caller.
+            *data = d;
             break;
         }
 
-        if data.len() < size + 2 {
+        // Need at least `size` bytes of data + CRLF
+        if d.len() < size + 2 {
             return Err("incomplete chunk data".into());
         }
-        out.extend_from_slice(&data[..size]);
-        if &data[size..size + 2] != b"\r\n" {
+
+        out.extend_from_slice(&d[..size]);
+
+        if &d[size..size + 2] != b"\r\n" {
             return Err("missing CRLF after chunk".into());
         }
-        data = &data[size + 2..];
+
+        // Advance past data and its CRLF.
+        d = &d[size + 2..];
     }
 
     Ok(out)
@@ -609,7 +627,7 @@ impl ServerBuilder {
     /// The TLS handshake is terminated inside the server via Rustls. By default,
     /// the server advertises the `icap` ALPN identifier (clients that ignore ALPN
     /// remain compatible). **Client authentication is not required**; for mTLS use
-    /// [`with_mtls_from_pem_files`].
+    /// [`ServerBuilder::with_mtls_from_pem_files`].
     ///
     /// This method is only available when the `tls-rustls` feature is enabled.
     ///

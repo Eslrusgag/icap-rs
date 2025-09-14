@@ -1,6 +1,6 @@
 # icap-rs — ICAP protocol for Rust (client & mini server)
 
-A Rust implementation of the **ICAP** protocol ([RFC 3507]) providing a client API and a small server.
+A Rust implementation of the **ICAP** protocol ([RFC 3507]) providing a client API and a server.
 
 [RFC 3507]: https://www.rfc-editor.org/rfc/rfc3507
 
@@ -12,7 +12,7 @@ A Rust implementation of the **ICAP** protocol ([RFC 3507]) providing a client 
 
 - **Client**: functional — supports `OPTIONS`, `REQMOD`, `RESPMOD`, Preview (including `ieof`), embedded HTTP/1.x
   messages, streaming bodies, and optional connection reuse.
-- **Server**: experimental — per-service routing, automatic `OPTIONS` responses (with optional **dynamic ISTag**),
+- **Server**: per-service routing, automatic `OPTIONS` responses (with optional **dynamic ISTag**),
   duplicate-route detection, safe reading of chunked bodies before invoking handlers, and an RFC-friendly **200 echo**
   fallback when `Allow: 204` is absent and `Preview` is not used.
 
@@ -26,7 +26,7 @@ A Rust implementation of the **ICAP** protocol ([RFC 3507]) providing a client 
 - **Preview** negotiation (incl. `Preview: 0` and `ieof` fast path).
 - Chunked uploads, streaming large bodies after `100 Continue`.
 - Keep-Alive: reuse a single idle connection.
-- **ICAPS (TLS)** with either `rustls` or `OpenSSL` backends — **client and server**.
+- **ICAPS (TLS)** with either `rustls`
 
 ---
 
@@ -157,8 +157,6 @@ The client supports **TLS (“ICAPS”)**. You can enable one of two TLS stacks:
   - Enable `tls-rustls` **and pick exactly one provider**:
     - `tls-rustls-ring` **or**
     - `tls-rustls-aws-lc`
-- **OpenSSL**:
-  - Enable `tls-openssl`
 
 > If you enable both rustls providers or none, the crate fails to compile with a clear error.  
 > When you use an `icaps://…` URI but build without any TLS feature, the client returns an error.
@@ -171,8 +169,6 @@ The client supports **TLS (“ICAPS”)**. You can enable one of two TLS stacks:
 version = "actual-version"
 features = ["tls-rustls", "tls-rustls-ring"]      # or: ["tls-rustls", "tls-rustls-aws-lc"]
 
-# — OR — use OpenSSL instead:
-# features = ["tls-openssl"]
 ```
 
 ### ICAPS quick start (system roots)
@@ -232,28 +228,6 @@ use icap_rs::Client;
           .build();
   # Ok(())
   # }
-```
-
-### OpenSSL backend (testing only: disable verify)
-
-With the OpenSSL backend you can temporarily disable verification (e.g., quick local tests).  
-**Do not** use this in production.
-
-```rust,no_run
-use icap_rs::{Client, Request};
-
-#[tokio::main]
-async fn main() -> icap_rs::error::IcapResult<()> {
-    let client = Client::builder()
-        .with_uri("icaps://localhost:13443")?
-        .keep_alive(true)
-        .danger_disable_cert_verify(true) // OpenSSL: disables verify; rustls: ignored
-        .build();
-
-    let resp = client.send(&Request::options("test")).await?;
-    println!("{} {}", resp.status_code.as_str(), resp.status_text);
-    Ok(())
-}
 ```
 
 ### Notes & limitations (client)
@@ -390,7 +364,7 @@ async fn main() -> IcapResult<()> {
 
 ## TLS (ICAPS) — **Server**
 
-The server can terminate TLS (“ICAPS”) directly using **rustls** (recommended) or **OpenSSL**.
+The server can terminate TLS (“ICAPS”) directly using **rustls** (recommended)
 
 > **Port choice:** there is no official IANA port for ICAPS.  
 > This README uses **13443** for the TLS server examples.  
@@ -406,9 +380,6 @@ Choose exactly **one** TLS stack:
 [dependencies.icap-rs]
 version = "actual-version"
 features = ["tls-rustls", "tls-rustls-ring"]      # or: ["tls-rustls", "tls-rustls-aws-lc"]
-
-# — OR — OpenSSL for TLS:
-# features = ["tls-openssl"]
 ```
 
 ### Example: ICAPS server (TLS, no client-auth)
@@ -486,13 +457,10 @@ async fn main() -> icap_rs::error::IcapResult<()> {
 
 ## Roadmap
 
+- OpenSSL TLS backend (`tls-openssl`) with feature-gated builds, test coverage, and docs (parity with `tls-rustls`).
 - Richer server APIs (streaming to handler, trailers, backpressure, graceful shutdown).
 - More complete `OPTIONS` helpers and better defaults.
 - TLS client auth (mTLS).
 - Connection pooling beyond a single keep-alive connection.
 
 ---
-
-## License
-
-Dual-license or project-specific license TBD. Replace this section with your actual license details.

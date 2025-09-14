@@ -6,12 +6,11 @@
 use std::sync::{Arc, RwLock};
 
 use http::{HeaderMap, Response as HttpResponse, StatusCode as HttpStatus, Version};
-use icap_rs::request::{BodyRead, EmbeddedHttp, Request};
+use icap_rs::request::{EmbeddedHttp, Request};
 use icap_rs::response::{Response, StatusCode};
 use icap_rs::server::Server;
 use icap_rs::server::options::ServiceOptions;
 use icap_rs::{Body, Method};
-use tokio::io::AsyncReadExt;
 use tracing::{error, info, warn};
 
 const ISTAG_REQMOD_INIT: &str = "reqmod-1.0";
