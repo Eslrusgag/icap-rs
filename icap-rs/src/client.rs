@@ -198,11 +198,12 @@ impl ClientBuilder {
             {
                 self = self.use_rustls();
             }
-            #[cfg(all(not(feature = "tls-rustls"), feature = "tls-openssl"))]
-            {
-                self = self.use_openssl();
-            }
-            #[cfg(all(not(feature = "tls-rustls"), not(feature = "tls-openssl")))]
+            // #[cfg(all(not(feature = "tls-rustls"), feature = "tls-openssl"))]
+            // {
+            //     self = self.use_openssl();
+            // }
+            //#[cfg(all(not(feature = "tls-rustls"), not(feature = "tls-openssl")))]
+            #[cfg(all(not(feature = "tls-rustls")))]
             {
                 return Err("`icaps://` requested but crate built without TLS features".into());
             }

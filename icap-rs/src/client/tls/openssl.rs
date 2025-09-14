@@ -8,7 +8,6 @@
 use super::TlsConnector;
 use crate::error::IcapResult;
 use crate::net::conn::Conn;
-// keep as-is if your project exposes this path
 use tokio::net::TcpStream;
 
 /// Configuration for the OpenSSL-based connector.

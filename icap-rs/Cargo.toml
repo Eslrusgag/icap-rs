@@ -32,7 +32,7 @@ tls-rustls-aws-lc = ["tls-rustls", "rustls/aws_lc_rs"]
 
 # Alternative TLS backend using OpenSSL (tokio-openssl).
 # Can be enabled alongside `tls-rustls` to allow runtime selection of the TLS backend.
-tls-openssl = ["dep:tokio-openssl", "dep:openssl"]
+#tls-openssl = ["dep:tokio-openssl", "dep:openssl"]
 
 
 [dependencies]
@@ -54,8 +54,8 @@ rustls-native-certs = { version = "0.8.1", optional = true }
 rustls-pemfile = { version = "2", optional = true }
 
 
-tokio-openssl = { version = "0.6", optional = true }
-openssl = { version = "0.10", optional = true }
+#tokio-openssl = { version = "0.6", optional = true }
+#openssl = { version = "0.10", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1.47", features = ["full"] }

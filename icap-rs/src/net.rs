@@ -20,17 +20,18 @@ use pin_project_lite::pin_project;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 
-#[cfg(all(feature = "tls-rustls", feature = "tls-openssl"))]
+#[cfg(feature = "tls-rustls")]
 mod conn_def {
     use super::*;
 
     pin_project! {
-        /// Transport connection when both TLS backends are compiled in.
+        /// Transport connection when the rustls TLS backend is compiled in.
         ///
         /// Variants:
         /// - [`Conn::Plain`] — raw `TcpStream`
         /// - [`Conn::Rustls`] — TLS via `tokio-rustls` + rustls
-        /// - [`Conn::Openssl`] — TLS via `tokio-openssl` + OpenSSL
+        ///
+        /// OpenSSL variant is intentionally disabled/commented out.
         #[project = ConnProj]
         #[derive(Debug)]
         pub enum Conn {
@@ -38,75 +39,8 @@ mod conn_def {
             Plain  { #[pin] inner: TcpStream },
             /// TLS connection using rustls.
             Rustls { #[pin] inner: tokio_rustls::client::TlsStream<TcpStream> },
-            /// TLS connection using OpenSSL.
-            Openssl{ #[pin] inner: tokio_openssl::SslStream<TcpStream> },
-        }
-    }
-
-    // Delegate AsyncRead to the active variant.
-    impl AsyncRead for Conn {
-        fn poll_read(
-            self: core::pin::Pin<&mut Self>,
-            cx: &mut core::task::Context<'_>,
-            buf: &mut tokio::io::ReadBuf<'_>,
-        ) -> core::task::Poll<std::io::Result<()>> {
-            match self.project() {
-                ConnProj::Plain { inner } => inner.poll_read(cx, buf),
-                ConnProj::Rustls { inner } => inner.poll_read(cx, buf),
-                ConnProj::Openssl { inner } => inner.poll_read(cx, buf),
-            }
-        }
-    }
-
-    // Delegate AsyncWrite to the active variant.
-    impl AsyncWrite for Conn {
-        fn poll_write(
-            self: core::pin::Pin<&mut Self>,
-            cx: &mut core::task::Context<'_>,
-            buf: &[u8],
-        ) -> core::task::Poll<std::io::Result<usize>> {
-            match self.project() {
-                ConnProj::Plain { inner } => inner.poll_write(cx, buf),
-                ConnProj::Rustls { inner } => inner.poll_write(cx, buf),
-                ConnProj::Openssl { inner } => inner.poll_write(cx, buf),
-            }
-        }
-        fn poll_flush(
-            self: core::pin::Pin<&mut Self>,
-            cx: &mut core::task::Context<'_>,
-        ) -> core::task::Poll<std::io::Result<()>> {
-            match self.project() {
-                ConnProj::Plain { inner } => inner.poll_flush(cx),
-                ConnProj::Rustls { inner } => inner.poll_flush(cx),
-                ConnProj::Openssl { inner } => inner.poll_flush(cx),
-            }
-        }
-        fn poll_shutdown(
-            self: core::pin::Pin<&mut Self>,
-            cx: &mut core::task::Context<'_>,
-        ) -> core::task::Poll<std::io::Result<()>> {
-            match self.project() {
-                ConnProj::Plain { inner } => inner.poll_shutdown(cx),
-                ConnProj::Rustls { inner } => inner.poll_shutdown(cx),
-                ConnProj::Openssl { inner } => inner.poll_shutdown(cx),
-            }
-        }
-    }
-}
-
-#[cfg(all(feature = "tls-rustls", not(feature = "tls-openssl")))]
-mod conn_def {
-    use super::*;
-
-    pin_project! {
-        /// Transport connection when only the rustls TLS backend is compiled in.
-        #[project = ConnProj]
-        #[derive(Debug)]
-        pub enum Conn {
-            /// Plain TCP connection (no TLS).
-            Plain  { #[pin] inner: TcpStream },
-            /// TLS connection using rustls.
-            Rustls { #[pin] inner: tokio_rustls::client::TlsStream<TcpStream> },
+            // /// TLS connection using OpenSSL. (disabled)
+            // Openssl { #[pin] inner: tokio_openssl::SslStream<TcpStream> },
         }
     }
 
@@ -119,6 +53,7 @@ mod conn_def {
             match self.project() {
                 ConnProj::Plain { inner } => inner.poll_read(cx, buf),
                 ConnProj::Rustls { inner } => inner.poll_read(cx, buf),
+                // ConnProj::Openssl { inner } => inner.poll_read(cx, buf),
             }
         }
     }
@@ -132,6 +67,7 @@ mod conn_def {
             match self.project() {
                 ConnProj::Plain { inner } => inner.poll_write(cx, buf),
                 ConnProj::Rustls { inner } => inner.poll_write(cx, buf),
+                // ConnProj::Openssl { inner } => inner.poll_write(cx, buf),
             }
         }
         fn poll_flush(
@@ -141,6 +77,7 @@ mod conn_def {
             match self.project() {
                 ConnProj::Plain { inner } => inner.poll_flush(cx),
                 ConnProj::Rustls { inner } => inner.poll_flush(cx),
+                // ConnProj::Openssl { inner } => inner.poll_flush(cx),
             }
         }
         fn poll_shutdown(
@@ -150,73 +87,17 @@ mod conn_def {
             match self.project() {
                 ConnProj::Plain { inner } => inner.poll_shutdown(cx),
                 ConnProj::Rustls { inner } => inner.poll_shutdown(cx),
+                // ConnProj::Openssl { inner } => inner.poll_shutdown(cx),
             }
         }
     }
 }
 
-#[cfg(all(not(feature = "tls-rustls"), feature = "tls-openssl"))]
-mod conn_def {
-    use super::*;
+// ──────────────────────────────────────────────────────────────────────────────
+// Case 2: no TLS features (Plain only)
+// ──────────────────────────────────────────────────────────────────────────────
 
-    pin_project! {
-        /// Transport connection when only the OpenSSL TLS backend is compiled in.
-        #[project = ConnProj]
-        #[derive(Debug)]
-        pub enum Conn {
-            /// Plain TCP connection (no TLS).
-            Plain   { #[pin] inner: TcpStream },
-            /// TLS connection using OpenSSL.
-            Openssl { #[pin] inner: tokio_openssl::SslStream<TcpStream> },
-        }
-    }
-
-    impl AsyncRead for Conn {
-        fn poll_read(
-            self: core::pin::Pin<&mut Self>,
-            cx: &mut core::task::Context<'_>,
-            buf: &mut tokio::io::ReadBuf<'_>,
-        ) -> core::task::Poll<std::io::Result<()>> {
-            match self.project() {
-                ConnProj::Plain { inner } => inner.poll_read(cx, buf),
-                ConnProj::Openssl { inner } => inner.poll_read(cx, buf),
-            }
-        }
-    }
-
-    impl AsyncWrite for Conn {
-        fn poll_write(
-            self: core::pin::Pin<&mut Self>,
-            cx: &mut core::task::Context<'_>,
-            buf: &[u8],
-        ) -> core::task::Poll<std::io::Result<usize>> {
-            match self.project() {
-                ConnProj::Plain { inner } => inner.poll_write(cx, buf),
-                ConnProj::Openssl { inner } => inner.poll_write(cx, buf),
-            }
-        }
-        fn poll_flush(
-            self: core::pin::Pin<&mut Self>,
-            cx: &mut core::task::Context<'_>,
-        ) -> core::task::Poll<std::io::Result<()>> {
-            match self.project() {
-                ConnProj::Plain { inner } => inner.poll_flush(cx),
-                ConnProj::Openssl { inner } => inner.poll_flush(cx),
-            }
-        }
-        fn poll_shutdown(
-            self: core::pin::Pin<&mut Self>,
-            cx: &mut core::task::Context<'_>,
-        ) -> core::task::Poll<std::io::Result<()>> {
-            match self.project() {
-                ConnProj::Plain { inner } => inner.poll_shutdown(cx),
-                ConnProj::Openssl { inner } => inner.poll_shutdown(cx),
-            }
-        }
-    }
-}
-
-#[cfg(all(not(feature = "tls-rustls"), not(feature = "tls-openssl")))]
+#[cfg(not(feature = "tls-rustls"))]
 mod conn_def {
     use super::*;
 

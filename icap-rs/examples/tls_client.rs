@@ -29,10 +29,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         builder = builder.add_root_ca_pem_file(CA_PEM_PATH)?;
     }
 
-    // If the build does not include the rustls backend (unlikely in these examples),
-    // you can fallback to disabling verification for local tests. Commented out by default.
-    // builder = builder.danger_disable_cert_verify(true);
-
     let client = builder.build();
 
     // Prepare ICAP REQMOD for the /scan service
