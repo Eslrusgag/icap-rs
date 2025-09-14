@@ -31,6 +31,7 @@ compile_error!(
 #[derive(Debug, Clone)]
 pub struct RustlsConfig {
     /// Kept for compatibility; rustls 0.23 has no public "disable verify" switch.
+    #[allow(dead_code)]
     pub danger_disable_verify: bool,
     /// Extra root certificates in **DER** form to be appended to the platform store.
     pub extra_roots: Vec<CertificateDer<'static>>,

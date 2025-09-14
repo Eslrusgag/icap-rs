@@ -61,7 +61,8 @@ pub fn cli_styles() -> clap::builder::Styles {
 #[derive(ValueEnum, Clone, Debug)]
 enum TlsBackendCli {
     Rustls,
-    //Openssl,
+    // OpenSSL backend is intentionally disabled/commented out
+    // Openssl,
 }
 
 #[derive(Parser, Debug)]
@@ -243,6 +244,7 @@ async fn main() -> IcapResult<()> {
                         std::process::exit(2);
                     }
                 } // TlsBackendCli::Openssl => {
+                  //     // OpenSSL backend intentionally disabled
                   //     #[cfg(feature = "tls-openssl")]
                   //     {
                   //         builder = builder.use_openssl();
@@ -282,7 +284,8 @@ async fn main() -> IcapResult<()> {
 
     if args.insecure {
         builder = builder.danger_disable_cert_verify(true);
-        #[cfg(all(feature = "tls-rustls", not(feature = "tls-openssl")))]
+        // We only warn for rustls builds; OpenSSL mention removed.
+        #[cfg(feature = "tls-rustls")]
         eprintln!(
             "Warning: rustls 0.23 does not provide a public no-verify API; --insecure may be ignored."
         );

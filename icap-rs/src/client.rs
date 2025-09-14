@@ -10,7 +10,7 @@
 //!
 //! TLS backends:
 //! - Plain TCP by default.
-//! - Enable `tls-rustls` or `tls-openssl` Cargo features to use TLS.
+//! - Enable `tls-rustls` to use TLS.
 //! - `icaps://` URIs automatically switch to TLS; which backend is used
 //!   depends on enabled features or explicit selection in the builder.
 
@@ -216,11 +216,11 @@ impl ClientBuilder {
         self
     }
 
-    #[cfg(feature = "tls-openssl")]
-    pub fn use_openssl(mut self) -> Self {
-        self.tls_backend = Some(TlsBackend::Openssl);
-        self
-    }
+    // #[cfg(feature = "tls-openssl")]
+    // pub fn use_openssl(mut self) -> Self {
+    //     self.tls_backend = Some(TlsBackend::Openssl);
+    //     self
+    // }
 
     /// Custom SNI hostname to use for TLS handshakes.
     pub fn sni_hostname(mut self, s: &str) -> Self {
@@ -271,20 +271,19 @@ impl ClientBuilder {
                 {
                     panic!("enable `tls-rustls` feature")
                 }
-            }
-            Some(TlsBackend::Openssl) => {
-                #[cfg(feature = "tls-openssl")]
-                {
-                    use crate::client::tls::openssl::OpensslConfig;
-                    AnyTlsConnector::openssl(OpensslConfig {
-                        danger_disable_verify: self.danger_disable_verify,
-                    })
-                }
-                #[cfg(not(feature = "tls-openssl"))]
-                {
-                    panic!("enable `tls-openssl` feature")
-                }
-            }
+            } // Some(TlsBackend::Openssl) => {
+              //     #[cfg(feature = "tls-openssl")]
+              //     {
+              //         use crate::client::tls::openssl::OpensslConfig;
+              //         AnyTlsConnector::openssl(OpensslConfig {
+              //             danger_disable_verify: self.danger_disable_verify,
+              //         })
+              //     }
+              //     #[cfg(not(feature = "tls-openssl"))]
+              //     {
+              //         panic!("enable `tls-openssl` feature")
+              //     }
+              // }
         };
 
         Client {
@@ -858,7 +857,6 @@ where
 
     Ok(())
 }
-
 fn parse_authority_with_scheme(uri: &str) -> IcapResult<(String, u16, bool)> {
     let s = uri.trim();
     let (tls, rest) = if let Some(r) = s.strip_prefix("icaps://") {
@@ -882,11 +880,6 @@ fn parse_authority_with_scheme(uri: &str) -> IcapResult<(String, u16, bool)> {
         return Err("Empty host in authority".into());
     }
     Ok((host, port, tls))
-}
-
-/// Back-compat helper used in some tests (icap:// only).
-fn parse_authority(uri: &str) -> IcapResult<(String, u16)> {
-    parse_authority_with_scheme(uri).map(|(h, p, _)| (h, p))
 }
 
 fn append_to_allow(headers: &mut HeaderMap, code: &str) {
@@ -1083,14 +1076,21 @@ mod tests {
     }
 
     #[rstest]
-    #[case("icap://proxy.local/service", Ok(("proxy.local".to_string(), 1344)))]
-    #[case("icap://proxy.local:1345/respmod", Ok(("proxy.local".to_string(), 1345)))]
+    #[case("icap://proxy.local/service", Ok(("proxy.local".to_string(), 1344, false)))]
+    #[case("icap://proxy.local:1345/respmod", Ok(("proxy.local".to_string(), 1345, false)))]
+    #[case("icaps://proxy.local/service",
+        Ok(("proxy.local".to_string(), 11344, true))
+    )] // default icaps port
+    #[case("icaps://proxy.local:2346/svc", Ok(("proxy.local".to_string(), 2346, true)))]
     #[case("http://wrong", Err(()))]
     #[case("icap://:1344/", Err(()))]
     #[case("icap://proxy:bad/", Err(()))]
-    fn parse_authority_cases(#[case] input: &str, #[case] expected: Result<(String, u16), ()>) {
-        match (parse_authority(input), expected) {
-            (Ok((h, p)), Ok((eh, ep))) => assert_eq!((h, p), (eh, ep)),
+    fn parse_authority_cases(
+        #[case] input: &str,
+        #[case] expected: Result<(String, u16, bool), ()>,
+    ) {
+        match (parse_authority_with_scheme(input), expected) {
+            (Ok((h, p, t)), Ok((eh, ep, et))) => assert_eq!((h, p, t), (eh, ep, et)),
             (Err(_), Err(_)) => {}
             other => panic!("mismatch: {:?}", other),
         }

@@ -22,7 +22,7 @@ use tokio::net::TcpStream;
 #[derive(Debug, Clone, Copy)]
 pub enum TlsBackend {
     Rustls,
-    Openssl,
+    //Openssl,
 }
 
 /// Minimal async connector interface shared by all TLS backends.
@@ -41,9 +41,9 @@ pub enum AnyTlsConnector {
     /// rustls-backed connector (enabled via `tls-rustls` feature).
     #[cfg(feature = "tls-rustls")]
     Rustls(rustls::RustlsConnector),
-    /// OpenSSL-backed connector (enabled via `tls-openssl` feature).
-    #[cfg(feature = "tls-openssl")]
-    Openssl(openssl::OpensslConnector),
+    // /// OpenSSL-backed connector (enabled via `tls-openssl` feature).
+    // #[cfg(feature = "tls-openssl")]
+    // Openssl(openssl::OpensslConnector),
 }
 
 impl AnyTlsConnector {
@@ -58,11 +58,11 @@ impl AnyTlsConnector {
         AnyTlsConnector::Rustls(rustls::RustlsConnector::new(cfg))
     }
 
-    /// Construct an OpenSSL connector (available when `tls-openssl` is enabled).
-    #[cfg(feature = "tls-openssl")]
-    pub fn openssl(cfg: openssl::OpensslConfig) -> Self {
-        AnyTlsConnector::Openssl(openssl::OpensslConnector::new(cfg))
-    }
+    // /// Construct an OpenSSL connector (available when `tls-openssl` is enabled).
+    // #[cfg(feature = "tls-openssl")]
+    // pub fn openssl(cfg: openssl::OpensslConfig) -> Self {
+    //     AnyTlsConnector::Openssl(openssl::OpensslConnector::new(cfg))
+    // }
 }
 
 #[async_trait]
@@ -72,8 +72,8 @@ impl TlsConnector for AnyTlsConnector {
             AnyTlsConnector::Plain => Ok(Conn::Plain { inner: tcp }),
             #[cfg(feature = "tls-rustls")]
             AnyTlsConnector::Rustls(c) => c.connect(tcp, server_name).await,
-            #[cfg(feature = "tls-openssl")]
-            AnyTlsConnector::Openssl(c) => c.connect(tcp, server_name).await,
+            // #[cfg(feature = "tls-openssl")]
+            // AnyTlsConnector::Openssl(c) => c.connect(tcp, server_name).await,
         }
     }
 }

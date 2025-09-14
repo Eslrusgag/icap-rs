@@ -1,4 +1,4 @@
-//! ICAP OPTIONS configuration (WIP).
+//! ICAP OPTIONS configuration.
 //!
 //! This module provides types to build an ICAP `OPTIONS` response for a given
 //! service. It includes:
