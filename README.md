@@ -15,11 +15,11 @@ Command-line ICAP client inspired by `c-icap-client`
 
 ### **rs-icap-server**
 
-Experimental ICAP server implementation inspired by `c-icap`
+ICAP server implementation inspired by `c-icap`
 
 ## Status
 
 - `icap_rs` and `rs-icap-client` are functional and actively developed.
-- `rs-icap-server` is experimental; APIs may change.
+- `rs-icap-server` In development
 
 ---
