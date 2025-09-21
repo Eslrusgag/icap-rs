@@ -57,14 +57,6 @@ use tracing::{trace, warn};
 /// assert!(StatusCode::OK.is_success());
 /// assert_eq!(StatusCode::NO_CONTENT.as_str(), "204");
 /// ```
-///
-/// When serializing an ICAP status line:
-/// ```ignore
-/// write!(out, "{} {} {}\r\n",
-///        ICAP_VERSION,
-///        status_code.as_str(), // "200"
-///        status_text)?;        // "OK"
-/// ```
 pub type StatusCode = http::StatusCode;
 
 /// Representation of an ICAP response.

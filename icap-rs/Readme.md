@@ -30,23 +30,6 @@ A Rust implementation of the **ICAP** protocol ([RFC 3507]) providing a client 
 
 ---
 
-## Install
-
-Add to your `Cargo.toml`:
-
-```toml
-[dependencies]
-icap-rs = "actual-version"
-```
-
-Or:
-
-```bash
-cargo add icap-rs
-```
-
----
-
 ## Client
 
 Builder-based configuration (host/port, keep-alive, default headers, timeouts).  

@@ -33,20 +33,6 @@
 //! assert_eq!(icap_req.method, Method::ReqMod);
 //! assert!(icap_req.allow_204);
 //! assert_eq!(icap_req.preview_size, Some(4));
-//! ```
-//!
-//! ## Example (server: lazy continue)
-//! ```ignore
-//! // server handler (pseudocode):
-//! async fn handle(mut req: Request<BodyRead>) -> IcapResult<Response> {
-//!     if let Some(EmbeddedHttp::Resp { head: _, body }) = &mut req.embedded {
-//!         // Decide on preview; if more bytes are needed:
-//!         let _reader = body.ensure_full().await?; // sends 100 Continue if required
-//!         // ...read/process...
-//!     }
-//!     Ok(Response::no_content())
-//! }
-//! ```
 
 use crate::ICAP_VERSION;
 use crate::error::{Error, IcapResult};

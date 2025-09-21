@@ -620,7 +620,6 @@ pub struct ServerBuilder {
 
 impl ServerBuilder {
     #[cfg(feature = "tls-rustls")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "tls-rustls")))]
     /// Enables ICAPS (ICAP over TLS) using Rustls by loading the server certificate
     /// chain and private key from PEM files.
     ///
@@ -682,7 +681,6 @@ impl ServerBuilder {
     }
 
     #[cfg(feature = "tls-rustls")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "tls-rustls")))]
     /// Enables **mutual TLS (mTLS)** using Rustls: clients must present a certificate
     /// that validates against the provided CA bundle.
     ///
