@@ -306,7 +306,7 @@ impl ClientBuilder {
 impl Default for ClientBuilder {
     fn default() -> Self {
         Self {
-            host: Some("localost".to_string()),
+            host: Some("localhost".to_string()),
             port: Some(1344),
             host_override: None,
             default_headers: HeaderMap::new(),

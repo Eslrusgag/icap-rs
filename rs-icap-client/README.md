@@ -87,9 +87,6 @@ These are effective only when URI starts with `icaps://` **and** the binary is b
 - `-v, --verbose` — Print parsed ICAP response headers and metadata
 - `-p, --print-request` — Print **exact ICAP wire** that would be sent, then exit
 - `-d, --debug-level <1..5>` — Enable logs (1=errors … 5=trace)
-
-> Run `rs-icap-client --help` to see the auto‑generated usage for your build (features can affect flags).
-
 ---
 
 ## Examples

@@ -1,4 +1,4 @@
-# icap-rs — ICAP protocol for Rust (client & mini server)
+# icap-rs — ICAP protocol for Rust
 
 A Rust implementation of the **ICAP** protocol ([RFC 3507]) providing a client API and a server.
 
@@ -226,7 +226,7 @@ use icap_rs::Client;
 
 ## Server
 
-- Minimal async ICAP server built on Tokio.
+- Async ICAP server built on Tokio.
 - **Routing per service**, with **one handler** able to serve multiple methods.
 - **Automatic `OPTIONS`** per service: `Methods` injected from registered routes; `Max-Connections` inherited from
   global limit.
@@ -253,7 +253,7 @@ serialization.
 
 ### Quick start — Server (plaintext)
 
-A minimal server exposing two services (`reqmod`, `respmod`) and replying `204 No Content`.
+A server exposing two services (`reqmod`, `respmod`) and replying `204 No Content`.
 
 ```rust,no_run
 use icap_rs::{Server, Request, Response, StatusCode};
@@ -347,7 +347,7 @@ async fn main() -> IcapResult<()> {
 
 ## TLS (ICAPS) — **Server**
 
-The server can terminate TLS (“ICAPS”) directly using **rustls** (recommended)
+The server can terminate TLS (“ICAPS”) directly using **rustls**
 
 > **Port choice:** there is no official IANA port for ICAPS.  
 > This README uses **13443** for the TLS server examples.  
@@ -359,7 +359,6 @@ The server can terminate TLS (“ICAPS”) directly using **rustls** (recommende
 Choose exactly **one** TLS stack:
 
 ```toml
-# RUSTLS (recommended): enable rustls and choose ONE provider
 [dependencies.icap-rs]
 version = "actual-version"
 features = ["tls-rustls", "tls-rustls-ring"]      # or: ["tls-rustls", "tls-rustls-aws-lc"]
@@ -445,5 +444,4 @@ async fn main() -> icap_rs::error::IcapResult<()> {
 - More complete `OPTIONS` helpers and better defaults.
 - TLS client auth (mTLS).
 - Connection pooling beyond a single keep-alive connection.
-
 ---

@@ -1,4 +1,6 @@
-use clap::{Parser, ValueEnum};
+use clap::builder::styling::{AnsiColor, Color, Style, Styles};
+use clap::{Parser, Subcommand, ValueEnum};
+
 use http::{
     HeaderName, HeaderValue, Method, Request as HttpRequest, Response as HttpResponse, StatusCode,
     Version,
@@ -18,44 +20,38 @@ use std::time::Duration;
 const BIN_NAME: &str = env!("CARGO_PKG_NAME");
 const BIN_VER: &str = env!("CARGO_PKG_VERSION");
 
-pub fn cli_styles() -> clap::builder::Styles {
-    clap::builder::Styles::styled()
+pub fn cli_styles() -> Styles {
+    Styles::styled()
         .usage(
-            anstyle::Style::new()
+            Style::new()
                 .bold()
                 .underline()
-                .fg_color(Some(anstyle::Color::Ansi(anstyle::AnsiColor::Green))),
+                .fg_color(Some(Color::Ansi(AnsiColor::Green))),
         )
         .header(
-            anstyle::Style::new()
+            Style::new()
                 .bold()
                 .underline()
-                .fg_color(Some(anstyle::Color::Ansi(anstyle::AnsiColor::Green))),
+                .fg_color(Some(Color::Ansi(AnsiColor::Green))),
         )
-        .literal(
-            anstyle::Style::new()
-                .fg_color(Some(anstyle::Color::Ansi(anstyle::AnsiColor::BrightCyan))),
-        )
+        .literal(Style::new().fg_color(Some(Color::Ansi(AnsiColor::BrightCyan))))
         .invalid(
-            anstyle::Style::new()
+            Style::new()
                 .bold()
-                .fg_color(Some(anstyle::Color::Ansi(anstyle::AnsiColor::Red))),
+                .fg_color(Some(Color::Ansi(AnsiColor::Red))),
         )
         .error(
-            anstyle::Style::new()
+            Style::new()
                 .bold()
-                .fg_color(Some(anstyle::Color::Ansi(anstyle::AnsiColor::Red))),
+                .fg_color(Some(Color::Ansi(AnsiColor::Red))),
         )
         .valid(
-            anstyle::Style::new()
+            Style::new()
                 .bold()
                 .underline()
-                .fg_color(Some(anstyle::Color::Ansi(anstyle::AnsiColor::BrightCyan))),
+                .fg_color(Some(Color::Ansi(AnsiColor::BrightCyan))),
         )
-        .placeholder(
-            anstyle::Style::new()
-                .fg_color(Some(anstyle::Color::Ansi(anstyle::AnsiColor::BrightBlue))),
-        )
+        .placeholder(Style::new().fg_color(Some(Color::Ansi(AnsiColor::BrightBlue))))
 }
 
 #[derive(ValueEnum, Clone, Debug)]
@@ -69,8 +65,8 @@ enum TlsBackendCli {
 #[command(
     name = "rs-icap-client",
     about = "Rust ICAP client implementation",
+    version,
     styles=cli_styles(),
-    disable_version_flag = true,
 )]
 struct Args {
     /// Full ICAP URI like icap://host[:port]/service or icaps://host[:port]/service
@@ -137,7 +133,7 @@ struct Args {
     #[arg(long = "tls-backend", value_enum)]
     tls_backend: Option<TlsBackendCli>,
 
-    /// Disable certificate verification (may be ignored for rustls 0.23)
+    /// Disable certificate verification
     #[arg(long, action = clap::ArgAction::SetTrue)]
     insecure: bool,
 
