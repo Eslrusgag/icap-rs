@@ -19,14 +19,6 @@ use rustls::pki_types::{CertificateDer, ServerName};
 use crate::error::IcapResult;
 use crate::net::Conn;
 
-/// Compile-time guard: make sure exactly one provider feature is enabled.
-#[cfg(all(not(feature = "tls-rustls-ring"), not(feature = "tls-rustls-aws-lc")))]
-compile_error!("Enable exactly one provider feature: `tls-rustls-ring` OR `tls-rustls-aws-lc`.");
-#[cfg(all(feature = "tls-rustls-ring", feature = "tls-rustls-aws-lc"))]
-compile_error!(
-    "Enable exactly one provider feature: `tls-rustls-ring` OR `tls-rustls-aws-lc` (not both)."
-);
-
 /// Configuration for the rustls-based TLS connector.
 #[derive(Debug, Clone)]
 pub struct RustlsConfig {
@@ -67,14 +59,8 @@ impl crate::client::tls::TlsConnector for RustlsConnector {
             let _ = roots.add(cert.clone());
         }
 
-        // Choose a crypto provider according to enabled feature.
-        #[cfg(feature = "tls-rustls-ring")]
         let provider: Arc<rustls::crypto::CryptoProvider> =
             rustls::crypto::ring::default_provider().into();
-
-        #[cfg(feature = "tls-rustls-aws-lc")]
-        let provider: Arc<rustls::crypto::CryptoProvider> =
-            rustls::crypto::aws_lc_rs::default_provider().into();
 
         // Build client config with safe defaults and our root store.
         let cfg: ClientConfig = ClientConfig::builder_with_provider(provider)

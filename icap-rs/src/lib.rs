@@ -19,3 +19,6 @@ pub const LIB_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const MAX_HDR_BYTES: usize = 64 * 1024;
 /// Supported ICAP protocol version.
 pub const ICAP_VERSION: &str = "ICAP/1.0";
+
+#[doc = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/docs/tls.md"))]
+pub mod tls_docs {}

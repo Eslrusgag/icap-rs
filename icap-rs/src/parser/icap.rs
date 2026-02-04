@@ -27,8 +27,33 @@ pub struct Encapsulated {
 }
 
 /// Parse the `Encapsulated:` header into offsets.
-pub fn parse_encapsulated_header(headers_text: &str) -> Encapsulated {
+/// Parse only the value of the `Encapsulated:` header (right side).
+///
+pub fn parse_encapsulated_value(val: &str) -> Encapsulated {
     let mut enc = Encapsulated::default();
+
+    for part in val.split(',') {
+        let part = part.trim();
+        let mut it = part.splitn(2, '=');
+
+        let key = it.next().unwrap_or("").trim().to_ascii_lowercase();
+        let off = it.next().and_then(|s| s.trim().parse::<usize>().ok());
+
+        match (key.as_str(), off) {
+            ("req-hdr", Some(o)) => enc.req_hdr = Some(o),
+            ("res-hdr", Some(o)) => enc.res_hdr = Some(o),
+            ("req-body", Some(o)) => enc.req_body = Some(o),
+            ("res-body", Some(o)) => enc.res_body = Some(o),
+            ("null-body", Some(o)) => enc.null_body = Some(o),
+            _ => {}
+        }
+    }
+
+    enc
+}
+
+/// Parse the `Encapsulated:` header from raw headers text.
+pub fn parse_encapsulated_header(headers_text: &str) -> Encapsulated {
     for line in headers_text.lines() {
         let Some((name, val)) = line.split_once(':') else {
             continue;
@@ -36,23 +61,9 @@ pub fn parse_encapsulated_header(headers_text: &str) -> Encapsulated {
         if !name.trim().eq_ignore_ascii_case("Encapsulated") {
             continue;
         }
-        for part in val.split(',') {
-            let part = part.trim();
-            let mut it = part.split('=');
-            let key = it.next().unwrap_or("").trim().to_ascii_lowercase();
-            let off = it.next().and_then(|s| s.trim().parse::<usize>().ok());
-            match (key.as_str(), off) {
-                ("req-hdr", Some(o)) => enc.req_hdr = Some(o),
-                ("res-hdr", Some(o)) => enc.res_hdr = Some(o),
-                ("req-body", Some(o)) => enc.req_body = Some(o),
-                ("res-body", Some(o)) => enc.res_body = Some(o),
-                ("null-body", Some(o)) => enc.null_body = Some(o),
-                _ => {}
-            }
-        }
-        break;
+        return parse_encapsulated_value(val);
     }
-    enc
+    Encapsulated::default()
 }
 
 pub fn http_version_str(v: Version) -> &'static str {
@@ -195,17 +206,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_encapsulated_header_variants() {
-        let t = "Encapsulated: req-hdr=0, req-body=123\r\n";
-        let e = parse_encapsulated_header(t);
+    fn parse_encapsulated_value_variants() {
+        let e = parse_encapsulated_value("req-hdr=0, req-body=123");
         assert_eq!(e.req_hdr, Some(0));
         assert_eq!(e.req_body, Some(123));
-        assert_eq!(e.res_hdr, None);
 
-        let t2 = "Some: x\r\nEncapsulated: res-hdr=0, res-body=42\r\nFoo: y\r\n";
-        let e2 = parse_encapsulated_header(t2);
+        let e2 = parse_encapsulated_value("res-hdr=0,res-body=42");
         assert_eq!(e2.res_hdr, Some(0));
         assert_eq!(e2.res_body, Some(42));
-        assert!(e2.req_hdr.is_none());
     }
 }

@@ -64,6 +64,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::{RootCertStore, ServerConfig};
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::future::Future;
 use std::path::PathBuf;
 use std::str;
@@ -212,20 +213,7 @@ impl Server {
                             if let Err(e) = sock.write_all(&bytes).await {
                                 warn!(client=%addr, error=%e, "failed to send 503");
                             } else {
-                                let _ = sock.set_linger(Some(std::time::Duration::from_secs(1)));
-                                let mut tmp = [0u8; 1024];
-                                loop {
-                                    match sock.try_read(&mut tmp) {
-                                        Ok(0) => break,
-                                        Ok(_) => continue,
-                                        Err(ref e)
-                                            if e.kind() == std::io::ErrorKind::WouldBlock =>
-                                        {
-                                            break;
-                                        }
-                                        Err(_) => break,
-                                    }
-                                }
+                                let _ = sock.shutdown().await;
                             }
                         }
                         Err(e) => warn!(client=%addr, error=%e, "failed to serialize 503"),
@@ -311,9 +299,6 @@ impl Server {
     /// Reads one full ICAP message (headers + chunked body if any), parses and dispatches it,
     /// writes the response, then repeats until the peer closes the connection.
     /// Handle a single client connection (persistent / keep-alive).
-    ///
-    /// Reads one full ICAP message (headers + chunked body if any), parses and dispatches it,
-    /// writes the response, then repeats until the peer closes the connection.
     async fn handle_connection<S>(
         mut socket: S,
         routes: Arc<HashMap<String, RouteEntry>>,
@@ -777,12 +762,7 @@ impl ServerBuilder {
         F: Fn(Request) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = IcapResult<Response>> + Send + 'static,
     {
-        use std::collections::hash_map::Entry;
-
-        let key = service.to_string();
-
-        // Ensure service slot exists
-        let entry = match self.routes.entry(key.clone()) {
+        let entry = match self.routes.entry(service.to_owned()) {
             Entry::Occupied(o) => o.into_mut(),
             Entry::Vacant(v) => v.insert(RouteEntry {
                 handlers: HashMap::new(),
@@ -927,30 +907,24 @@ impl ServerBuilder {
     }
 }
 
-#[cfg(any(feature = "tls-rustls-ring", feature = "tls-rustls-aws-lc"))]
+#[cfg(feature = "tls-rustls")]
 fn install_rustls_provider_once() {
     use std::sync::Once;
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
-        #[cfg(feature = "tls-rustls-ring")]
+        #[cfg(feature = "tls-rustls")]
         {
             rustls::crypto::ring::default_provider()
                 .install_default()
                 .expect("install ring crypto provider");
-        }
-        #[cfg(all(feature = "tls-rustls-aws-lc", not(feature = "tls-rustls-ring")))]
-        {
-            rustls::crypto::aws_lc_rs::default_provider()
-                .install_default()
-                .expect("install aws-lc-rs crypto provider");
         }
     });
 }
 
 #[cfg(feature = "tls-rustls")]
 fn load_rustls_acceptor(tls: &TlsParams) -> Result<TlsAcceptor, String> {
-    // Ensure a crypto provider is installed (rustls 0.23 requirement)
-    #[cfg(any(feature = "tls-rustls-ring", feature = "tls-rustls-aws-lc"))]
+    // Ensure a crypto provider is installed
+    #[cfg(feature = "tls-rustls")]
     install_rustls_provider_once();
 
     use std::io::BufReader;

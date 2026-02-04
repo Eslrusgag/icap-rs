@@ -500,17 +500,17 @@ impl Request<Vec<u8>> {
     }
 }
 
-/// Parse ICAP request from bytes (used in tests and simple flows).
+/// Parse ICAP request from bytes
 ///
 /// Note: this parser constructs `Request<Vec<u8>>`, i.e. a fully buffered
 /// embedded HTTP body when present.
 pub(crate) fn parse_icap_request(data: &[u8]) -> IcapResult<Request<Vec<u8>>> {
     trace!("parse_icap_request: len={}", data.len());
+
     let hdr_end = find_double_crlf(data).ok_or("ICAP request headers not complete")?;
     let head = &data[..hdr_end];
     let head_str = std::str::from_utf8(head)?;
 
-    // Request line: METHOD <icap-uri> ICAP/1.0
     let mut lines = head_str.split("\r\n");
     let request_line = lines.next().ok_or("Empty request")?;
     let mut parts = request_line.split_whitespace();
@@ -529,7 +529,6 @@ pub(crate) fn parse_icap_request(data: &[u8]) -> IcapResult<Request<Vec<u8>>> {
     if !version.eq_ignore_ascii_case(ICAP_VERSION) {
         return Err(Error::InvalidVersion(version.to_string()));
     }
-    trace!("parse_icap_request: {} {}", method, icap_uri);
 
     let mut icap_headers = HeaderMap::new();
     for line in lines {
@@ -546,12 +545,10 @@ pub(crate) fn parse_icap_request(data: &[u8]) -> IcapResult<Request<Vec<u8>>> {
         }
     }
 
-    // RFC 3507: Host is mandatory for ICAP requests.
     if !icap_headers.contains_key("Host") {
         return Err(Error::MissingHeader("Host"));
     }
 
-    // RFC 3507 §4.3/§4.4: for REQMOD/RESPMOD Encapsulated is mandatory.
     if matches!(method, Method::ReqMod | Method::RespMod)
         && !icap_headers.contains_key("Encapsulated")
     {
@@ -577,11 +574,39 @@ pub(crate) fn parse_icap_request(data: &[u8]) -> IcapResult<Request<Vec<u8>>> {
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.trim().parse::<usize>().ok());
 
-    let rest = &data[hdr_end..];
-    let embedded = if rest.is_empty() {
-        None
-    } else if let Some(http_hdr_end) = find_double_crlf(rest) {
-        let http_head_bytes = &rest[..http_hdr_end];
+    // Encapsulated area: сразу после ICAP headers CRLFCRLF
+    let enc_area = &data[hdr_end..];
+
+    let enc = icap_headers
+        .get("Encapsulated")
+        .and_then(|v| v.to_str().ok())
+        .map(crate::parser::icap::parse_encapsulated_value)
+        .unwrap_or_default();
+
+    let http_hdr_off = match method {
+        Method::ReqMod => enc.req_hdr,
+        Method::RespMod => enc.res_hdr,
+        Method::Options => None,
+    };
+
+    let embedded = if let Some(hdr_off) = http_hdr_off {
+        let hdr_end_off = next_offset_after(&enc, hdr_off);
+        let http_region = slice_encapsulated(enc_area, hdr_off, hdr_end_off)?;
+
+        let Some(http_hdr_len) = find_double_crlf(http_region) else {
+            return Ok(Request {
+                method,
+                service,
+                icap_headers,
+                embedded: None,
+                preview_size,
+                allow_204,
+                allow_206,
+                preview_ieof: false,
+            });
+        };
+        let http_head_bytes = &http_region[..http_hdr_len];
+        let inline_body = &http_region[http_hdr_len..];
 
         let first_line_end =
             memmem::find(http_head_bytes, b"\r\n").unwrap_or(http_head_bytes.len());
@@ -592,82 +617,95 @@ pub(crate) fn parse_icap_request(data: &[u8]) -> IcapResult<Request<Vec<u8>>> {
         let mut hlines = http_head_str.split("\r\n");
         let start = hlines.next().unwrap_or_default();
 
+        let mut http_headers = HeaderMap::new();
+        for line in hlines {
+            if line.is_empty() {
+                break;
+            }
+            if let Some(colon) = memchr(b':', line.as_bytes()) {
+                let name = &line[..colon];
+                let value = line[colon + 1..].trim();
+                http_headers.insert(
+                    HeaderName::from_bytes(name.as_bytes())?,
+                    HeaderValue::from_str(value)?,
+                );
+            }
+        }
+
+        let body_off = match method {
+            Method::ReqMod => enc.req_body,
+            Method::RespMod => enc.res_body,
+            Method::Options => None,
+        };
+
+        let no_body = body_off.is_none() && enc.null_body.is_some();
+
+        let body_bytes: Vec<u8> = if no_body {
+            Vec::new()
+        } else if let Some(boff) = body_off {
+            // Граница тела — следующий offset после boff, либо конец enc_area.
+            let bend = next_offset_after(&enc, boff);
+            let body_slice = slice_encapsulated(enc_area, boff, bend)?;
+
+            if boff < hdr_off {
+                return Err("Encapsulated offsets invalid (body before headers)".into());
+            }
+
+            body_slice.to_vec()
+        } else {
+            inline_body.to_vec()
+        };
+
         if is_response {
             // HTTP Response
             let mut p = start.split_whitespace();
             let _ver = p.next().unwrap_or("HTTP/1.1");
             let code = p.next().unwrap_or("200").parse::<u16>().unwrap_or(200);
-            trace!("parse_icap_request: embedded HTTP response code={}", code);
 
-            let mut http_headers = HeaderMap::new();
-            for line in hlines {
-                if line.is_empty() {
-                    break;
-                }
-                if let Some(colon) = memchr(b':', line.as_bytes()) {
-                    let name = &line[..colon];
-                    let value = line[colon + 1..].trim();
-                    http_headers.insert(
-                        HeaderName::from_bytes(name.as_bytes())?,
-                        HeaderValue::from_str(value)?,
-                    );
-                }
-            }
-            let body = rest[http_hdr_end..].to_vec();
             let mut builder = HttpResponse::builder()
                 .status(HttpStatus::from_u16(code).unwrap_or(HttpStatus::OK))
                 .version(Version::HTTP_11);
+
             {
                 let headers_mut = builder
                     .headers_mut()
                     .ok_or("response builder: headers_mut is None")?;
                 headers_mut.extend(http_headers);
             }
+
             let head = builder
                 .body(())
                 .map_err(|e| format!("build http::Response head: {e}"))?;
+
             Some(EmbeddedHttp::Resp {
                 head,
-                body: Body::Full { reader: body },
+                body: Body::Full { reader: body_bytes },
             })
         } else {
             // HTTP Request
             let mut p = start.split_whitespace();
             let m = p.next().unwrap_or("GET");
             let u = p.next().unwrap_or("/");
-            trace!("parse_icap_request: embedded HTTP request {} {}", m, u);
 
-            let mut http_headers = HeaderMap::new();
-            for line in hlines {
-                if line.is_empty() {
-                    break;
-                }
-                if let Some(colon) = memchr(b':', line.as_bytes()) {
-                    let name = &line[..colon];
-                    let value = line[colon + 1..].trim();
-                    http_headers.insert(
-                        HeaderName::from_bytes(name.as_bytes())?,
-                        HeaderValue::from_str(value)?,
-                    );
-                }
-            }
-            let body = rest[http_hdr_end..].to_vec();
             let mut builder = HttpRequest::builder()
                 .method(m)
                 .uri(u)
                 .version(Version::HTTP_11);
+
             {
                 let headers_mut = builder
                     .headers_mut()
                     .ok_or("request builder: headers_mut is None")?;
                 headers_mut.extend(http_headers);
             }
+
             let head = builder
                 .body(())
                 .map_err(|e| format!("build http::Request head: {e}"))?;
+
             Some(EmbeddedHttp::Req {
                 head,
-                body: Body::Full { reader: body },
+                body: Body::Full { reader: body_bytes },
             })
         }
     } else {
@@ -684,6 +722,43 @@ pub(crate) fn parse_icap_request(data: &[u8]) -> IcapResult<Request<Vec<u8>>> {
         allow_206,
         preview_ieof: false,
     })
+}
+
+fn next_offset_after(enc: &crate::parser::icap::Encapsulated, start: usize) -> Option<usize> {
+    let mut min: Option<usize> = None;
+
+    let mut consider = |v: Option<usize>| {
+        if let Some(o) = v {
+            if o > start {
+                min = Some(match min {
+                    Some(m) => m.min(o),
+                    None => o,
+                });
+            }
+        }
+    };
+
+    consider(enc.req_hdr);
+    consider(enc.res_hdr);
+    consider(enc.req_body);
+    consider(enc.res_body);
+    consider(enc.null_body);
+
+    min
+}
+
+fn slice_encapsulated(enc_area: &[u8], start: usize, end: Option<usize>) -> IcapResult<&[u8]> {
+    if start > enc_area.len() {
+        return Err("Encapsulated offset out of bounds".into());
+    }
+    let end = end.unwrap_or(enc_area.len());
+    if end > enc_area.len() {
+        return Err("Encapsulated end offset out of bounds".into());
+    }
+    if end < start {
+        return Err("Encapsulated offsets invalid (end < start)".into());
+    }
+    Ok(&enc_area[start..end])
 }
 
 #[cfg(test)]
@@ -754,6 +829,41 @@ mod tests {
             req.icap_headers.get("Host").unwrap(),
             &HeaderValue::from_static("icap2.example.org")
         );
+    }
+
+    #[test]
+    fn parse_reqmod_body_is_sliced_by_next_offset() {
+        let http = b"GET / HTTP/1.1\r\nHost: ex\r\n\r\n";
+        let body = b"12345678";
+        let tail = b"ZZZZ"; // это будет идти после null-body boundary
+
+        let req_body_off = http.len(); // тело сразу после http headers
+        let null_body_off = req_body_off + body.len(); // конец тела
+
+        let raw = format!(
+            "REQMOD icap://icap.example.org/icap/test ICAP/1.0\r\n\
+Host: icap.example.org\r\n\
+Encapsulated: req-hdr=0, req-body={}, null-body={}\r\n\
+\r\n",
+            req_body_off, null_body_off
+        )
+        .into_bytes();
+
+        let mut bytes = raw;
+        bytes.extend_from_slice(http);
+        bytes.extend_from_slice(body);
+        bytes.extend_from_slice(tail);
+
+        let r = parse_icap_request(&bytes).expect("parse");
+        match r.embedded {
+            Some(EmbeddedHttp::Req {
+                body: Body::Full { reader },
+                ..
+            }) => {
+                assert_eq!(reader, body);
+            }
+            _ => panic!("expected embedded req with full body"),
+        }
     }
 
     #[test]
