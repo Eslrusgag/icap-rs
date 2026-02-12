@@ -135,19 +135,19 @@ impl From<String> for Method {
     }
 }
 
-type BoxedUnitFut = Pin<Box<dyn Future<Output = IcapResult<()>> + Send>>;
+type BoxedUnitFut = Pin<Box<dyn Future<Output = IcapResult<()>> + Send + Sync>>;
 
 /// A one-shot handle to send `ICAP/1.0 100 Continue` when the handler decides
 /// to read past the preview boundary (server-side only).
 pub struct ContinueHandle {
-    send: Option<Box<dyn FnOnce() -> BoxedUnitFut + Send>>,
+    send: Option<Box<dyn FnOnce() -> BoxedUnitFut + Send + Sync>>,
 }
 
 impl ContinueHandle {
     pub fn new<F, Fut>(f: F) -> Self
     where
-        F: FnOnce() -> Fut + Send + 'static,
-        Fut: Future<Output = IcapResult<()>> + Send + 'static,
+        F: FnOnce() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = IcapResult<()>> + Send + Sync + 'static,
     {
         Self {
             send: Some(Box::new(move || Box::pin(f()))),
