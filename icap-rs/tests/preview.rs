@@ -68,43 +68,43 @@ async fn start_server(addr: &str) {
                 }
 
                 let preview_n = req.preview_size.unwrap_or(0);
-                if let Some(total_len) = maybe_len {
-                    if total_len <= preview_n {
-                        return Ok(Response::no_content().try_set_istag(ISTAG)?);
-                    }
+                if let Some(total_len) = maybe_len
+                    && total_len <= preview_n
+                {
+                    return Response::no_content().try_set_istag(ISTAG);
                 }
 
-                if let Some(EmbeddedHttp::Req { head, body }) = req.embedded {
-                    if let Body::Full { reader } = body {
-                        let mut headers = head.headers().clone();
-                        headers.remove(header::TRANSFER_ENCODING);
-                        headers.remove(header::TE);
-                        headers.insert(
-                            header::CONTENT_LENGTH,
-                            HeaderValue::from_str(&reader.len().to_string()).unwrap(),
-                        );
+                if let Some(EmbeddedHttp::Req { head, body }) = req.embedded
+                    && let Body::Full { reader } = body
+                {
+                    let mut headers = head.headers().clone();
+                    headers.remove(header::TRANSFER_ENCODING);
+                    headers.remove(header::TE);
+                    headers.insert(
+                        header::CONTENT_LENGTH,
+                        HeaderValue::from_str(&reader.len().to_string()).unwrap(),
+                    );
 
-                        let mut builder = HttpRequest::builder()
-                            .method(head.method().clone())
-                            .uri(head.uri().clone())
-                            .version(head.version());
+                    let mut builder = HttpRequest::builder()
+                        .method(head.method().clone())
+                        .uri(head.uri().clone())
+                        .version(head.version());
 
-                        if let Some(h) = builder.headers_mut() {
-                            *h = headers;
-                        }
-
-                        let http_req = builder
-                            .body(reader)
-                            .map_err(|e| format!("build echo http::Request: {e}"))?;
-
-                        let resp = Response::new(StatusCode::OK, "OK")
-                            .try_set_istag(ISTAG)?
-                            .with_http_request(&http_req)?;
-                        return Ok(resp);
+                    if let Some(h) = builder.headers_mut() {
+                        *h = headers;
                     }
+
+                    let http_req = builder
+                        .body(reader)
+                        .map_err(|e| format!("build echo http::Request: {e}"))?;
+
+                    let resp = Response::new(StatusCode::OK, "OK")
+                        .try_set_istag(ISTAG)?
+                        .with_http_request(&http_req)?;
+                    return Ok(resp);
                 }
 
-                Ok(Response::no_content().try_set_istag(ISTAG)?)
+                Response::no_content().try_set_istag(ISTAG)
             },
             Some(
                 ServiceOptions::new()
@@ -187,18 +187,18 @@ async fn icap_reqmod_with_preview(
                 Ok(0) => break,
                 Ok(n) => {
                     resp.extend_from_slice(&tmp[..n]);
-                    if let Some(h_end) = find_double_crlf(&resp) {
-                        if let Some(code) = icap_status_code(&resp) {
-                            if code == 204 {
-                                break;
-                            }
-                            if let Some(off2) = find_double_crlf(&resp[h_end + 4..]) {
-                                let http_head = &resp[h_end + 4..h_end + 4 + off2];
-                                if let Some(cl) = http_content_length(http_head) {
-                                    let have = resp.len() - (h_end + 4 + off2 + 4);
-                                    if have >= cl {
-                                        break;
-                                    }
+                    if let Some(h_end) = find_double_crlf(&resp)
+                        && let Some(code) = icap_status_code(&resp)
+                    {
+                        if code == 204 {
+                            break;
+                        }
+                        if let Some(off2) = find_double_crlf(&resp[h_end + 4..]) {
+                            let http_head = &resp[h_end + 4..h_end + 4 + off2];
+                            if let Some(cl) = http_content_length(http_head) {
+                                let have = resp.len() - (h_end + 4 + off2 + 4);
+                                if have >= cl {
+                                    break;
                                 }
                             }
                         }

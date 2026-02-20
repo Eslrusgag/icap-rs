@@ -60,12 +60,15 @@
 pub mod options;
 
 use memchr::{memchr, memmem};
+#[cfg(feature = "tls-rustls")]
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+#[cfg(feature = "tls-rustls")]
 use rustls::{RootCertStore, ServerConfig};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::future::Future;
+#[cfg(feature = "tls-rustls")]
 use std::path::PathBuf;
 use std::str;
 use std::sync::Arc;
@@ -81,6 +84,7 @@ use crate::request::{Body, parse_icap_request};
 pub use crate::server::options::{ServiceOptions, TransferBehavior};
 use crate::{EmbeddedHttp, Method, Request, Response, StatusCode};
 use smallvec::SmallVec;
+#[cfg(feature = "tls-rustls")]
 use tokio_rustls::TlsAcceptor;
 
 /// A per-service ICAP handler.
@@ -362,13 +366,9 @@ impl Server {
                     let mut chunked_slice = &buf[body_abs..msg_end];
                     let decoded = dechunk_icap_entity(&mut chunked_slice)
                         .map_err(|e| format!("dechunk ICAP entity: {e}"))?;
-
-                    let dest_len = decoded.len();
-                    if buf.len() < body_abs + dest_len {
-                        buf.resize(body_abs + dest_len, 0);
-                    }
-                    buf[body_abs..body_abs + dest_len].copy_from_slice(&decoded);
-                    msg_end = body_abs + dest_len;
+                    let decoded_len = decoded.len();
+                    buf.splice(body_abs..msg_end, decoded);
+                    msg_end = body_abs + decoded_len;
                 }
             }
 
@@ -431,36 +431,42 @@ impl Server {
                                 Response::new(StatusCode::OK, "OK").try_set_istag(&istag_now)?;
 
                             match (&req.embedded, method) {
-                                (Some(EmbeddedHttp::Resp { head, body }), Method::RespMod) => {
-                                    if let Body::Full { reader } = body {
-                                        let mut builder = http::Response::builder()
-                                            .status(head.status())
-                                            .version(head.version());
-                                        if let Some(h) = builder.headers_mut() {
-                                            h.extend(head.headers().clone());
-                                        }
-                                        let http_resp =
-                                            builder.body(reader.clone()).map_err(|e| {
-                                                format!("build http::Response from embedded: {e}")
-                                            })?;
-                                        out = out.with_http_response(&http_resp)?;
+                                (
+                                    Some(EmbeddedHttp::Resp {
+                                        head,
+                                        body: Body::Full { reader },
+                                    }),
+                                    Method::RespMod,
+                                ) => {
+                                    let mut builder = http::Response::builder()
+                                        .status(head.status())
+                                        .version(head.version());
+                                    if let Some(h) = builder.headers_mut() {
+                                        h.extend(head.headers().clone());
                                     }
+                                    let http_resp = builder.body(reader.clone()).map_err(|e| {
+                                        format!("build http::Response from embedded: {e}")
+                                    })?;
+                                    out = out.with_http_response(&http_resp)?;
                                 }
-                                (Some(EmbeddedHttp::Req { head, body }), Method::ReqMod) => {
-                                    if let Body::Full { reader } = body {
-                                        let mut builder = http::Request::builder()
-                                            .method(head.method().clone())
-                                            .uri(head.uri().clone())
-                                            .version(head.version());
-                                        if let Some(h) = builder.headers_mut() {
-                                            h.extend(head.headers().clone());
-                                        }
-                                        let http_req =
-                                            builder.body(reader.clone()).map_err(|e| {
-                                                format!("build http::Request from embedded: {e}")
-                                            })?;
-                                        out = out.with_http_request(&http_req)?;
+                                (
+                                    Some(EmbeddedHttp::Req {
+                                        head,
+                                        body: Body::Full { reader },
+                                    }),
+                                    Method::ReqMod,
+                                ) => {
+                                    let mut builder = http::Request::builder()
+                                        .method(head.method().clone())
+                                        .uri(head.uri().clone())
+                                        .version(head.version());
+                                    if let Some(h) = builder.headers_mut() {
+                                        h.extend(head.headers().clone());
                                     }
+                                    let http_req = builder.body(reader.clone()).map_err(|e| {
+                                        format!("build http::Request from embedded: {e}")
+                                    })?;
+                                    out = out.with_http_request(&http_req)?;
                                 }
                                 _ => {}
                             }
@@ -578,6 +584,7 @@ fn dechunk_icap_entity(data: &mut &[u8]) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+#[cfg(feature = "tls-rustls")]
 #[derive(Clone)]
 struct TlsParams {
     cert_path: PathBuf,
@@ -600,6 +607,7 @@ pub struct ServerBuilder {
     max_connections_global: Option<usize>,
     aliases: HashMap<String, String>,
     default_service: Option<String>,
+    #[cfg(feature = "tls-rustls")]
     tls: Option<TlsParams>,
 }
 
@@ -885,13 +893,6 @@ impl ServerBuilder {
         } else {
             None
         };
-
-        #[cfg(not(feature = "tls-rustls"))]
-        {
-            if self.tls.is_some() {
-                return Err("This build has no TLS support. Enable feature `tls-rustls`.".into());
-            }
-        }
 
         Ok(Server {
             listener,

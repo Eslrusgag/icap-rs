@@ -25,6 +25,7 @@ A Rust implementation of the **ICAP** protocol ([RFC 3507]) providing a client A
 - Embedded HTTP request/response serialization on the ICAP wire.
 - **Preview** negotiation (incl. `Preview: 0` and `ieof` fast path).
 - Chunked uploads, streaming large bodies after `100 Continue`.
+- Streaming response body directly into an `AsyncWrite` sink (`...into_writer`) to avoid buffering.
 - Keep-Alive: reuse a single idle connection.
 - **ICAPS (TLS)** with `rustls` (ring) — see
 - **GitHub / crates.io**: [docs/tls.md](docs/tls.md)
@@ -51,6 +52,48 @@ async fn main() -> icap_rs::error::IcapResult<()> {
     let req = Request::options("respmod");
     let resp = client.send(&req).await?;
     println!("ICAP: {} {}", resp.status_code.as_str(), resp.status_text);
+    Ok(())
+}
+```
+
+### Streaming Request + Streaming Response (no buffered body)
+
+```rust,no_run
+use http::{Request as HttpRequest, Version};
+use icap_rs::{Client, Request};
+
+#[tokio::main]
+async fn main() -> icap_rs::error::IcapResult<()> {
+    let client = Client::builder()
+        .with_uri("icap://127.0.0.1:1344")?
+        .build();
+
+    // Head-only embedded HTTP request (no Vec<u8> body attached here)
+    let http_head = HttpRequest::builder()
+        .method("POST")
+        .uri("/upload")
+        .version(Version::HTTP_11)
+        .header("Host", "example.local")
+        .header("Content-Length", "0")
+        .body(())
+        .unwrap();
+
+    let req = Request::reqmod("scan")
+        .preview(0)
+        .preview_ieof()
+        .with_http_request_head(http_head);
+
+    // Stream request body from any AsyncRead source:
+    let src = tokio::io::empty();
+    // Stream response payload into any AsyncWrite sink:
+    let mut dst = tokio::io::sink();
+
+    let resp = client
+        .send_streaming_reader_into_writer(&req, src, &mut dst)
+        .await?;
+
+    // response body is empty because payload was forwarded to `dst`
+    assert!(resp.body.is_empty());
     Ok(())
 }
 ```

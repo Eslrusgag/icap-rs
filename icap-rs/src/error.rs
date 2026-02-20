@@ -20,11 +20,8 @@ pub enum Error {
     #[error("Network error: {0}")]
     Network(#[from] std::io::Error),
 
-    /// Client-side overall timeout while performing an ICAP operation.
-    ///
-    /// Returned by high-level client APIs when connecting, sending, or
-    /// receiving takes longer than the configured timeout.
-    #[error("Network timeout after {0:?}")]
+    /// Client Timeout
+    #[error("Client timeout after {0:?}")]
     ClientTimeout(Duration),
 
     /// The peer closed the connection before a complete ICAP header block
@@ -59,11 +56,11 @@ pub enum Error {
     #[error("Invalid protocol version: {0}")]
     InvalidVersion(String),
 
-    /// Invalid ISTag header (length/charset).
+    /// Invalid ISTag header
     #[error("Invalid ISTag: {0}")]
     InvalidISTag(String),
 
-    /// Missing required ICAP header (e.g. `Host`, `Encapsulated`, `ISTag`).
+    /// Missing required ICAP header
     #[error("Missing required header: {0}")]
     MissingHeader(&'static str),
 
@@ -78,10 +75,6 @@ pub enum Error {
     /// Service-related error.
     #[error("Service error: {0}")]
     Service(String),
-
-    /// Configuration error.
-    #[error("Configuration error: {0}")]
-    Configuration(String),
 
     /// Application handler error.
     #[error("Handler error: {0}")]
@@ -126,11 +119,6 @@ impl Error {
         Self::Service(message.into())
     }
 
-    /// Create a configuration error.
-    pub fn configuration(message: impl Into<String>) -> Self {
-        Self::Configuration(message.into())
-    }
-
     /// Create a handler error.
     pub fn handler(message: impl Into<String>) -> Self {
         Self::Handler(message.into())
@@ -164,12 +152,6 @@ impl From<&str> for Error {
     }
 }
 
-impl From<Box<dyn StdError + Send + Sync>> for Error {
-    fn from(err: Box<dyn StdError + Send + Sync>) -> Self {
-        Self::Unexpected(err.to_string())
-    }
-}
-
 /// Convenient alias for results in the ICAP library.
 pub type IcapResult<T> = Result<T, Error>;
 
@@ -195,12 +177,8 @@ impl From<Utf8Error> for Error {
     }
 }
 impl From<InvalidHeaderName> for Error {
-    fn from(e: InvalidHeaderName) -> Self {
-        Error::HttpParse(e.to_string())
-    }
+    fn from(e: InvalidHeaderName) -> Self { Error::Header(e.to_string()) }
 }
 impl From<InvalidHeaderValue> for Error {
-    fn from(e: InvalidHeaderValue) -> Self {
-        Error::HttpParse(e.to_string())
-    }
+    fn from(e: InvalidHeaderValue) -> Self { Error::Header(e.to_string()) }
 }

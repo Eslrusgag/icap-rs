@@ -11,8 +11,7 @@ use icap_rs::response::{Response, StatusCode};
 
 fn find_free_port() -> u16 {
     let sock = StdTcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
-    let port = sock.local_addr().unwrap().port();
-    port
+    sock.local_addr().unwrap().port()
 }
 
 async fn spawn_server_with_limit(limit: usize) -> (String, JoinHandle<()>) {

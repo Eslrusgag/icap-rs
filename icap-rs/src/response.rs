@@ -77,6 +77,14 @@ pub struct Response {
     pub body: Vec<u8>,
 }
 
+#[inline]
+fn ensure_owned_response<'a>(owned: &'a mut Option<Response>, original: &Response) -> &'a mut Response {
+    if owned.is_none() {
+        *owned = Some(original.clone());
+    }
+    owned.as_mut().expect("owned response")
+}
+
 impl Response {
     /// Create a new ICAP response with the given status code and status text.
     pub fn new(status_code: StatusCode, status_text: &str) -> Self {
@@ -155,54 +163,57 @@ impl Response {
 
     /// Serialize into raw ICAP bytes.
     pub fn to_raw(&self) -> IcapResult<Vec<u8>> {
-        let mut resp = self.clone();
-
-        let require_istag = resp.status_code.is_success();
+        let require_istag = self.status_code.is_success();
 
         if require_istag {
-            let istag = resp
+            let istag = self
                 .headers
                 .get("ISTag")
                 .ok_or(Error::MissingHeader("ISTag"))?
                 .to_str()
                 .map_err(|e| Error::Unexpected(e.to_string()))?;
             validate_istag(istag)?;
-        } else if let Some(v) = resp.headers.get("ISTag") {
+        } else if let Some(v) = self.headers.get("ISTag") {
             let s = v.to_str().map_err(|e| Error::Unexpected(e.to_string()))?;
             validate_istag(s)?;
         }
 
-        match resp.status_code {
+        let mut owned: Option<Response> = None;
+
+        match self.status_code {
             StatusCode::NO_CONTENT => {
-                if !resp.body.is_empty() {
+                if !self.body.is_empty() {
                     return Err(Error::Body("204 must not carry a body".into()));
                 }
-                if !resp.headers.contains_key("Encapsulated") {
-                    resp.headers.insert(
-                        HeaderName::from_static("encapsulated"),
-                        HeaderValue::from_static("null-body=0"),
-                    );
-                } else if resp.headers.get("Encapsulated").map(|v| v.as_bytes())
-                    != Some(b"null-body=0".as_slice())
-                {
-                    return Err(Error::Header(
-                        "204 requires Encapsulated: null-body=0".into(),
-                    ));
+                match self.headers.get("Encapsulated") {
+                    None => {
+                        ensure_owned_response(&mut owned, self).headers.insert(
+                            HeaderName::from_static("encapsulated"),
+                            HeaderValue::from_static("null-body=0"),
+                        );
+                    }
+                    Some(v) if v.as_bytes() != b"null-body=0".as_slice() => {
+                        return Err(Error::Header(
+                            "204 requires Encapsulated: null-body=0".into(),
+                        ));
+                    }
+                    Some(_) => {}
                 }
             }
             StatusCode::OK | StatusCode::PARTIAL_CONTENT => {
-                if !resp.headers.contains_key("Encapsulated") {
-                    if resp.body.is_empty() {
+                if !self.headers.contains_key("Encapsulated") {
+                    if self.body.is_empty() {
                         return Err(Error::MissingHeader(
                             "Encapsulated missing and cannot infer for 2xx with empty body; \
                          set it explicitly or use Response::with_http_response(...)",
                         ));
                     }
-                    if looks_like_http_resp(&resp.body) {
-                        let enc = compute_enc_for_res_body(&resp.body)?;
+                    if looks_like_http_resp(&self.body) {
+                        let enc = compute_enc_for_res_body(&self.body)?;
                         let hv = HeaderValue::from_str(&enc)
                             .map_err(|e| Error::Header(e.to_string()))?;
-                        resp.headers
+                        ensure_owned_response(&mut owned, self)
+                            .headers
                             .insert(HeaderName::from_static("encapsulated"), hv);
                     } else {
                         return Err(Error::Header(
@@ -212,20 +223,21 @@ impl Response {
                 }
             }
             _ => {
-                if !resp.headers.contains_key("Encapsulated") {
-                    if resp.body.is_empty() {
-                        resp.headers.insert(
+                if !self.headers.contains_key("Encapsulated") {
+                    if self.body.is_empty() {
+                        ensure_owned_response(&mut owned, self).headers.insert(
                             HeaderName::from_static("encapsulated"),
                             HeaderValue::from_static("null-body=0"),
                         );
-                    } else if looks_like_http_resp(&resp.body) {
-                        let enc = compute_enc_for_res_body(&resp.body)?;
+                    } else if looks_like_http_resp(&self.body) {
+                        let enc = compute_enc_for_res_body(&self.body)?;
                         let hv = HeaderValue::from_str(&enc)
                             .map_err(|e| Error::Header(e.to_string()))?;
-                        resp.headers
+                        ensure_owned_response(&mut owned, self)
+                            .headers
                             .insert(HeaderName::from_static("encapsulated"), hv);
                     } else {
-                        resp.headers.insert(
+                        ensure_owned_response(&mut owned, self).headers.insert(
                             HeaderName::from_static("encapsulated"),
                             HeaderValue::from_static("opt-body=0"),
                         );
@@ -234,7 +246,8 @@ impl Response {
             }
         }
 
-        crate::parser::serialize_icap_response(&resp)
+        let resp_ref = owned.as_ref().unwrap_or(self);
+        crate::parser::serialize_icap_response(resp_ref)
             .map_err(|e| Error::Serialization(e.to_string()))
     }
 
@@ -469,6 +482,81 @@ pub(crate) fn parse_icap_response(raw: &[u8]) -> IcapResult<Response> {
         status_text,
         headers,
         body,
+    })
+}
+
+pub(crate) fn parse_icap_response_head(raw: &[u8]) -> IcapResult<Response> {
+    trace!(len = raw.len(), "parse_icap_response_head");
+    if raw.is_empty() {
+        return Err("Empty response".into());
+    }
+
+    let hdr_end = find_double_crlf(raw).ok_or("ICAP response headers not complete")?;
+    let head = &raw[..hdr_end];
+    let head_str = std::str::from_utf8(head)?;
+    let mut lines = head_str.split("\r\n");
+
+    let status_line = lines.next().ok_or("Empty response")?;
+    let parts: Vec<&str> = status_line.split_whitespace().collect();
+    if parts.len() < 2 {
+        return Err("Invalid status line format".into());
+    }
+    if parts[0] != ICAP_VERSION {
+        return Err(Error::InvalidVersion(parts[0].to_string()));
+    }
+
+    let version = parts[0].to_string();
+    let status_code = match StatusCode::from_str(parts[1]) {
+        Ok(code) => code,
+        Err(_) => {
+            let code_num = parts[1].parse::<u16>().map_err(|_| "Invalid status code")?;
+            StatusCode::try_from(code_num)
+                .map_err(|_| format!("Unknown ICAP status code: {}", code_num))?
+        }
+    };
+    let status_text = if parts.len() > 2 {
+        parts[2..].join(" ")
+    } else {
+        String::new()
+    };
+
+    let mut headers = HeaderMap::new();
+    let mut seen_encapsulated = false;
+    for line in lines {
+        if line.is_empty() {
+            break;
+        }
+        if let Some(colon) = memchr(b':', line.as_bytes()) {
+            let name = &line[..colon];
+            let value = line[colon + 1..].trim();
+
+            if name.eq_ignore_ascii_case("Encapsulated") {
+                if seen_encapsulated {
+                    return Err(Error::Header("duplicate Encapsulated header".into()));
+                }
+                seen_encapsulated = true;
+            }
+            if name.eq_ignore_ascii_case("ISTag") {
+                validate_istag(value)?;
+            }
+
+            headers.insert(
+                HeaderName::from_bytes(name.as_bytes())?,
+                HeaderValue::from_str(value)?,
+            );
+        }
+    }
+
+    if status_code.is_success() && !headers.contains_key("ISTag") {
+        return Err(Error::MissingHeader("ISTag"));
+    }
+
+    Ok(Response {
+        version,
+        status_code,
+        status_text,
+        headers,
+        body: Vec::new(),
     })
 }
 

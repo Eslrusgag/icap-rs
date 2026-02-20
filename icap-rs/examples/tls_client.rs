@@ -3,6 +3,7 @@ use icap_rs::{Client, Request as IcapRequest};
 
 const URI: &str = "icaps://localhost:13443/scan"; // ICAPS endpoint + service
 const SNI: &str = "localhost"; // Must match server certificate
+#[cfg(feature = "tls-rustls")]
 const CA_PEM_PATH: &str = "test_data/certs/ca.pem"; // Test CA that signed server.crt
 
 #[tokio::main]
@@ -17,7 +18,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .body(r#"{"name":"John Doe","email":"john@example.com"}"#.as_bytes().to_vec())?;
 
     // Build ICAP client with explicit settings
-    let mut builder = Client::builder()
+    let builder = Client::builder()
         .with_uri(URI)?
         .keep_alive(true)
         .user_agent("ICAP-Client/1.0")
@@ -25,9 +26,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Trust our test CA explicitly (preferred for self-signed test setup)
     #[cfg(feature = "tls-rustls")]
-    {
-        builder = builder.add_root_ca_pem_file(CA_PEM_PATH)?;
-    }
+    let builder = builder.add_root_ca_pem_file(CA_PEM_PATH)?;
 
     let client = builder.build();
 

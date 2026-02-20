@@ -117,29 +117,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                 .add_header("Server", "icap-rs/0.1.0"));
                         }
 
-                        if let Some(EmbeddedHttp::Resp { head, body }) = &request.embedded {
-                            if let Body::Full { reader } = body {
-                                let mut builder = http::Response::builder()
-                                    .status(head.status())
-                                    .version(head.version());
-                                if let Some(h) = builder.headers_mut() {
-                                    h.extend(head.headers().clone());
-                                    h.remove(http::header::TRANSFER_ENCODING);
-                                    h.insert(
-                                        http::header::CONTENT_LENGTH,
-                                        http::HeaderValue::from_str(&reader.len().to_string())
-                                            .unwrap(),
-                                    );
-                                }
-                                let http_resp = builder
-                                    .body(reader.clone())
-                                    .map_err(|e| format!("build http::Response: {e}"))?;
-
-                                return Ok(Response::new(StatusCode::OK, "OK")
-                                    .try_set_istag(&istag_now)?
-                                    .with_http_response(&http_resp)?
-                                    .add_header("Server", "icap-rs/0.1.0"));
+                        if let Some(EmbeddedHttp::Resp {
+                            head,
+                            body: Body::Full { reader },
+                        }) = &request.embedded
+                        {
+                            let mut builder = http::Response::builder()
+                                .status(head.status())
+                                .version(head.version());
+                            if let Some(h) = builder.headers_mut() {
+                                h.extend(head.headers().clone());
+                                h.remove(http::header::TRANSFER_ENCODING);
+                                h.insert(
+                                    http::header::CONTENT_LENGTH,
+                                    http::HeaderValue::from_str(&reader.len().to_string()).unwrap(),
+                                );
                             }
+                            let http_resp = builder
+                                .body(reader.clone())
+                                .map_err(|e| format!("build http::Response: {e}"))?;
+
+                            return Ok(Response::new(StatusCode::OK, "OK")
+                                .try_set_istag(&istag_now)?
+                                .with_http_response(&http_resp)?
+                                .add_header("Server", "icap-rs/0.1.0"));
                         }
                         Ok(Response::no_content()
                             .try_set_istag(&istag_now)?
@@ -174,9 +175,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
                         let istag_now = t.read().unwrap().clone();
                         let http = build_block_403_http("Blocked!", &istag_now);
-                        Ok(Response::new(StatusCode::OK, "OK")
+                        Response::new(StatusCode::OK, "OK")
                             .try_set_istag(&istag_now)?
-                            .with_http_response(&http)?)
+                            .with_http_response(&http)
                     }
                 }
             },
@@ -196,7 +197,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 fn can_return_204(h: &HeaderMap) -> bool {
     h.get("Allow")
         .and_then(|v| v.to_str().ok())
-        .map(|s| s.split(',').any(|p| p.trim() == "204"))
+        .map(|s| s.split(',').any(|p| p.trim().eq_ignore_ascii_case("204")))
         .unwrap_or(false)
 }
 

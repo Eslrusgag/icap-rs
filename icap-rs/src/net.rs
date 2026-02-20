@@ -1,21 +1,11 @@
 //! Connection wrapper used by the ICAP client.
 //!
-//! This module exposes a single enum [`Conn`] that abstracts over the
+//! This module exposes a enum [`Conn`] that abstracts over the
 //! underlying transport:
 //!
 //! - plain TCP (`TcpStream`)
 //! - TLS over **rustls** (`tokio_rustls::client::TlsStream<TcpStream>`) — when the
 //!   `tls-rustls` feature is enabled
-//! - TLS over **OpenSSL** (`tokio_openssl::SslStream<TcpStream>`) — when the
-//!   `tls-openssl` feature is enabled
-//!
-//! The exact shape of the enum depends on enabled Cargo features. To keep the
-//! same public name regardless of features, we define the enum inside a
-//! `conn_def` module selected by `#[cfg(...)]` and then `pub use` it below.
-//!
-//! The enum implements `AsyncRead`/`AsyncWrite` by delegating to the inner
-//! stream. We use `pin_project_lite` to safely project pinned enum variants.
-
 use pin_project_lite::pin_project;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
@@ -154,3 +144,14 @@ mod conn_def {
 
 /// Re-export the feature-shaped `Conn` so callers can use a stable path.
 pub use conn_def::Conn;
+
+impl Conn {
+    /// Returns mutable access to the underlying plain TCP stream when transport is non-TLS.
+    pub fn plain_mut(&mut self) -> Option<&mut TcpStream> {
+        match self {
+            Conn::Plain { inner } => Some(inner),
+            #[cfg(feature = "tls-rustls")]
+            Conn::Rustls { .. } => None,
+        }
+    }
+}

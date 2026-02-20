@@ -23,7 +23,7 @@ async fn start_server_with_limit(
         .with_max_connections(limit)
         .build()
         .await
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("build: {e}")))?;
+        .map_err(|e| io::Error::other(format!("build: {e}")))?;
 
     // Spawn the server.
     let handle = tokio::spawn(async move {

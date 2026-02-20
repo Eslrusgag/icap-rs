@@ -8,9 +8,9 @@ use icap_rs::server::options::ServiceOptions;
 use tokio::time::Duration;
 
 async fn always_204_handler(_req: Request) -> IcapResult<Response> {
-    Ok(Response::no_content()
+    Response::no_content()
         .add_header("Server", "icap-rs/test")
-        .try_set_istag("test")?)
+        .try_set_istag("test")
 }
 
 async fn start_server_on(port: u16) {
@@ -20,7 +20,7 @@ async fn start_server_on(port: u16) {
 
     let server = Server::builder()
         .bind(&format!("127.0.0.1:{port}"))
-        .route_respmod("respmod", |req| always_204_handler(req), Some(respmod_opts))
+        .route_respmod("respmod", always_204_handler, Some(respmod_opts))
         .default_service("respmod")
         .alias("/", "respmod")
         .alias("alt", "respmod")

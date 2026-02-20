@@ -20,13 +20,15 @@ use crate::error::{Error, IcapResult};
 use crate::parser::parse_encapsulated_header;
 use crate::parser::{canon_icap_header, read_chunked_to_end, write_chunk, write_chunk_into};
 use crate::request::{Request, serialize_embedded_http};
-use crate::response::{Response, parse_icap_response};
+use crate::response::{Response, parse_icap_response, parse_icap_response_head};
 
 use crate::Method;
 use crate::client::tls::{AnyTlsConnector, TlsBackend, TlsConnector};
 use crate::parser::icap::find_double_crlf;
 
 use http::{HeaderMap, HeaderName, HeaderValue};
+use std::collections::HashSet;
+use std::io::Write as _;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -45,7 +47,8 @@ use tracing::trace;
 /// High-level ICAP client with connection reuse and Preview negotiation.
 ///
 /// Construct via [`Client::builder()`] and send requests using [`Client::send`]
-/// or [`Client::send_streaming`]. You can also generate the exact wire bytes
+/// / [`Client::send_streaming`] / [`Client::send_streaming_reader_into_writer`].
+/// You can also generate the exact wire bytes
 /// without sending using [`Client::get_request`] / [`Client::get_request_wire`].
 #[derive(Debug, Clone)]
 pub struct Client {
@@ -71,10 +74,8 @@ struct ClientRef {
 /// - [`ConnectionPolicy::KeepAlive`] — keep a single idle connection and reuse it.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub enum ConnectionPolicy {
-    /// Close the connection after each request (no reuse).
     #[default]
     Close,
-    /// Reuse a single idle connection when possible.
     KeepAlive,
 }
 
@@ -131,14 +132,11 @@ impl ClientBuilder {
     }
 
     /// Insert a default ICAP header that will be sent with every request.
-    ///
-    /// If the same header is set later on a particular request, that per-request
-    /// value takes precedence.
-    pub fn default_header(mut self, name: &str, value: &str) -> Self {
-        let n: HeaderName = name.parse().expect("invalid header name");
-        let v: HeaderValue = HeaderValue::from_str(value).expect("invalid header value");
+    pub fn default_header(mut self, name: &str, value: &str) -> IcapResult<Self> {
+        let n: HeaderName = name.parse()?;
+        let v: HeaderValue = HeaderValue::from_str(value)?;
         self.default_headers.insert(n, v);
-        self
+        Ok(self)
     }
 
     /// Sets the ICAP `User-Agent` header for all requests created by this client.
@@ -164,9 +162,6 @@ impl ClientBuilder {
     }
 
     /// Enable or disable connection reuse (keep-alive).
-    ///
-    /// When enabled, the client will store a single idle connection and reuse it
-    /// for subsequent requests, reducing handshake overhead.
     pub fn keep_alive(mut self, yes: bool) -> Self {
         self.connection_policy = if yes {
             ConnectionPolicy::KeepAlive
@@ -203,7 +198,7 @@ impl ClientBuilder {
             //     self = self.use_openssl();
             // }
             //#[cfg(all(not(feature = "tls-rustls"), not(feature = "tls-openssl")))]
-            #[cfg(all(not(feature = "tls-rustls")))]
+            #[cfg(not(feature = "tls-rustls"))]
             {
                 return Err("`icaps://` requested but crate built without TLS features".into());
             }
@@ -259,19 +254,13 @@ impl ClientBuilder {
 
         let any_tls = match self.tls_backend {
             None => AnyTlsConnector::plain(),
+            #[cfg(feature = "tls-rustls")]
             Some(TlsBackend::Rustls) => {
-                #[cfg(feature = "tls-rustls")]
-                {
-                    use crate::client::tls::rustls::RustlsConfig;
-                    AnyTlsConnector::rustls(RustlsConfig {
-                        danger_disable_verify: self.danger_disable_verify,
-                        extra_roots: self.extra_roots,
-                    })
-                }
-                #[cfg(not(feature = "tls-rustls"))]
-                {
-                    panic!("enable `tls-rustls` feature")
-                }
+                use crate::client::tls::rustls::RustlsConfig;
+                AnyTlsConnector::rustls(RustlsConfig {
+                    danger_disable_verify: self.danger_disable_verify,
+                    extra_roots: self.extra_roots,
+                })
             } // Some(TlsBackend::Openssl) => {
               //     #[cfg(feature = "tls-openssl")]
               //     {
@@ -285,6 +274,8 @@ impl ClientBuilder {
               //         panic!("enable `tls-openssl` feature")
               //     }
               // }
+            #[cfg(not(feature = "tls-rustls"))]
+            Some(_) => panic!("enable `tls-rustls` feature"),
         };
 
         Client {
@@ -360,7 +351,7 @@ impl Client {
 
         // If the server already sent a response on a kept-alive *plain* TCP socket,
         // consume it now and return early.
-        if let Conn::Plain { inner } = &mut stream
+        if let Some(inner) = stream.plain_mut()
             && let Some(resp) = Self::try_read_early_response_now(inner).await?
         {
             return Ok(resp);
@@ -370,22 +361,19 @@ impl Client {
         AsyncWriteExt::write_all(&mut stream, &built.bytes).await?;
         AsyncWriteExt::flush(&mut stream).await?;
 
+        // OPTIONS: read headers + optional body, then parse, then decide reuse
         if req.method == Method::Options {
-            let (_code, mut buf) =
-                Self::with_timeout(self.inner.read_timeout, read_icap_headers(&mut stream)).await?;
-            Self::with_timeout(
-                self.inner.read_timeout,
-                read_icap_body_if_any(&mut stream, &mut buf),
-            )
-            .await?;
-            maybe_put_back(self.inner.connection_policy, &self.inner.idle_conn, stream).await;
-            return parse_icap_response(&buf);
+            let buf = self.read_response_buffer(&mut stream).await?;
+            return self.finalize_response(stream, buf).await;
         }
 
+        // Preview/100-continue negotiation
         if built.expect_continue {
             let (code, hdr_buf) =
                 Self::with_timeout(self.inner.read_timeout, read_icap_headers(&mut stream)).await?;
-            return if code == 100 {
+
+            if code == 100 {
+                // send remaining body, then terminating chunk
                 if let Some(rest) = built.remaining_body
                     && !rest.is_empty()
                 {
@@ -394,37 +382,21 @@ impl Client {
                 AsyncWriteExt::write_all(&mut stream, b"0\r\n\r\n").await?;
                 AsyncWriteExt::flush(&mut stream).await?;
 
-                let (_code2, mut response) =
-                    Self::with_timeout(self.inner.read_timeout, read_icap_headers(&mut stream))
-                        .await?;
-                Self::with_timeout(
-                    self.inner.read_timeout,
-                    read_icap_body_if_any(&mut stream, &mut response),
-                )
-                .await?;
-                maybe_put_back(self.inner.connection_policy, &self.inner.idle_conn, stream).await;
-                parse_icap_response(&response)
+                // read final response
+                let response_buf = self.read_response_buffer(&mut stream).await?;
+                return self.finalize_response(stream, response_buf).await;
             } else {
-                let mut response = hdr_buf;
-                Self::with_timeout(
-                    self.inner.read_timeout,
-                    read_icap_body_if_any(&mut stream, &mut response),
-                )
-                .await?;
-                maybe_put_back(self.inner.connection_policy, &self.inner.idle_conn, stream).await;
-                parse_icap_response(&response)
-            };
+                // non-100 early final response
+                let response_buf = self
+                    .read_response_buffer_with_headers(&mut stream, hdr_buf)
+                    .await?;
+                return self.finalize_response(stream, response_buf).await;
+            }
         }
 
-        let (_code, mut response) =
-            Self::with_timeout(self.inner.read_timeout, read_icap_headers(&mut stream)).await?;
-        Self::with_timeout(
-            self.inner.read_timeout,
-            read_icap_body_if_any(&mut stream, &mut response),
-        )
-        .await?;
-        maybe_put_back(self.inner.connection_policy, &self.inner.idle_conn, stream).await;
-        parse_icap_response(&response)
+        // Normal request: read response, parse, then decide reuse
+        let response_buf = self.read_response_buffer(&mut stream).await?;
+        self.finalize_response(stream, response_buf).await
     }
 
     /// Send a request and stream the body from a file using ICAP chunked encoding.
@@ -433,11 +405,23 @@ impl Client {
         req: &Request,
         file_path: P,
     ) -> IcapResult<Response> {
+        let file = TokioFile::open(file_path).await?;
+        self.send_streaming_reader(req, file).await
+    }
+
+    /// Send a request and stream body bytes from any `AsyncRead` source using ICAP chunked encoding.
+    ///
+    /// This API avoids requiring an in-memory `Vec<u8>` body in the request object.
+    /// Pair it with `Request::with_http_request_head(...)` / `with_http_response_head(...)`
+    /// for head-only embedded HTTP.
+    pub async fn send_streaming_reader<R>(&self, req: &Request, mut reader: R) -> IcapResult<Response>
+    where
+        R: AsyncRead + Unpin + Send,
+    {
         trace!(
-            "client.send_streaming: method={} service={} file={:?}",
+            "client.send_streaming_reader: method={} service={}",
             req.method,
-            req.service,
-            file_path.as_ref()
+            req.service
         );
 
         let mut stream = match self.inner.connection_policy {
@@ -451,13 +435,89 @@ impl Client {
             ConnectionPolicy::Close => self.inner.connect().await?,
         };
 
-        if let Conn::Plain { inner } = &mut stream
+        if let Some(inner) = stream.plain_mut()
             && let Some(resp) = Self::try_read_early_response_now(inner).await?
         {
             return Ok(resp);
         }
 
         // force_has_body=true (body will be streamed), preview0_ieof=false
+        let built = self.build_icap_request_bytes(req, true, false)?;
+        AsyncWriteExt::write_all(&mut stream, &built.bytes).await?;
+        AsyncWriteExt::flush(&mut stream).await?;
+
+        // If Preview: 0, send zero chunk now (optionally ieof)
+        if matches!(req.preview_size, Some(0)) {
+            if req.preview_ieof {
+                AsyncWriteExt::write_all(&mut stream, b"0; ieof\r\n\r\n").await?;
+            } else {
+                AsyncWriteExt::write_all(&mut stream, b"0\r\n\r\n").await?;
+            }
+            AsyncWriteExt::flush(&mut stream).await?;
+        }
+
+        // Read server decision (100 Continue or final)
+        let (code, hdr_buf) =
+            Self::with_timeout(self.inner.read_timeout, read_icap_headers(&mut stream)).await?;
+
+        if code == 100 {
+            // Stream source as chunked
+            let mut buf = vec![0u8; 64 * 1024];
+            loop {
+                let n = reader.read(&mut buf).await?;
+                if n == 0 {
+                    break;
+                }
+                write_chunk(&mut stream, &buf[..n]).await?;
+            }
+
+            // terminating chunk
+            AsyncWriteExt::write_all(&mut stream, b"0\r\n\r\n").await?;
+            AsyncWriteExt::flush(&mut stream).await?;
+
+            // read final response
+            let response_buf = self.read_response_buffer(&mut stream).await?;
+            self.finalize_response(stream, response_buf).await
+        } else {
+            // final response without 100
+            let response_buf = self
+                .read_response_buffer_with_headers(&mut stream, hdr_buf)
+                .await?;
+            self.finalize_response(stream, response_buf).await
+        }
+    }
+
+    /// Send a request with streamed request body and stream response body into `writer`.
+    ///
+    /// Returned [`Response`] contains status line and headers, while `body` is empty because
+    /// response payload is forwarded directly to `writer`.
+    pub async fn send_streaming_reader_into_writer<R, W>(
+        &self,
+        req: &Request,
+        mut reader: R,
+        writer: &mut W,
+    ) -> IcapResult<Response>
+    where
+        R: AsyncRead + Unpin + Send,
+        W: AsyncWrite + Unpin + Send,
+    {
+        let mut stream = match self.inner.connection_policy {
+            ConnectionPolicy::KeepAlive => {
+                if let Some(s) = self.inner.idle_conn.lock().await.take() {
+                    s
+                } else {
+                    self.inner.connect().await?
+                }
+            }
+            ConnectionPolicy::Close => self.inner.connect().await?,
+        };
+
+        if let Some(inner) = stream.plain_mut()
+            && let Some(resp) = Self::try_read_early_response_now(inner).await?
+        {
+            return Ok(resp);
+        }
+
         let built = self.build_icap_request_bytes(req, true, false)?;
         AsyncWriteExt::write_all(&mut stream, &built.bytes).await?;
         AsyncWriteExt::flush(&mut stream).await?;
@@ -473,11 +533,11 @@ impl Client {
 
         let (code, hdr_buf) =
             Self::with_timeout(self.inner.read_timeout, read_icap_headers(&mut stream)).await?;
-        if code == 100 {
-            let mut f = TokioFile::open(file_path).await?;
+
+        let mut response_buf = if code == 100 {
             let mut buf = vec![0u8; 64 * 1024];
             loop {
-                let n = f.read(&mut buf).await?;
+                let n = reader.read(&mut buf).await?;
                 if n == 0 {
                     break;
                 }
@@ -486,25 +546,46 @@ impl Client {
             AsyncWriteExt::write_all(&mut stream, b"0\r\n\r\n").await?;
             AsyncWriteExt::flush(&mut stream).await?;
 
-            let (_code2, mut response) =
+            let (_code2, final_hdr_buf) =
                 Self::with_timeout(self.inner.read_timeout, read_icap_headers(&mut stream)).await?;
-            Self::with_timeout(
-                self.inner.read_timeout,
-                read_icap_body_if_any(&mut stream, &mut response),
-            )
-            .await?;
-            maybe_put_back(self.inner.connection_policy, &self.inner.idle_conn, stream).await;
-            parse_icap_response(&response)
+            final_hdr_buf
         } else {
-            let mut response = hdr_buf;
-            Self::with_timeout(
-                self.inner.read_timeout,
-                read_icap_body_if_any(&mut stream, &mut response),
-            )
-            .await?;
-            maybe_put_back(self.inner.connection_policy, &self.inner.idle_conn, stream).await;
-            parse_icap_response(&response)
-        }
+            hdr_buf
+        };
+
+        let head = parse_icap_response_head(&response_buf)?;
+        Self::with_timeout(
+            self.inner.read_timeout,
+            read_icap_body_if_any_into(&mut stream, &mut response_buf, writer),
+        )
+        .await?;
+        AsyncWriteExt::flush(writer).await?;
+
+        let can_reuse = !response_wants_close(&head);
+        maybe_put_back(
+            self.inner.connection_policy,
+            &self.inner.idle_conn,
+            stream,
+            can_reuse,
+        )
+        .await;
+
+        Ok(head)
+    }
+
+    /// Convenience wrapper over [`Client::send_streaming_reader_into_writer`] for file sources.
+    pub async fn send_streaming_into_writer<P, W>(
+        &self,
+        req: &Request,
+        file_path: P,
+        writer: &mut W,
+    ) -> IcapResult<Response>
+    where
+        P: AsRef<Path>,
+        W: AsyncWrite + Unpin + Send,
+    {
+        let file = TokioFile::open(file_path).await?;
+        self.send_streaming_reader_into_writer(req, file, writer).await
     }
 
     /// Build the exact wire representation of a request, including preview tail when applicable.
@@ -539,6 +620,43 @@ impl Client {
         }
     }
 
+    async fn read_response_buffer(&self, stream: &mut Conn) -> IcapResult<Vec<u8>> {
+        let (_code, mut response_buf) =
+            Self::with_timeout(self.inner.read_timeout, read_icap_headers(stream)).await?;
+        Self::with_timeout(
+            self.inner.read_timeout,
+            read_icap_body_if_any(stream, &mut response_buf),
+        )
+        .await?;
+        Ok(response_buf)
+    }
+
+    async fn read_response_buffer_with_headers(
+        &self,
+        stream: &mut Conn,
+        mut response_buf: Vec<u8>,
+    ) -> IcapResult<Vec<u8>> {
+        Self::with_timeout(
+            self.inner.read_timeout,
+            read_icap_body_if_any(stream, &mut response_buf),
+        )
+        .await?;
+        Ok(response_buf)
+    }
+
+    async fn finalize_response(&self, stream: Conn, response_buf: Vec<u8>) -> IcapResult<Response> {
+        let resp = parse_icap_response(&response_buf)?;
+        let can_reuse = !response_wants_close(&resp);
+        maybe_put_back(
+            self.inner.connection_policy,
+            &self.inner.idle_conn,
+            stream,
+            can_reuse,
+        )
+        .await;
+        Ok(resp)
+    }
+
     fn build_icap_request_bytes(
         &self,
         req: &Request,
@@ -556,93 +674,75 @@ impl Client {
             preview0_ieof
         );
 
-        let mut out = Vec::new();
+        let mut out = Vec::with_capacity(512);
 
         // Start-line
-        let full_uri = format!(
-            "icap://{}:{}/{}",
+        write!(
+            &mut out,
+            "{} icap://{}:{}/{} ICAP/1.0\r\n",
+            req.method,
             self.inner.host,
             self.inner.port,
             Self::trim_leading_slash(&req.service)
-        );
-        out.extend_from_slice(format!("{} {} ICAP/1.0\r\n", req.method, full_uri).as_bytes());
+        )
+        .map_err(Error::Network)?;
 
         // ICAP headers
-        let mut headers = self.inner.default_headers.clone();
         let host_value = self
             .inner
             .host_override
             .clone()
             .unwrap_or_else(|| self.inner.host.clone());
-        headers.insert(
-            HeaderName::from_static("host"),
-            HeaderValue::from_str(&host_value)?,
-        );
-
-        for (n, v) in req.icap_headers.iter() {
-            headers.insert(n.clone(), v.clone());
-        }
-        if req.allow_204 {
-            append_to_allow(&mut headers, "204");
-        }
-        if req.allow_206 {
-            append_to_allow(&mut headers, "206");
-        }
-        if let Some(ps) = req.preview_size {
-            headers.insert(
-                HeaderName::from_static("preview"),
-                HeaderValue::from_str(&ps.to_string())?,
-            );
-        }
 
         // Encapsulated
-        let (http_headers_bytes, http_body_bytes, enc_header) = if req.is_mod() {
+        let (http_headers_bytes, http_body_bytes, enc_head_key, enc_body_key) = if req.is_mod() {
             if let Some(ref emb) = req.embedded {
                 let (hdrs, body_from_emb) = serialize_embedded_http(emb);
+                let hdr_len = hdrs.len();
                 let (hdr_key, body_key) = match req.method.as_str() {
                     "REQMOD" => ("req-hdr", "req-body"),
                     _ => ("res-hdr", "res-body"),
                 };
                 let will_send_body = force_has_body || body_from_emb.is_some();
-                if will_send_body {
-                    let enc = format!(
-                        "Encapsulated: {}=0, {}={}\r\n",
-                        hdr_key,
-                        body_key,
-                        hdrs.len()
-                    );
-                    (hdrs, body_from_emb, enc)
+                if will_send_body && !hdrs.is_empty() {
+                    (hdrs, body_from_emb, Some((hdr_key, hdr_len)), Some(body_key))
+                } else if !hdrs.is_empty() {
+                    (hdrs, None, Some((hdr_key, 0usize)), None)
                 } else {
-                    (hdrs, None, format!("Encapsulated: {}=0\r\n", hdr_key))
+                    (hdrs, None, None, None)
                 }
             } else {
-                (
-                    Vec::new(),
-                    None,
-                    "Encapsulated: null-body=0\r\n".to_string(),
-                )
+                (Vec::new(), None, None, None)
             }
         } else {
-            (
-                Vec::new(),
-                None,
-                "Encapsulated: null-body=0\r\n".to_string(),
-            )
+            (Vec::new(), None, None, None)
         };
 
         // Write ICAP headers (except Encapsulated)
-        for (name, value) in headers.iter() {
-            if name.as_str().eq_ignore_ascii_case("encapsulated") {
-                continue;
-            }
-            let cname = canon_icap_header(name.as_str());
-            out.extend_from_slice(cname.as_bytes());
-            out.extend_from_slice(b": ");
-            out.extend_from_slice(value.as_bytes());
-            out.extend_from_slice(b"\r\n");
-        }
+        write_icap_headers(
+            &mut out,
+            &self.inner.default_headers,
+            &req.icap_headers,
+            &host_value,
+            req.allow_204,
+            req.allow_206,
+            req.preview_size,
+        )?;
         // Encapsulated last + CRLF
-        out.extend_from_slice(enc_header.as_bytes());
+        if let Some((hdr_key, hdr_len)) = enc_head_key {
+            if let Some(body_key) = enc_body_key {
+                write!(
+                    &mut out,
+                    "Encapsulated: {}=0, {}={}\r\n",
+                    hdr_key, body_key, hdr_len
+                )
+                .map_err(Error::Network)?;
+            } else {
+                write!(&mut out, "Encapsulated: {}=0\r\n", hdr_key).map_err(Error::Network)?;
+            }
+        } else {
+            out.extend_from_slice(b"Encapsulated: null-body=0\r\n");
+        }
         out.extend_from_slice(b"\r\n");
 
         // Embedded HTTP headers
@@ -729,8 +829,13 @@ impl ClientRef {
     }
 }
 
-async fn maybe_put_back(policy: ConnectionPolicy, slot: &Mutex<Option<Conn>>, stream: Conn) {
-    if let ConnectionPolicy::KeepAlive = policy {
+async fn maybe_put_back(
+    policy: ConnectionPolicy,
+    slot: &Mutex<Option<Conn>>,
+    stream: Conn,
+    can_reuse: bool,
+) {
+    if matches!(policy, ConnectionPolicy::KeepAlive) && can_reuse {
         *slot.lock().await = Some(stream);
     }
 }
@@ -858,6 +963,88 @@ where
 
     Ok(())
 }
+
+async fn read_icap_body_if_any_into<S, W>(
+    stream: &mut S,
+    buf: &mut Vec<u8>,
+    writer: &mut W,
+) -> IcapResult<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let Some(h_end) = find_double_crlf(buf) else {
+        return Err("Corrupted ICAP headers".into());
+    };
+
+    let hdr_text = std::str::from_utf8(&buf[..h_end]).map_err(|_| "Invalid headers utf8")?;
+    let enc = parse_encapsulated_header(hdr_text);
+
+    // Fast path: embedded HTTP message with known Content-Length (or header-only) can be streamed directly.
+    if let Some(http_rel) = enc.req_hdr.or(enc.res_hdr) {
+        let http_abs = h_end + http_rel;
+        while buf.len() < http_abs {
+            let mut tmp = [0u8; 4096];
+            let n = AsyncReadExt::read(stream, &mut tmp).await?;
+            if n == 0 {
+                return Err("Unexpected EOF before start of embedded HTTP".into());
+            }
+            buf.extend_from_slice(&tmp[..n]);
+        }
+
+        let http_hdr_end_abs = loop {
+            if let Some(rel) = find_double_crlf(&buf[http_abs..]) {
+                break http_abs + rel;
+            }
+            let mut tmp = [0u8; 4096];
+            let n = AsyncReadExt::read(stream, &mut tmp).await?;
+            if n == 0 {
+                return Err("Unexpected EOF before end of embedded HTTP headers".into());
+            }
+            buf.extend_from_slice(&tmp[..n]);
+        };
+
+        let has_http_body = enc.req_body.is_some() || enc.res_body.is_some();
+        let target_end = if !has_http_body {
+            Some(http_hdr_end_abs)
+        } else {
+            let http_head = &buf[http_abs..http_hdr_end_abs];
+            http_content_length(http_head).map(|cl| http_hdr_end_abs + cl)
+        };
+
+        if let Some(target_end) = target_end {
+            let initial_end = buf.len().min(target_end);
+            if initial_end > h_end {
+                AsyncWriteExt::write_all(writer, &buf[h_end..initial_end]).await?;
+            }
+            let mut written = initial_end;
+            let mut tmp = [0u8; 8192];
+            while written < target_end {
+                let n = AsyncReadExt::read(stream, &mut tmp).await?;
+                if n == 0 {
+                    return Err("Unexpected EOF while streaming response body".into());
+                }
+                let take = (target_end - written).min(n);
+                AsyncWriteExt::write_all(writer, &tmp[..take]).await?;
+                written += take;
+                if take < n {
+                    buf.clear();
+                    buf.extend_from_slice(&tmp[take..n]);
+                }
+            }
+            buf.truncate(h_end);
+            return Ok(());
+        }
+    }
+
+    // Fallback for chunked/unknown-length variants: use buffered reader, then forward payload.
+    read_icap_body_if_any(stream, buf).await?;
+    if buf.len() > h_end {
+        AsyncWriteExt::write_all(writer, &buf[h_end..]).await?;
+        buf.truncate(h_end);
+    }
+    Ok(())
+}
 fn parse_authority_with_scheme(uri: &str) -> IcapResult<(String, u16, bool)> {
     let s = uri.trim();
     let (tls, rest) = if let Some(r) = s.strip_prefix("icaps://") {
@@ -883,6 +1070,7 @@ fn parse_authority_with_scheme(uri: &str) -> IcapResult<(String, u16, bool)> {
     Ok((host, port, tls))
 }
 
+#[cfg(test)]
 fn append_to_allow(headers: &mut HeaderMap, code: &str) {
     let name = HeaderName::from_static("allow");
     match headers.get_mut(&name) {
@@ -902,6 +1090,133 @@ fn append_to_allow(headers: &mut HeaderMap, code: &str) {
     }
 }
 
+#[inline]
+fn is_virtual_icap_header(name: &str) -> bool {
+    name.eq_ignore_ascii_case("host")
+        || name.eq_ignore_ascii_case("encapsulated")
+        || name.eq_ignore_ascii_case("allow")
+        || name.eq_ignore_ascii_case("preview")
+}
+
+fn write_icap_headers(
+    out: &mut Vec<u8>,
+    default_headers: &HeaderMap,
+    req_headers: &HeaderMap,
+    host_value: &str,
+    allow_204: bool,
+    allow_206: bool,
+    preview_size: Option<usize>,
+) -> IcapResult<()> {
+    // Host is always emitted; request-level Host overrides computed host.
+    out.extend_from_slice(canon_icap_header("host").as_bytes());
+    out.extend_from_slice(b": ");
+    if let Some(v) = req_headers.get("Host") {
+        out.extend_from_slice(v.as_bytes());
+    } else {
+        out.extend_from_slice(host_value.as_bytes());
+    }
+    out.extend_from_slice(b"\r\n");
+
+    let req_names: HashSet<&str> = req_headers.keys().map(|n| n.as_str()).collect();
+
+    // Default headers first, unless overridden by request-level headers.
+    for (name, value) in default_headers.iter() {
+        let key = name.as_str();
+        if is_virtual_icap_header(key) || req_names.contains(key) {
+            continue;
+        }
+        let cname = canon_icap_header(key);
+        out.extend_from_slice(cname.as_bytes());
+        out.extend_from_slice(b": ");
+        out.extend_from_slice(value.as_bytes());
+        out.extend_from_slice(b"\r\n");
+    }
+
+    // Request-level headers override defaults.
+    for (name, value) in req_headers.iter() {
+        let key = name.as_str();
+        if is_virtual_icap_header(key) {
+            continue;
+        }
+        let cname = canon_icap_header(key);
+        out.extend_from_slice(cname.as_bytes());
+        out.extend_from_slice(b": ");
+        out.extend_from_slice(value.as_bytes());
+        out.extend_from_slice(b"\r\n");
+    }
+
+    // Allow merge logic preserving request-over-default precedence.
+    if let Some(mut allow) = req_headers
+        .get("Allow")
+        .or_else(|| default_headers.get("Allow"))
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_string())
+    {
+        if allow_204 && !allow.split(',').any(|p| p.trim().eq_ignore_ascii_case("204")) {
+            if !allow.is_empty() {
+                allow.push_str(", ");
+            }
+            allow.push_str("204");
+        }
+        if allow_206 && !allow.split(',').any(|p| p.trim().eq_ignore_ascii_case("206")) {
+            if !allow.is_empty() {
+                allow.push_str(", ");
+            }
+            allow.push_str("206");
+        }
+        if !allow.is_empty() {
+            out.extend_from_slice(canon_icap_header("allow").as_bytes());
+            out.extend_from_slice(b": ");
+            out.extend_from_slice(allow.as_bytes());
+            out.extend_from_slice(b"\r\n");
+        }
+    } else if allow_204 || allow_206 {
+        let allow = match (allow_204, allow_206) {
+            (true, true) => "204, 206",
+            (true, false) => "204",
+            (false, true) => "206",
+            (false, false) => "",
+        };
+        if !allow.is_empty() {
+            out.extend_from_slice(canon_icap_header("allow").as_bytes());
+            out.extend_from_slice(b": ");
+            out.extend_from_slice(allow.as_bytes());
+            out.extend_from_slice(b"\r\n");
+        }
+    }
+
+    if let Some(ps) = preview_size {
+        out.extend_from_slice(canon_icap_header("preview").as_bytes());
+        out.extend_from_slice(b": ");
+        out.extend_from_slice(ps.to_string().as_bytes());
+        out.extend_from_slice(b"\r\n");
+    } else if let Some(v) = req_headers
+        .get("Preview")
+        .or_else(|| default_headers.get("Preview"))
+    {
+        out.extend_from_slice(canon_icap_header("preview").as_bytes());
+        out.extend_from_slice(b": ");
+        out.extend_from_slice(v.as_bytes());
+        out.extend_from_slice(b"\r\n");
+    }
+
+    Ok(())
+}
+
+fn response_wants_close(resp: &Response) -> bool {
+
+    let Some(v) = resp.headers().get(http::header::CONNECTION) else {
+        return false;
+    };
+
+    let Ok(s) = v.to_str() else {
+        return true;
+    };
+
+    s.split(',')
+        .any(|t| t.trim().eq_ignore_ascii_case("close"))
+}
+
 async fn read_icap_headers<S>(stream: &mut S) -> IcapResult<(u16, Vec<u8>)>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -909,21 +1224,33 @@ where
     let mut buf = Vec::new();
     let mut tmp = [0u8; 4096];
 
-    let first_crlf_pos = |b: &Vec<u8>| b.windows(2).position(|w| w == b"\r\n");
+    let mut status_line_end: Option<usize> = None;
+    let mut hdr_end: Option<usize> = None;
 
-    let parse_status_if_possible = |b: &Vec<u8>| -> Result<Option<u16>, &'static str> {
-        if let Some(line_end) = first_crlf_pos(b) {
-            let status_line = &b[..line_end];
-            let s = std::str::from_utf8(status_line).map_err(|_| "bad utf8 in status line")?;
-            let mut parts = s.split_whitespace();
-            let _ver = parts.next();
-            let code_str = parts.next().ok_or("missing status code")?;
-            let code = code_str.parse::<u16>().map_err(|_| "bad status code")?;
-            Ok(Some(code))
-        } else {
-            Ok(None)
+    let mut code: Option<u16> = None;
+
+    let mut win: u32 = 0;
+    const CRLFCRLF: u32 = 0x0D0A0D0A;
+
+    let mut prev: Option<u8> = None;
+
+    fn parse_status_code_from_status_line(line: &[u8]) -> Option<u16> {
+        let sp1 = line.iter().position(|&b| b == b' ')?;
+        let mut i = sp1;
+        while i < line.len() && line[i] == b' ' {
+            i += 1;
         }
-    };
+        if i + 3 > line.len() {
+            return None;
+        }
+        let d0 = line[i];
+        let d1 = line[i + 1];
+        let d2 = line[i + 2];
+        if !d0.is_ascii_digit() || !d1.is_ascii_digit() || !d2.is_ascii_digit() {
+            return None;
+        }
+        Some((d0 - b'0') as u16 * 100 + (d1 - b'0') as u16 * 10 + (d2 - b'0') as u16)
+    }
 
     loop {
         let n = AsyncReadExt::read(stream, &mut tmp)
@@ -931,37 +1258,83 @@ where
             .map_err(Error::Network)?;
 
         if n == 0 {
-            if first_crlf_pos(&buf).is_some() && find_double_crlf(&buf).is_none() {
-                buf.extend_from_slice(b"\r\n");
-            } else {
+            // EOF
+            if buf.is_empty() {
+                return Err(Error::EarlyCloseWithoutHeaders);
+            }
+
+            if let Some(c) = code
+                && (400..=599).contains(&c)
+                && hdr_end.is_none()
+            {
+                if !buf.ends_with(b"\r\n\r\n") {
+                    if buf.ends_with(b"\r\n") {
+                        buf.extend_from_slice(b"\r\n");
+                    } else {
+                        buf.extend_from_slice(b"\r\n\r\n");
+                    }
+                }
+                return Ok((c, buf));
+            }
+
+            if hdr_end.is_none() && status_line_end.is_some() {
+                if !buf.ends_with(b"\r\n\r\n") {
+                    if buf.ends_with(b"\r\n") {
+                        buf.extend_from_slice(b"\r\n");
+                    } else {
+                        buf.extend_from_slice(b"\r\n\r\n");
+                    }
+                }
                 return Err(Error::EarlyCloseWithoutHeaders);
             }
         } else {
+            let old_len = buf.len();
             buf.extend_from_slice(&tmp[..n]);
-        }
 
-        if let Some(_hdr_end) = find_double_crlf(&buf) {
-            let line_end = first_crlf_pos(&buf).unwrap_or(buf.len());
-            let status_line = &buf[..line_end];
+            for (j, &b) in tmp[..n].iter().enumerate() {
+                let i = old_len + j;
 
-            let code = {
-                let s = std::str::from_utf8(status_line).map_err(|_| "bad utf8 in status line")?;
-                let mut parts = s.split_whitespace();
-                let _ver = parts.next();
-                let code_str = parts.next().ok_or("missing status code")?;
-                code_str.parse::<u16>().map_err(|_| "bad status code")?
-            };
+                if status_line_end.is_none() && prev == Some(b'\r') && b == b'\n' {
+                    status_line_end = Some(i - 1);
+                    let line = &buf[..(i - 1)];
+                    if let Some(c) = parse_status_code_from_status_line(line) {
+                        code = Some(c);
+                    }
+                }
 
-            return Ok((code, buf));
-        }
+                win = (win << 8) | (b as u32);
+                if hdr_end.is_none() && win == CRLFCRLF {
+                    hdr_end = Some(i - 3);
+                }
 
-        if let Some(code) = parse_status_if_possible(&buf).map_err(|e| e.to_string())?
-            && (400..=599).contains(&code)
-        {
-            if find_double_crlf(&buf).is_none() {
-                buf.extend_from_slice(b"\r\n");
+                prev = Some(b);
             }
-            return Ok((code, buf));
+        }
+
+        if code.is_none() && let Some(end) = status_line_end {
+            let line = &buf[..end];
+            if let Some(c) = parse_status_code_from_status_line(line) {
+                code = Some(c);
+            }
+        }
+
+        if let Some(c) = code
+            && (400..=599).contains(&c)
+            && hdr_end.is_none()
+        {
+            if !buf.ends_with(b"\r\n\r\n") {
+                if buf.ends_with(b"\r\n") {
+                    buf.extend_from_slice(b"\r\n");
+                } else {
+                    buf.extend_from_slice(b"\r\n\r\n");
+                }
+            }
+            return Ok((c, buf));
+        }
+
+        if hdr_end.is_some() {
+            let c = code.ok_or("missing/bad status code")?;
+            return Ok((c, buf));
         }
 
         if buf.len() > crate::MAX_HDR_BYTES {
@@ -1050,7 +1423,7 @@ mod tests {
         Client::builder()
             .host("icap.example")
             .port(1344)
-            .default_header("x-trace-id", "test-123")
+            .default_header("x-trace-id", "test-123").unwrap()
             .keep_alive(true)
             .build()
     }
@@ -1173,7 +1546,7 @@ mod tests {
         let head = extract_headers_text(&wire);
         let enc_line = find_header_line(&head, "Encapsulated").unwrap();
         assert!(enc_line.contains("req-hdr=0"));
-        let off = enc_line.split('=').last().unwrap().trim();
+        let off = enc_line.split('=').next_back().unwrap().trim();
         let off_num: usize = off.parse().unwrap();
 
         let icap_headers_end = head.len();

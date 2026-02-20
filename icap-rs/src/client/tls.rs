@@ -21,6 +21,7 @@ use tokio::net::TcpStream;
 /// variants are actually usable.
 #[derive(Debug, Clone, Copy)]
 pub enum TlsBackend {
+    #[cfg(feature = "tls-rustls")]
     Rustls,
     //Openssl,
 }
@@ -68,6 +69,9 @@ impl AnyTlsConnector {
 #[async_trait]
 impl TlsConnector for AnyTlsConnector {
     async fn connect(&self, tcp: TcpStream, server_name: &str) -> IcapResult<Conn> {
+        #[cfg(not(feature = "tls-rustls"))]
+        let _ = server_name;
+
         match self {
             AnyTlsConnector::Plain => Ok(Conn::Plain { inner: tcp }),
             #[cfg(feature = "tls-rustls")]

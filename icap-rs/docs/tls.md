@@ -43,11 +43,15 @@ async fn main() -> icap_rs::error::IcapResult<()> {
 ## Server (ICAPS)
 
 ```rust,no_run
+#[cfg(feature = "tls-rustls")]
 use icap_rs::{Server, Request, Response};
+#[cfg(feature = "tls-rustls")]
 use icap_rs::server::options::ServiceOptions;
 
+#[cfg(feature = "tls-rustls")]
 const ISTAG: &str = "scan-1.0";
 
+#[cfg(feature = "tls-rustls")]
 #[tokio::main]
 async fn main() -> icap_rs::error::IcapResult<()> {
     let server = Server::builder()
@@ -67,4 +71,7 @@ async fn main() -> icap_rs::error::IcapResult<()> {
 
     server.run().await
 }
+
+#[cfg(not(feature = "tls-rustls"))]
+fn main() {}
 ```

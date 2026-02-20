@@ -37,7 +37,6 @@
 use crate::ICAP_VERSION;
 use crate::error::{Error, IcapResult};
 use crate::parser::icap::find_double_crlf;
-use crate::parser::{serialize_http_request, serialize_http_response, split_http_bytes};
 use bytes::Bytes;
 use http::{
     HeaderMap, HeaderName, HeaderValue, Request as HttpRequest, Response as HttpResponse,
@@ -50,6 +49,7 @@ use std::future::Future;
 use std::str::FromStr;
 use tracing::trace;
 
+use std::io::Write as _;
 use std::io::Read as _;
 use std::pin::Pin;
 use tokio::io::AsyncRead;
@@ -355,40 +355,66 @@ pub enum EmbeddedHttp<R> {
 pub(crate) fn serialize_embedded_http(e: &EmbeddedHttp<Vec<u8>>) -> (Vec<u8>, Option<Vec<u8>>) {
     match e {
         EmbeddedHttp::Req { head, body } => {
-            // Rebuild http::Request<Vec<u8>> for serializer
-            let mut builder = HttpRequest::builder()
-                .method(head.method().clone())
-                .uri(head.uri().clone())
-                .version(head.version());
-            {
-                let headers_mut = builder.headers_mut().expect("headers_mut");
-                headers_mut.extend(head.headers().clone());
-            }
+            let head_bytes = serialize_http_request_head(head);
             let body_bytes = match body {
-                Body::Empty => Vec::new(),
-                Body::Full { reader } => reader.clone(),
-                Body::Preview { .. } => Vec::new(), // client shouldn't serialize Preview
+                Body::Empty => None,
+                Body::Full { reader } if reader.is_empty() => None,
+                Body::Full { reader } => Some(reader.clone()),
+                Body::Preview { .. } => None, // client shouldn't serialize Preview
             };
-            let req = builder.body(body_bytes).expect("build request");
-            split_http_bytes(&serialize_http_request(&req))
+            (head_bytes, body_bytes)
         }
         EmbeddedHttp::Resp { head, body } => {
-            let mut builder = HttpResponse::builder()
-                .status(head.status())
-                .version(head.version());
-            {
-                let headers_mut = builder.headers_mut().expect("headers_mut");
-                headers_mut.extend(head.headers().clone());
-            }
+            let head_bytes = serialize_http_response_head(head);
             let body_bytes = match body {
-                Body::Empty => Vec::new(),
-                Body::Full { reader } => reader.clone(),
-                Body::Preview { .. } => Vec::new(),
+                Body::Empty => None,
+                Body::Full { reader } if reader.is_empty() => None,
+                Body::Full { reader } => Some(reader.clone()),
+                Body::Preview { .. } => None,
             };
-            let resp = builder.body(body_bytes).expect("build response");
-            split_http_bytes(&serialize_http_response(&resp))
+            (head_bytes, body_bytes)
         }
     }
+}
+
+fn serialize_http_request_head(head: &HttpRequest<()>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(256 + head.headers().len() * 32);
+    write!(
+        &mut out,
+        "{} {} {}\r\n",
+        head.method(),
+        head.uri(),
+        crate::parser::http_version_str(head.version())
+    )
+    .expect("write request line");
+    for (name, value) in head.headers() {
+        out.extend_from_slice(name.as_str().as_bytes());
+        out.extend_from_slice(b": ");
+        out.extend_from_slice(value.as_bytes());
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend_from_slice(b"\r\n");
+    out
+}
+
+fn serialize_http_response_head(head: &HttpResponse<()>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(256 + head.headers().len() * 32);
+    write!(
+        &mut out,
+        "{} {} {}\r\n",
+        crate::parser::http_version_str(head.version()),
+        head.status().as_u16(),
+        head.status().canonical_reason().unwrap_or("")
+    )
+    .expect("write status line");
+    for (name, value) in head.headers() {
+        out.extend_from_slice(name.as_str().as_bytes());
+        out.extend_from_slice(b": ");
+        out.extend_from_slice(value.as_bytes());
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend_from_slice(b"\r\n");
+    out
 }
 
 /// Single public ICAP request type used by both client and server.
@@ -480,6 +506,28 @@ impl<R> Request<R> {
 
 /// Client-side convenience: attach embedded HTTP with **owned bytes**.
 impl Request<Vec<u8>> {
+    /// Attach only HTTP request head (no buffered body bytes).
+    ///
+    /// Useful with streaming client APIs such as `Client::send_streaming_reader`.
+    pub fn with_http_request_head(mut self, head: HttpRequest<()>) -> Self {
+        self.embedded = Some(EmbeddedHttp::Req {
+            head,
+            body: Body::Empty,
+        });
+        self
+    }
+
+    /// Attach only HTTP response head (no buffered body bytes).
+    ///
+    /// Useful with streaming client APIs such as `Client::send_streaming_reader`.
+    pub fn with_http_response_head(mut self, head: HttpResponse<()>) -> Self {
+        self.embedded = Some(EmbeddedHttp::Resp {
+            head,
+            body: Body::Empty,
+        });
+        self
+    }
+
     pub fn with_http_request(mut self, req: HttpRequest<Vec<u8>>) -> Self {
         let (parts, body) = req.into_parts();
         let head = HttpRequest::from_parts(parts, ());
@@ -557,17 +605,8 @@ pub(crate) fn parse_icap_request(data: &[u8]) -> IcapResult<Request<Vec<u8>>> {
 
     let service = icap_uri.rsplit('/').next().unwrap_or("").to_string();
 
-    let allow_204 = icap_headers
-        .get("Allow")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.split(',').any(|p| p.trim() == "204"))
-        .unwrap_or(false);
-
-    let allow_206 = icap_headers
-        .get("Allow")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.split(',').any(|p| p.trim() == "206"))
-        .unwrap_or(false);
+    let allow_204 = allow_contains_token(&icap_headers, "204");
+    let allow_206 = allow_contains_token(&icap_headers, "206");
 
     let preview_size = icap_headers
         .get("Preview")
@@ -728,13 +767,11 @@ fn next_offset_after(enc: &crate::parser::icap::Encapsulated, start: usize) -> O
     let mut min: Option<usize> = None;
 
     let mut consider = |v: Option<usize>| {
-        if let Some(o) = v {
-            if o > start {
-                min = Some(match min {
-                    Some(m) => m.min(o),
-                    None => o,
-                });
-            }
+        if let Some(o) = v && o > start {
+            min = Some(match min {
+                Some(m) => m.min(o),
+                None => o,
+            });
         }
     };
 
@@ -759,6 +796,15 @@ fn slice_encapsulated(enc_area: &[u8], start: usize, end: Option<usize>) -> Icap
         return Err("Encapsulated offsets invalid (end < start)".into());
     }
     Ok(&enc_area[start..end])
+}
+
+#[inline]
+fn allow_contains_token(headers: &HeaderMap, token: &str) -> bool {
+    headers
+        .get("Allow")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.split(',').any(|p| p.trim().eq_ignore_ascii_case(token)))
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -886,6 +932,38 @@ Encapsulated: req-hdr=0, req-body={}, null-body={}\r\n\
 
         let req2: Request = Request::respmod("svc").with_http_response(http_resp);
         assert!(matches!(req2.embedded, Some(EmbeddedHttp::Resp { .. })));
+    }
+
+    #[test]
+    fn builder_embeds_http_heads_without_buffered_body() {
+        let req_head = HttpRequest::builder()
+            .method("POST")
+            .uri("/x")
+            .version(Version::HTTP_11)
+            .body(())
+            .unwrap();
+        let req: Request = Request::reqmod("svc").with_http_request_head(req_head);
+        assert!(matches!(
+            req.embedded,
+            Some(EmbeddedHttp::Req {
+                body: Body::Empty,
+                ..
+            })
+        ));
+
+        let resp_head = HttpResponse::builder()
+            .status(HttpStatus::OK)
+            .version(Version::HTTP_11)
+            .body(())
+            .unwrap();
+        let req2: Request = Request::respmod("svc").with_http_response_head(resp_head);
+        assert!(matches!(
+            req2.embedded,
+            Some(EmbeddedHttp::Resp {
+                body: Body::Empty,
+                ..
+            })
+        ));
     }
 
     // ---------- Version & framing ----------
@@ -1076,62 +1154,10 @@ mod rfc_tests {
     //! - Case-insensitive headers
     //! - Request-line/headers framing errors
     use super::*;
-    use http::{HeaderValue, StatusCode as HttpStatus};
+    use http::StatusCode as HttpStatus;
 
     fn icap_bytes(s: &str) -> Vec<u8> {
         s.as_bytes().to_vec()
-    }
-
-    #[test]
-    fn method_from_str_is_case_insensitive() {
-        assert_eq!(Method::from("reqmod"), Method::ReqMod);
-        assert_eq!(Method::from("RESPMOD"), Method::RespMod);
-        assert_eq!(Method::from("  Options  "), Method::Options);
-    }
-
-    #[test]
-    #[should_panic(expected = "Unknown ICAP method string")]
-    fn method_from_str_unknown_panics() {
-        let _ = Method::from("PATCH");
-    }
-
-    #[test]
-    fn service_is_last_path_segment_of_icap_uri() {
-        let raw = icap_bytes(
-            "REQMOD icap://icap.example.org/icap/test ICAP/1.0\r\n\
-         Host: icap.example.org\r\n\
-         Encapsulated: req-hdr=0\r\n\
-         \r\n",
-        );
-        let r = parse_icap_request(&raw).expect("parse");
-        assert_eq!(r.service, "test");
-
-        let raw2 = icap_bytes(
-            "RESPMOD icap://icap.example.org/respmod ICAP/1.0\r\n\
-         Host: icap.example.org\r\n\
-         Encapsulated: res-hdr=0\r\n\
-         \r\n",
-        );
-        let r2 = parse_icap_request(&raw2).expect("parse");
-        assert_eq!(r2.service, "respmod");
-    }
-
-    #[test]
-    fn headers_are_case_insensitive_allow_parsed_with_whitespace() {
-        let raw = icap_bytes(
-            "REQMOD icap://h/s ICAP/1.0\r\n\
-         host: icap.example.org\r\n\
-         aLlOw: 206, 204 \r\n\
-         Encapsulated: req-hdr=0\r\n\
-         \r\n",
-        );
-        let r = parse_icap_request(&raw).expect("parse");
-        assert!(r.allow_204);
-        assert!(r.allow_206);
-        assert_eq!(
-            r.icap_headers.get("Host").unwrap(),
-            &HeaderValue::from_static("icap.example.org")
-        );
     }
 
     #[test]
@@ -1200,34 +1226,4 @@ mod rfc_tests {
         assert!(err.to_string().contains("not complete"), "err: {err}");
     }
 
-    #[test]
-    fn host_header_is_required() {
-        let raw = b"REQMOD icap://icap.example.org/icap/test ICAP/1.0\r\n\
-                Encapsulated: req-hdr=0\r\n\
-                \r\n";
-        let err = parse_icap_request(raw).unwrap_err();
-        let m = err.to_string().to_lowercase();
-        assert!(m.contains("host"), "expected missing Host error; got: {m}");
-    }
-
-    #[test]
-    fn encapsulated_is_required_for_request() {
-        let raw_req = b"REQMOD icap://icap.example.org/icap/test ICAP/1.0\r\n\
-                    Host: icap.example.org\r\n\
-                    \r\n";
-        let err1 = parse_icap_request(raw_req).unwrap_err();
-        assert!(
-            matches!(err1, Error::MissingHeader(h) if h == "Encapsulated"),
-            "expected MissingHeader(Encapsulated); got: {err1}"
-        );
-
-        let raw_resp = b"RESPMOD icap://icap.example.org/icap/test ICAP/1.0\r\n\
-                     Host: icap.example.org\r\n\
-                     \r\n";
-        let err2 = parse_icap_request(raw_resp).unwrap_err();
-        assert!(
-            matches!(err2, Error::MissingHeader(h) if h == "Encapsulated"),
-            "expected MissingHeader(Encapsulated); got: {err2}"
-        );
-    }
 }

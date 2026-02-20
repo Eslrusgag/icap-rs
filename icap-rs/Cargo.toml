@@ -50,6 +50,7 @@ rustls-pemfile = { version = "2", optional = true }
 
 [dev-dependencies]
 rstest = "0.26.1"
+criterion = { version = "0.5", features = ["html_reports"] }
 
 
 [[example]]
@@ -73,3 +74,7 @@ path = "examples/tls_client.rs"
 #[[bench]]
 #name = "client_bench"
 #harness = false
+
+[[bench]]
+name = "protocol_bench"
+harness = false
