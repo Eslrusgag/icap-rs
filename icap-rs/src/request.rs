@@ -7,11 +7,14 @@
 //! - [`Request<R>`]: a single, public ICAP request type used by both **client** and
 //!   **server**, parameterized by the body carrier `R`.
 //! ## Preview (server-side)
-//! When the server receives a Preview (`Preview: N`), it should construct
-//! `EmbeddedHttp<BodyRead>` with `Body::Preview { bytes, ieof, remainder }`.
-//! Calling `Body<BodyRead>::ensure_full()` will (lazily) send `ICAP/1.0 100 Continue`
-//! if needed and convert the body to `Body::Full`, returning a unified reader that
-//! yields `preview-bytes` followed by the remainder stream.
+//! The server handles Preview (`Preview: N`) on the wire:
+//! - reads preview chunks first,
+//! - sends `ICAP/1.0 100 Continue` when preview is non-`ieof`,
+//! - then reads and de-chunks the remainder before invoking handlers.
+//!
+//! As a result, default server handlers receive embedded bodies as `Body::Full`.
+//! `Body::Preview` and `Body<BodyRead>::ensure_full()` remain available for custom
+//! integrations that build preview-aware pipelines explicitly.
 //!
 //! ## Example (client: REQMOD with an embedded HTTP request)
 //! ```rust
@@ -615,11 +618,13 @@ pub(crate) fn parse_icap_request(data: &[u8]) -> IcapResult<Request<Vec<u8>>> {
     // Encapsulated area: сразу после ICAP headers CRLFCRLF
     let enc_area = &data[hdr_end..];
 
-    let enc = icap_headers
-        .get("Encapsulated")
-        .and_then(|v| v.to_str().ok())
-        .map(crate::parser::icap::parse_encapsulated_value)
-        .unwrap_or_default();
+    let enc = match icap_headers.get("Encapsulated") {
+        Some(v) => {
+            let raw = v.to_str().map_err(|e| Error::Header(e.to_string()))?;
+            crate::parser::icap::parse_encapsulated_value(raw)?
+        }
+        None => crate::parser::icap::Encapsulated::default(),
+    };
 
     let http_hdr_off = match method {
         Method::ReqMod => enc.req_hdr,
@@ -780,6 +785,7 @@ fn next_offset_after(enc: &crate::parser::icap::Encapsulated, start: usize) -> O
     consider(enc.res_hdr);
     consider(enc.req_body);
     consider(enc.res_body);
+    consider(enc.opt_body);
     consider(enc.null_body);
 
     min
@@ -1057,6 +1063,38 @@ Encapsulated: req-hdr=0, req-body={}, null-body={}\r\n\
         assert!(
             matches!(err2, Error::MissingHeader(h) if h == "Encapsulated"),
             "expected MissingHeader(Encapsulated); got: {err2}"
+        );
+    }
+
+    #[test]
+    fn invalid_encapsulated_token_is_rejected() {
+        let raw = icap_bytes(
+            "REQMOD icap://icap.example.org/icap/test ICAP/1.0\r\n\
+             Host: icap.example.org\r\n\
+             Encapsulated: req-hdr=0, bad-token=10\r\n\
+             \r\n",
+        );
+        let err = parse_icap_request(&raw).unwrap_err();
+        let m = err.to_string().to_lowercase();
+        assert!(
+            m.contains("encapsulated") || m.contains("invalid"),
+            "expected Encapsulated parse error, got: {m}"
+        );
+    }
+
+    #[test]
+    fn duplicate_encapsulated_part_is_rejected() {
+        let raw = icap_bytes(
+            "RESPMOD icap://icap.example.org/icap/test ICAP/1.0\r\n\
+             Host: icap.example.org\r\n\
+             Encapsulated: res-hdr=0, res-hdr=10\r\n\
+             \r\n",
+        );
+        let err = parse_icap_request(&raw).unwrap_err();
+        let m = err.to_string().to_lowercase();
+        assert!(
+            m.contains("duplicate") && m.contains("encapsulated"),
+            "expected duplicate Encapsulated part error, got: {m}"
         );
     }
 

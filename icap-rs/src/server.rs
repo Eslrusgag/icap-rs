@@ -346,8 +346,10 @@ impl Server {
             };
 
             let hdr_text =
-                std::str::from_utf8(&buf[..h_end]).map_err(|_| "Invalid ICAP headers utf8")?;
-            let enc = crate::parser::parse_encapsulated_header(hdr_text);
+                std::str::from_utf8(&buf[..h_end])
+                .map_err(|_| "Invalid ICAP headers utf8")?
+                .to_string();
+            let enc = crate::parser::parse_encapsulated_header(&hdr_text)?;
             let mut msg_end = h_end;
 
             if let Some(body_rel) = enc.req_body.or(enc.res_body) {
@@ -360,14 +362,43 @@ impl Server {
                     buf.extend_from_slice(&tmp[..n]);
                 }
 
-                msg_end = read_chunked_to_end(&mut socket, &mut buf, body_abs).await?;
-                if msg_end > body_abs {
-                    let mut chunked_slice = &buf[body_abs..msg_end];
-                    let decoded = dechunk_icap_entity(&mut chunked_slice)
-                        .map_err(|e| format!("dechunk ICAP entity: {e}"))?;
+                let preview_size = parse_preview_header_value(&hdr_text);
+                if preview_size.is_some() {
+                    let (preview_end, preview_ieof) =
+                        read_chunked_until_zero(&mut socket, &mut buf, body_abs).await?;
+
+                    let mut preview_slice = &buf[body_abs..preview_end];
+                    let (mut decoded, _ieof_seen) = dechunk_icap_entity_with_ieof(&mut preview_slice)
+                        .map_err(|e| format!("dechunk ICAP preview entity: {e}"))?;
+
+                    if !preview_ieof {
+                        socket.write_all(b"ICAP/1.0 100 Continue\r\n\r\n").await?;
+                        socket.flush().await?;
+
+                        let rest_end =
+                            read_chunked_to_end(&mut socket, &mut buf, preview_end).await?;
+                        let mut rest_slice = &buf[preview_end..rest_end];
+                        let (rest_decoded, _) = dechunk_icap_entity_with_ieof(&mut rest_slice)
+                            .map_err(|e| format!("dechunk ICAP remainder entity: {e}"))?;
+                        decoded.extend_from_slice(&rest_decoded);
+                        msg_end = rest_end;
+                    } else {
+                        msg_end = preview_end;
+                    }
+
                     let decoded_len = decoded.len();
                     buf.splice(body_abs..msg_end, decoded);
                     msg_end = body_abs + decoded_len;
+                } else {
+                    msg_end = read_chunked_to_end(&mut socket, &mut buf, body_abs).await?;
+                    if msg_end > body_abs {
+                        let mut chunked_slice = &buf[body_abs..msg_end];
+                        let decoded = dechunk_icap_entity(&mut chunked_slice)
+                            .map_err(|e| format!("dechunk ICAP entity: {e}"))?;
+                        let decoded_len = decoded.len();
+                        buf.splice(body_abs..msg_end, decoded);
+                        msg_end = body_abs + decoded_len;
+                    }
                 }
             }
 
@@ -581,6 +612,149 @@ fn dechunk_icap_entity(data: &mut &[u8]) -> Result<Vec<u8>, String> {
     }
 
     Ok(out)
+}
+
+fn parse_preview_header_value(hdr_text: &str) -> Option<usize> {
+    for line in hdr_text.lines() {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.trim().eq_ignore_ascii_case("Preview") {
+            return value.trim().parse::<usize>().ok();
+        }
+    }
+    None
+}
+
+async fn read_chunked_until_zero<S>(
+    stream: &mut S,
+    buf: &mut Vec<u8>,
+    mut pos: usize,
+) -> IcapResult<(usize, bool)>
+where
+    S: AsyncRead + Unpin,
+{
+    loop {
+        match parse_one_chunk_meta(buf, pos)? {
+            Some((next_pos, is_zero, has_ieof, _size)) => {
+                if is_zero {
+                    return Ok((next_pos, has_ieof));
+                }
+                pos = next_pos;
+            }
+            None => {
+                let mut tmp = [0u8; 4096];
+                let n = stream.read(&mut tmp).await?;
+                if n == 0 {
+                    return Err("Unexpected EOF while reading ICAP preview body".into());
+                }
+                buf.extend_from_slice(&tmp[..n]);
+            }
+        }
+    }
+}
+
+fn parse_one_chunk_meta(
+    buf: &[u8],
+    from: usize,
+) -> Result<Option<(usize, bool, bool, usize)>, String> {
+    if from >= buf.len() {
+        return Ok(None);
+    }
+
+    let rel = memmem::find(&buf[from..], b"\r\n");
+    let Some(line_end_rel) = rel else {
+        return Ok(None);
+    };
+    let line_end = from + line_end_rel;
+    let size_line = &buf[from..line_end];
+    let after_size = line_end + 2;
+
+    let (size_hex, ext_part) = if let Some(i) = memchr(b';', size_line) {
+        (&size_line[..i], Some(&size_line[i + 1..]))
+    } else {
+        (size_line, None)
+    };
+
+    let size_str = std::str::from_utf8(size_hex)
+        .map_err(|_| "chunk size not utf8".to_string())?
+        .trim();
+    let size = usize::from_str_radix(size_str, 16).map_err(|_| "chunk size not hex".to_string())?;
+
+    let has_ieof = ext_part
+        .and_then(|b| std::str::from_utf8(b).ok())
+        .map(|s| {
+            s.split(';')
+                .any(|t| t.trim().eq_ignore_ascii_case("ieof"))
+        })
+        .unwrap_or(false);
+
+    if size == 0 {
+        if buf.len() < after_size + 2 {
+            return Ok(None);
+        }
+        if &buf[after_size..after_size + 2] != b"\r\n" {
+            return Err("Invalid chunked terminator".into());
+        }
+        return Ok(Some((after_size + 2, true, has_ieof, 0)));
+    }
+
+    let need = after_size + size + 2;
+    if buf.len() < need {
+        return Ok(None);
+    }
+    if &buf[after_size + size..need] != b"\r\n" {
+        return Err("missing CRLF after chunk".into());
+    }
+    Ok(Some((need, false, false, size)))
+}
+
+fn dechunk_icap_entity_with_ieof(data: &mut &[u8]) -> Result<(Vec<u8>, bool), String> {
+    let mut out = Vec::with_capacity((*data).len());
+    let mut d = *data;
+    let ieof = loop {
+        let rel = memmem::find(d, b"\r\n").ok_or("chunk size line without CRLF")?;
+        let line = &d[..rel];
+        d = &d[rel + 2..];
+
+        let (size_hex, ext_part) = if let Some(i) = memchr(b';', line) {
+            (&line[..i], Some(&line[i + 1..]))
+        } else {
+            (line, None)
+        };
+
+        let size_str = std::str::from_utf8(size_hex).map_err(|_| "chunk size not utf8")?;
+        let size = usize::from_str_radix(size_str.trim(), 16).map_err(|_| "chunk size not hex")?;
+
+        let has_ieof = ext_part
+            .and_then(|b| std::str::from_utf8(b).ok())
+            .map(|s| {
+                s.split(';')
+                    .any(|t| t.trim().eq_ignore_ascii_case("ieof"))
+            })
+            .unwrap_or(false);
+
+        if size == 0 {
+            if d.starts_with(b"\r\n") {
+                d = &d[2..];
+            } else {
+                return Err("missing final CRLF after zero chunk".into());
+            }
+            *data = d;
+            break has_ieof;
+        }
+
+        if d.len() < size + 2 {
+            return Err("incomplete chunk data".into());
+        }
+        out.extend_from_slice(&d[..size]);
+        if &d[size..size + 2] != b"\r\n" {
+            return Err("missing CRLF after chunk".into());
+        }
+        d = &d[size + 2..];
+    };
+
+    Ok((out, ieof))
 }
 
 #[cfg(feature = "tls-rustls")]

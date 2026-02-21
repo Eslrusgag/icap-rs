@@ -210,7 +210,15 @@ async fn icap_reqmod_with_preview(
     })
     .await;
 
-    let code = icap_status_code(&resp).expect("no icap code");
+    let mut code = icap_status_code(&resp).expect("no icap code");
+    if code == 100
+        && let Some(h1) = find_double_crlf(&resp)
+    {
+        let rest = &resp[h1 + 4..];
+        if let Some(c2) = icap_status_code(rest) {
+            code = c2;
+        }
+    }
     (code, resp)
 }
 
@@ -239,6 +247,8 @@ async fn preview_non_ieof_full_body_roundtrip() {
     let addr = "127.0.0.1:13441";
     start_server(addr).await;
 
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+
     let preview = b"abcd";
     let tail = b"efghij";
     let total_body = [preview.as_ref(), tail.as_ref()].concat();
@@ -248,21 +258,97 @@ async fn preview_non_ieof_full_body_roundtrip() {
         total_body.len()
     );
 
-    let (code, resp) = icap_reqmod_with_preview(
+    let req_body_off = http_head.len();
+    let icap = format!(
+        "REQMOD icap://{}/scan ICAP/1.0\r\n\
+         Host: {}\r\n\
+         Encapsulated: req-hdr=0, req-body={}\r\n\
+         Preview: {}\r\n\
+         \r\n",
         addr,
-        "scan",
-        preview.len(),
-        &http_head,
-        preview,
-        Some(tail),
-        false,
-    )
+        addr,
+        req_body_off,
+        preview.len()
+    );
+
+    stream
+        .write_all(icap.as_bytes())
+        .await
+        .expect("write icap head");
+    stream
+        .write_all(http_head.as_bytes())
+        .await
+        .expect("write http head");
+
+    let mut preview_wire = Vec::new();
+    preview_wire.extend_from_slice(format!("{:X}\r\n", preview.len()).as_bytes());
+    preview_wire.extend_from_slice(preview);
+    preview_wire.extend_from_slice(b"\r\n0\r\n\r\n");
+    stream
+        .write_all(&preview_wire)
+        .await
+        .expect("write preview only");
+
+    let mut first_resp = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_millis(700), async {
+        let mut tmp = [0u8; 4096];
+        loop {
+            let n = stream.read(&mut tmp).await.expect("read 100");
+            if n == 0 {
+                break;
+            }
+            first_resp.extend_from_slice(&tmp[..n]);
+            if find_double_crlf(&first_resp).is_some() {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("timeout waiting for 100 Continue");
+    assert_eq!(
+        icap_status_code(&first_resp).expect("no first status"),
+        100,
+        "expected 100 Continue before remainder"
+    );
+
+    let mut tail_wire = Vec::new();
+    tail_wire.extend_from_slice(format!("{:X}\r\n", tail.len()).as_bytes());
+    tail_wire.extend_from_slice(tail);
+    tail_wire.extend_from_slice(b"\r\n0\r\n\r\n");
+    stream.write_all(&tail_wire).await.expect("write tail");
+
+    let mut resp = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_millis(1200), async {
+        let mut tmp = [0u8; 8192];
+        loop {
+            match stream.read(&mut tmp).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    resp.extend_from_slice(&tmp[..n]);
+                    if let Some(h_end) = find_double_crlf(&resp)
+                        && let Some(code) = icap_status_code(&resp)
+                    {
+                        if code == 204 {
+                            break;
+                        }
+                        if let Some(off2) = find_double_crlf(&resp[h_end + 4..]) {
+                            let http_head = &resp[h_end + 4..h_end + 4 + off2];
+                            if let Some(cl) = http_content_length(http_head) {
+                                let have = resp.len() - (h_end + 4 + off2 + 4);
+                                if have >= cl {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    })
     .await;
 
-    assert_eq!(
-        code, 200,
-        "server should return 200 OK when body exceeds preview"
-    );
+    assert_eq!(icap_status_code(&resp).expect("no final status"), 200);
 
     let h1 = find_double_crlf(&resp).expect("icap hdr end");
     let resp_after_icap = &resp[h1 + 4..];
@@ -282,4 +368,97 @@ async fn preview_non_ieof_full_body_roundtrip() {
         total_body.as_slice(),
         "echoed HTTP body mismatch"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn preview_non_ieof_requires_100_continue_before_remainder() {
+    let addr = "127.0.0.1:13442";
+    start_server(addr).await;
+
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+
+    let preview = b"abcd";
+    let tail = b"efghij";
+    let total_len = preview.len() + tail.len();
+    let http_head = format!(
+        "POST /upload HTTP/1.1\r\nHost: example.com\r\nContent-Length: {}\r\n\r\n",
+        total_len
+    );
+    let req_body_off = http_head.len();
+
+    let icap = format!(
+        "REQMOD icap://{}/scan ICAP/1.0\r\n\
+         Host: {}\r\n\
+         Encapsulated: req-hdr=0, req-body={}\r\n\
+         Preview: {}\r\n\
+         \r\n",
+        addr,
+        addr,
+        req_body_off,
+        preview.len()
+    );
+
+    stream
+        .write_all(icap.as_bytes())
+        .await
+        .expect("write icap head");
+    stream
+        .write_all(http_head.as_bytes())
+        .await
+        .expect("write http head");
+
+    let mut preview_wire = Vec::new();
+    preview_wire.extend_from_slice(format!("{:X}\r\n", preview.len()).as_bytes());
+    preview_wire.extend_from_slice(preview);
+    preview_wire.extend_from_slice(b"\r\n0\r\n\r\n");
+    stream
+        .write_all(&preview_wire)
+        .await
+        .expect("write preview only");
+
+    let mut first_resp = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_millis(700), async {
+        let mut tmp = [0u8; 4096];
+        loop {
+            let n = stream.read(&mut tmp).await.expect("read 100");
+            if n == 0 {
+                break;
+            }
+            first_resp.extend_from_slice(&tmp[..n]);
+            if find_double_crlf(&first_resp).is_some() {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("timeout waiting for 100 Continue");
+
+    let code = icap_status_code(&first_resp).expect("no ICAP code in first response");
+    assert_eq!(code, 100, "server must send 100 Continue after non-ieof preview");
+
+    let mut tail_wire = Vec::new();
+    tail_wire.extend_from_slice(format!("{:X}\r\n", tail.len()).as_bytes());
+    tail_wire.extend_from_slice(tail);
+    tail_wire.extend_from_slice(b"\r\n0\r\n\r\n");
+    stream.write_all(&tail_wire).await.expect("write tail");
+
+    let mut final_resp = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_millis(1000), async {
+        let mut tmp = [0u8; 8192];
+        loop {
+            let n = stream.read(&mut tmp).await.expect("read final response");
+            if n == 0 {
+                break;
+            }
+            final_resp.extend_from_slice(&tmp[..n]);
+            if find_double_crlf(&final_resp).is_some() {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("timeout waiting final response");
+
+    let final_code = icap_status_code(&final_resp).expect("no final ICAP status");
+    assert_eq!(final_code, 200, "expected final 200 after remainder upload");
 }

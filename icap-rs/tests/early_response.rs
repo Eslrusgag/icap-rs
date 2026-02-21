@@ -65,6 +65,7 @@ async fn early_503_when_conn_limit_exceeded() {
     let (addr, _handle) = spawn_server_with_limit(1).await;
 
     let _hold = TcpStream::connect(&addr).await.expect("occupy permit");
+    sleep(Duration::from_millis(40)).await;
 
     let sa: SocketAddr = addr.parse().unwrap();
     let client = make_client("127.0.0.1", sa.port());

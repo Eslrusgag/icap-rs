@@ -13,8 +13,9 @@ A Rust implementation of the **ICAP** protocol ([RFC 3507]) providing a client A
 - **Client**: functional — supports `OPTIONS`, `REQMOD`, `RESPMOD`, Preview (including `ieof`), embedded HTTP/1.x
   messages, streaming bodies, and optional connection reuse.
 - **Server**: per-service routing, automatic `OPTIONS` responses (with optional **dynamic ISTag**),
-  duplicate-route detection, safe reading of chunked bodies before invoking handlers, and an RFC-friendly **200 echo**
-  fallback when `Allow: 204` is absent and `Preview` is not used.
+  duplicate-route detection, Preview handshake (`100 Continue` on non-`ieof` preview),
+  strict `Encapsulated` validation, and an RFC-friendly **200 echo** fallback when `Allow: 204` is absent and
+  `Preview` is not used.
 
 ---
 
@@ -25,6 +26,8 @@ A Rust implementation of the **ICAP** protocol ([RFC 3507]) providing a client A
 - Embedded HTTP request/response serialization on the ICAP wire.
 - **Preview** negotiation (incl. `Preview: 0` and `ieof` fast path).
 - Chunked uploads, streaming large bodies after `100 Continue`.
+- Strict `Encapsulated` parsing (invalid/duplicate/non-monotonic offsets are rejected).
+- ICAP responses with non-empty body are serialized using ICAP chunked framing.
 - Streaming response body directly into an `AsyncWrite` sink (`...into_writer`) to avoid buffering.
 - Keep-Alive: reuse a single idle connection.
 - **ICAPS (TLS)** with `rustls` — see [docs/tls.md](docs/tls.md)
@@ -112,7 +115,7 @@ async fn main() -> icap_rs::error::IcapResult<()> {
   `RESPMOD`).
 - **Duplicate route detection**: registering the same `(service, method)` twice panics with a clear message (axum-like
   DX).
-- Reads encapsulated *chunked* bodies to completion before invoking handlers.
+- Handles Preview on wire (`100 Continue` for non-`ieof`) and then reads encapsulated chunked body before invoking handlers.
 
 ### ICAP status codes (re-exported from `http`)
 

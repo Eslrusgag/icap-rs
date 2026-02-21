@@ -360,8 +360,29 @@ impl Client {
         }
 
         let built = self.build_icap_request_bytes(req, false, req.preview_ieof)?;
-        AsyncWriteExt::write_all(&mut stream, &built.bytes).await?;
-        AsyncWriteExt::flush(&mut stream).await?;
+        if let Err(write_err) = AsyncWriteExt::write_all(&mut stream, &built.bytes).await {
+            if let Ok((_code, hdr_buf)) =
+                Self::with_timeout(self.inner.read_timeout, read_icap_headers(&mut stream)).await
+                && let Ok(response_buf) = self
+                    .read_response_buffer_with_headers(&mut stream, hdr_buf)
+                    .await
+            {
+                return self.finalize_response(stream, response_buf).await;
+            }
+            return Err(write_err.into());
+        }
+
+        if let Err(flush_err) = AsyncWriteExt::flush(&mut stream).await {
+            if let Ok((_code, hdr_buf)) =
+                Self::with_timeout(self.inner.read_timeout, read_icap_headers(&mut stream)).await
+                && let Ok(response_buf) = self
+                    .read_response_buffer_with_headers(&mut stream, hdr_buf)
+                    .await
+            {
+                return self.finalize_response(stream, response_buf).await;
+            }
+            return Err(flush_err.into());
+        }
 
         // OPTIONS: read headers + optional body, then parse, then decide reuse
         if req.method == Method::Options {
@@ -858,48 +879,6 @@ struct BuiltIcap {
     remaining_body: Option<Vec<u8>>,
 }
 
-fn http_content_length(http_head: &[u8]) -> Option<usize> {
-    for line in http_head.split(|&b| b == b'\n') {
-        let line = if let Some(b) = line.strip_suffix(b"\r") {
-            b
-        } else {
-            line
-        };
-        let lower = line
-            .iter()
-            .map(|c| c.to_ascii_lowercase())
-            .collect::<Vec<_>>();
-        if lower.starts_with(b"content-length:") {
-            let v = &line[b"Content-Length:".len()..].trim_ascii();
-            return std::str::from_utf8(v).ok()?.trim().parse::<usize>().ok();
-        }
-    }
-    None
-}
-
-fn http_has_te_chunked(http_head: &[u8]) -> bool {
-    for line in http_head.split(|&b| b == b'\n') {
-        let line = if let Some(b) = line.strip_suffix(b"\r") {
-            b
-        } else {
-            line
-        };
-        let lower = line
-            .iter()
-            .map(|c| c.to_ascii_lowercase())
-            .collect::<Vec<_>>();
-        if lower.starts_with(b"transfer-encoding:")
-            && std::str::from_utf8(&line[b"Transfer-Encoding:".len()..])
-                .ok()
-                .map(|v| v.to_ascii_lowercase().contains("chunked"))
-                .unwrap_or(false)
-        {
-            return true;
-        }
-    }
-    false
-}
-
 async fn read_until_len<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     buf: &mut Vec<u8>,
@@ -927,49 +906,33 @@ where
     };
 
     let hdr_text = std::str::from_utf8(&buf[..h_end]).map_err(|_| "Invalid headers utf8")?;
-    let enc = parse_encapsulated_header(hdr_text);
+    let enc = parse_encapsulated_header(hdr_text)?;
 
-    if let Some(http_rel) = enc.req_hdr.or(enc.res_hdr) {
-        let http_abs = h_end + http_rel;
+    let has_enc_body = enc.req_body.is_some() || enc.res_body.is_some() || enc.opt_body.is_some();
+    if has_enc_body {
+        let enc_start_rel = [
+            enc.req_hdr,
+            enc.res_hdr,
+            enc.req_body,
+            enc.res_body,
+            enc.opt_body,
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(0);
 
-        let http_hdr_end_abs = loop {
-            if let Some(rel) = find_double_crlf(&buf[http_abs..]) {
-                break http_abs + rel;
-            }
-            let mut tmp = [0u8; 4096];
-            let n = AsyncReadExt::read(stream, &mut tmp).await?;
-            if n == 0 {
-                return Err("Unexpected EOF before end of embedded HTTP headers".into());
-            }
-            buf.extend_from_slice(&tmp[..n]);
-        };
-
-        let has_http_body = enc.req_body.is_some() || enc.res_body.is_some();
-        if !has_http_body {
-            return Ok(());
+        let enc_abs = h_end + enc_start_rel;
+        if buf.len() < enc_abs {
+            read_until_len(stream, buf, enc_abs).await?;
         }
-
-        let http_head = &buf[http_abs..http_hdr_end_abs];
-        if let Some(cl) = http_content_length(http_head) {
-            let want = http_hdr_end_abs + cl;
-            read_until_len(stream, buf, want).await?;
-            return Ok(());
+        let end = read_chunked_to_end(stream, buf, enc_abs).await?;
+        if end > enc_abs {
+            let mut chunked_slice = &buf[enc_abs..end];
+            let decoded =
+                dechunk_icap_entity(&mut chunked_slice).map_err(|e| format!("dechunk ICAP entity: {e}"))?;
+            buf.splice(enc_abs..end, decoded);
         }
-
-        if http_has_te_chunked(http_head) {
-            let _end = read_chunked_to_end(stream, buf, http_hdr_end_abs).await?;
-            return Ok(());
-        }
-
-        return Ok(());
-    }
-
-    if let Some(body_rel) = enc.req_body.or(enc.res_body) {
-        let body_abs = h_end + body_rel;
-        if buf.len() < body_abs {
-            read_until_len(stream, buf, body_abs).await?;
-        }
-        let _end = read_chunked_to_end(stream, buf, body_abs).await?;
     }
 
     Ok(())
@@ -988,73 +951,51 @@ where
         return Err("Corrupted ICAP headers".into());
     };
 
-    let hdr_text = std::str::from_utf8(&buf[..h_end]).map_err(|_| "Invalid headers utf8")?;
-    let enc = parse_encapsulated_header(hdr_text);
-
-    // Fast path: embedded HTTP message with known Content-Length (or header-only) can be streamed directly.
-    if let Some(http_rel) = enc.req_hdr.or(enc.res_hdr) {
-        let http_abs = h_end + http_rel;
-        while buf.len() < http_abs {
-            let mut tmp = [0u8; 4096];
-            let n = AsyncReadExt::read(stream, &mut tmp).await?;
-            if n == 0 {
-                return Err("Unexpected EOF before start of embedded HTTP".into());
-            }
-            buf.extend_from_slice(&tmp[..n]);
-        }
-
-        let http_hdr_end_abs = loop {
-            if let Some(rel) = find_double_crlf(&buf[http_abs..]) {
-                break http_abs + rel;
-            }
-            let mut tmp = [0u8; 4096];
-            let n = AsyncReadExt::read(stream, &mut tmp).await?;
-            if n == 0 {
-                return Err("Unexpected EOF before end of embedded HTTP headers".into());
-            }
-            buf.extend_from_slice(&tmp[..n]);
-        };
-
-        let has_http_body = enc.req_body.is_some() || enc.res_body.is_some();
-        let target_end = if !has_http_body {
-            Some(http_hdr_end_abs)
-        } else {
-            let http_head = &buf[http_abs..http_hdr_end_abs];
-            http_content_length(http_head).map(|cl| http_hdr_end_abs + cl)
-        };
-
-        if let Some(target_end) = target_end {
-            let initial_end = buf.len().min(target_end);
-            if initial_end > h_end {
-                AsyncWriteExt::write_all(writer, &buf[h_end..initial_end]).await?;
-            }
-            let mut written = initial_end;
-            let mut tmp = [0u8; 8192];
-            while written < target_end {
-                let n = AsyncReadExt::read(stream, &mut tmp).await?;
-                if n == 0 {
-                    return Err("Unexpected EOF while streaming response body".into());
-                }
-                let take = (target_end - written).min(n);
-                AsyncWriteExt::write_all(writer, &tmp[..take]).await?;
-                written += take;
-                if take < n {
-                    buf.clear();
-                    buf.extend_from_slice(&tmp[take..n]);
-                }
-            }
-            buf.truncate(h_end);
-            return Ok(());
-        }
-    }
-
-    // Fallback for chunked/unknown-length variants: use buffered reader, then forward payload.
     read_icap_body_if_any(stream, buf).await?;
     if buf.len() > h_end {
         AsyncWriteExt::write_all(writer, &buf[h_end..]).await?;
         buf.truncate(h_end);
     }
     Ok(())
+}
+
+fn dechunk_icap_entity(data: &mut &[u8]) -> Result<Vec<u8>, String> {
+    let mut out = Vec::with_capacity((*data).len());
+    let mut d = *data;
+
+    loop {
+        let crlf_pos = memchr::memmem::find(d, b"\r\n").ok_or("chunk size line without CRLF")?;
+        let (size_line, rest) = d.split_at(crlf_pos);
+        d = &rest[2..];
+
+        let size_hex = size_line
+            .split(|&b| b == b';')
+            .next()
+            .unwrap_or(size_line);
+        let size_str = std::str::from_utf8(size_hex).map_err(|_| "chunk size not utf8")?;
+        let size = usize::from_str_radix(size_str.trim(), 16).map_err(|_| "chunk size not hex")?;
+
+        if size == 0 {
+            if d.starts_with(b"\r\n") {
+                d = &d[2..];
+            } else {
+                return Err("missing final CRLF after zero chunk".into());
+            }
+            *data = d;
+            break;
+        }
+
+        if d.len() < size + 2 {
+            return Err("incomplete chunk data".into());
+        }
+        out.extend_from_slice(&d[..size]);
+        if &d[size..size + 2] != b"\r\n" {
+            return Err("missing CRLF after chunk".into());
+        }
+        d = &d[size + 2..];
+    }
+
+    Ok(out)
 }
 fn parse_authority_with_scheme(uri: &str) -> IcapResult<(String, u16, bool)> {
     let s = uri.trim();

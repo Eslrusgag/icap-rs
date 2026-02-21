@@ -1,4 +1,4 @@
-use crate::error::IcapResult;
+use crate::error::{Error, IcapResult};
 //use crate::request::{EmbeddedHttp, Request};
 use crate::response::Response;
 use std::borrow::Cow;
@@ -23,37 +23,71 @@ pub struct Encapsulated {
     pub(crate) res_hdr: Option<usize>,
     pub(crate) req_body: Option<usize>,
     pub(crate) res_body: Option<usize>,
+    pub(crate) opt_body: Option<usize>,
     pub(crate) null_body: Option<usize>,
 }
 
 /// Parse the `Encapsulated:` header into offsets.
 /// Parse only the value of the `Encapsulated:` header (right side).
 ///
-pub fn parse_encapsulated_value(val: &str) -> Encapsulated {
+pub fn parse_encapsulated_value(val: &str) -> IcapResult<Encapsulated> {
+    if val.trim().is_empty() {
+        return Err(Error::MissingHeader("Encapsulated"));
+    }
+
     let mut enc = Encapsulated::default();
+    let mut offsets: Vec<usize> = Vec::new();
 
     for part in val.split(',') {
-        let part = part.trim();
-        let mut it = part.splitn(2, '=');
+        let p = part.trim();
+        let (name_raw, off_raw) = p
+            .split_once('=')
+            .ok_or_else(|| Error::Header(format!("invalid Encapsulated token: {p}")))?;
 
-        let key = it.next().unwrap_or("").trim().to_ascii_lowercase();
-        let off = it.next().and_then(|s| s.trim().parse::<usize>().ok());
+        let name = name_raw.trim().to_ascii_lowercase();
+        let off: usize = off_raw
+            .trim()
+            .parse()
+            .map_err(|_| Error::Header(format!("invalid Encapsulated offset: {off_raw}")))?;
 
-        match (key.as_str(), off) {
-            ("req-hdr", Some(o)) => enc.req_hdr = Some(o),
-            ("res-hdr", Some(o)) => enc.res_hdr = Some(o),
-            ("req-body", Some(o)) => enc.req_body = Some(o),
-            ("res-body", Some(o)) => enc.res_body = Some(o),
-            ("null-body", Some(o)) => enc.null_body = Some(o),
-            _ => {}
+        let slot = match name.as_str() {
+            "req-hdr" => &mut enc.req_hdr,
+            "res-hdr" => &mut enc.res_hdr,
+            "req-body" => &mut enc.req_body,
+            "res-body" => &mut enc.res_body,
+            "opt-body" => &mut enc.opt_body,
+            "null-body" => &mut enc.null_body,
+            _ => {
+                return Err(Error::Header(format!(
+                    "invalid Encapsulated part name: {}",
+                    name_raw.trim()
+                )));
+            }
+        };
+
+        if slot.replace(off).is_some() {
+            return Err(Error::Header(format!(
+                "duplicate Encapsulated part name: {}",
+                name_raw.trim()
+            )));
+        }
+        offsets.push(off);
+    }
+
+    for w in offsets.windows(2) {
+        if w[1] < w[0] {
+            return Err(Error::Header(format!(
+                "Encapsulated offsets not monotonic: {} -> {}",
+                w[0], w[1]
+            )));
         }
     }
 
-    enc
+    Ok(enc)
 }
 
 /// Parse the `Encapsulated:` header from raw headers text.
-pub fn parse_encapsulated_header(headers_text: &str) -> Encapsulated {
+pub fn parse_encapsulated_header(headers_text: &str) -> IcapResult<Encapsulated> {
     for line in headers_text.lines() {
         let Some((name, val)) = line.split_once(':') else {
             continue;
@@ -63,7 +97,7 @@ pub fn parse_encapsulated_header(headers_text: &str) -> Encapsulated {
         }
         return parse_encapsulated_value(val);
     }
-    Encapsulated::default()
+    Ok(Encapsulated::default())
 }
 
 pub fn http_version_str(v: Version) -> &'static str {
@@ -132,20 +166,6 @@ pub fn serialize_icap_response(resp: &Response) -> IcapResult<Vec<u8>> {
         return Ok(out);
     }
 
-    let encapsulated = resp
-        .headers
-        .get("Encapsulated")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_ascii_lowercase())
-        .unwrap_or_default();
-
-    let is_embedded_http = encapsulated.contains("req-hdr=") || encapsulated.contains("res-hdr=");
-
-    if is_embedded_http {
-        out.extend_from_slice(&resp.body);
-        return Ok(out);
-    }
-
     let size_line = format!("{:X}\r\n", resp.body.len());
     out.extend_from_slice(size_line.as_bytes());
     out.extend_from_slice(&resp.body);
@@ -207,12 +227,24 @@ mod tests {
 
     #[test]
     fn parse_encapsulated_value_variants() {
-        let e = parse_encapsulated_value("req-hdr=0, req-body=123");
+        let e = parse_encapsulated_value("req-hdr=0, req-body=123").expect("parse");
         assert_eq!(e.req_hdr, Some(0));
         assert_eq!(e.req_body, Some(123));
 
-        let e2 = parse_encapsulated_value("res-hdr=0,res-body=42");
+        let e2 = parse_encapsulated_value("res-hdr=0,res-body=42").expect("parse");
         assert_eq!(e2.res_hdr, Some(0));
         assert_eq!(e2.res_body, Some(42));
+    }
+
+    #[test]
+    fn parse_encapsulated_value_rejects_invalid_tokens() {
+        let err = parse_encapsulated_value("req-hdr=0, bad=10").unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("encapsulated"));
+    }
+
+    #[test]
+    fn parse_encapsulated_value_rejects_non_monotonic_offsets() {
+        let err = parse_encapsulated_value("req-hdr=10, req-body=5").unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("offset"));
     }
 }
