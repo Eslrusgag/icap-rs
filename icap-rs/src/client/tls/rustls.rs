@@ -16,7 +16,7 @@ use rustls::RootCertStore;
 use rustls::client::ClientConfig;
 use rustls::pki_types::{CertificateDer, ServerName};
 
-use crate::error::IcapResult;
+use crate::error::{Error, IcapResult};
 use crate::net::Conn;
 
 /// Configuration for the rustls-based TLS connector.
@@ -50,8 +50,8 @@ impl RustlsConnector {
 impl crate::client::tls::TlsConnector for RustlsConnector {
     /// Perform a TLS client handshake over the provided TCP stream using SNI.
     async fn connect(&self, tcp: TcpStream, server_name: &str) -> IcapResult<Conn> {
-        let server_name =
-            ServerName::try_from(server_name.to_string()).map_err(|_| "invalid SNI server name")?;
+        let server_name = ServerName::try_from(server_name.to_string())
+            .map_err(|_| Error::InvalidUri("invalid SNI server name".into()))?;
 
         let cfg = self
             .cached_client_cfg

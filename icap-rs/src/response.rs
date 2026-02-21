@@ -110,8 +110,7 @@ impl Response {
         let istag = headers
             .get("ISTag")
             .ok_or(Error::MissingHeader("ISTag"))?
-            .to_str()
-            .map_err(|e| Error::Unexpected(e.to_string()))?;
+            .to_str()?;
         validate_istag(istag)?;
 
         Ok(Self {
@@ -147,7 +146,7 @@ impl Response {
     pub fn try_set_istag(mut self, istag: &str) -> IcapResult<Self> {
         validate_istag(istag)?;
         let name = HeaderName::from_static("istag");
-        let val = HeaderValue::from_str(istag).map_err(|e| Error::Header(e.to_string()))?;
+        let val = HeaderValue::from_str(istag)?;
         self.headers.insert(name, val);
         Ok(self)
     }
@@ -173,11 +172,10 @@ impl Response {
                 .headers
                 .get("ISTag")
                 .ok_or(Error::MissingHeader("ISTag"))?
-                .to_str()
-                .map_err(|e| Error::Unexpected(e.to_string()))?;
+                .to_str()?;
             validate_istag(istag)?;
         } else if let Some(v) = self.headers.get("ISTag") {
-            let s = v.to_str().map_err(|e| Error::Unexpected(e.to_string()))?;
+            let s = v.to_str()?;
             validate_istag(s)?;
         }
 
@@ -213,8 +211,7 @@ impl Response {
                     }
                     if looks_like_http_resp(&self.body) {
                         let enc = compute_enc_for_res_body(&self.body)?;
-                        let hv = HeaderValue::from_str(&enc)
-                            .map_err(|e| Error::Header(e.to_string()))?;
+                        let hv = HeaderValue::from_str(&enc)?;
                         ensure_owned_response(&mut owned, self)
                             .headers
                             .insert(HeaderName::from_static("encapsulated"), hv);
@@ -234,8 +231,7 @@ impl Response {
                         );
                     } else if looks_like_http_resp(&self.body) {
                         let enc = compute_enc_for_res_body(&self.body)?;
-                        let hv = HeaderValue::from_str(&enc)
-                            .map_err(|e| Error::Header(e.to_string()))?;
+                        let hv = HeaderValue::from_str(&enc)?;
                         ensure_owned_response(&mut owned, self)
                             .headers
                             .insert(HeaderName::from_static("encapsulated"), hv);
@@ -300,7 +296,7 @@ impl Response {
         let bytes = serialize_http_request(http);
 
         let enc = compute_enc_for_req_body(&bytes)?;
-        let hv = HeaderValue::from_str(&enc).map_err(|e| Error::Header(e.to_string()))?;
+        let hv = HeaderValue::from_str(&enc)?;
 
         self.body = bytes;
         self.headers
@@ -314,7 +310,7 @@ impl Response {
         let bytes = serialize_http_response(http);
 
         let enc = compute_enc_for_res_body(&bytes)?;
-        let hv = HeaderValue::from_str(&enc).map_err(|e| Error::Header(e.to_string()))?;
+        let hv = HeaderValue::from_str(&enc)?;
 
         self.body = bytes;
         self.headers
@@ -376,18 +372,19 @@ fn compute_enc_for_req_body(body: &[u8]) -> IcapResult<String> {
 pub(crate) fn parse_icap_response(raw: &[u8]) -> IcapResult<Response> {
     trace!(len = raw.len(), "parse_icap_response");
     if raw.is_empty() {
-        return Err("Empty response".into());
+        return Err(Error::parse("Empty response"));
     }
 
-    let hdr_end = find_double_crlf(raw).ok_or("ICAP response headers not complete")?;
+    let hdr_end =
+        find_double_crlf(raw).ok_or_else(|| Error::parse("ICAP response headers not complete"))?;
     let head = &raw[..hdr_end];
     let head_str = std::str::from_utf8(head)?;
     let mut lines = head_str.split("\r\n");
 
-    let status_line = lines.next().ok_or("Empty response")?;
+    let status_line = lines.next().ok_or_else(|| Error::parse("Empty response"))?;
     let parts: Vec<&str> = status_line.split_whitespace().collect();
     if parts.len() < 2 {
-        return Err("Invalid status line format".into());
+        return Err(Error::parse("Invalid status line format"));
     }
 
     if parts[0] != ICAP_VERSION {
@@ -399,9 +396,12 @@ pub(crate) fn parse_icap_response(raw: &[u8]) -> IcapResult<Response> {
     let status_code = match StatusCode::from_str(parts[1]) {
         Ok(code) => code,
         Err(_) => {
-            let code_num = parts[1].parse::<u16>().map_err(|_| "Invalid status code")?;
-            StatusCode::try_from(code_num)
-                .map_err(|_| format!("Unknown ICAP status code: {}", code_num))?
+            let code_num = parts[1]
+                .parse::<u16>()
+                .map_err(|_| Error::InvalidStatusCode("Invalid status code".into()))?;
+            StatusCode::try_from(code_num).map_err(|_| {
+                Error::InvalidStatusCode(format!("Unknown ICAP status code: {}", code_num))
+            })?
         }
     };
 
@@ -491,18 +491,19 @@ pub(crate) fn parse_icap_response(raw: &[u8]) -> IcapResult<Response> {
 pub(crate) fn parse_icap_response_head(raw: &[u8]) -> IcapResult<Response> {
     trace!(len = raw.len(), "parse_icap_response_head");
     if raw.is_empty() {
-        return Err("Empty response".into());
+        return Err(Error::parse("Empty response"));
     }
 
-    let hdr_end = find_double_crlf(raw).ok_or("ICAP response headers not complete")?;
+    let hdr_end =
+        find_double_crlf(raw).ok_or_else(|| Error::parse("ICAP response headers not complete"))?;
     let head = &raw[..hdr_end];
     let head_str = std::str::from_utf8(head)?;
     let mut lines = head_str.split("\r\n");
 
-    let status_line = lines.next().ok_or("Empty response")?;
+    let status_line = lines.next().ok_or_else(|| Error::parse("Empty response"))?;
     let parts: Vec<&str> = status_line.split_whitespace().collect();
     if parts.len() < 2 {
-        return Err("Invalid status line format".into());
+        return Err(Error::parse("Invalid status line format"));
     }
     if parts[0] != ICAP_VERSION {
         return Err(Error::InvalidVersion(parts[0].to_string()));
@@ -512,9 +513,12 @@ pub(crate) fn parse_icap_response_head(raw: &[u8]) -> IcapResult<Response> {
     let status_code = match StatusCode::from_str(parts[1]) {
         Ok(code) => code,
         Err(_) => {
-            let code_num = parts[1].parse::<u16>().map_err(|_| "Invalid status code")?;
-            StatusCode::try_from(code_num)
-                .map_err(|_| format!("Unknown ICAP status code: {}", code_num))?
+            let code_num = parts[1]
+                .parse::<u16>()
+                .map_err(|_| Error::InvalidStatusCode("Invalid status code".into()))?;
+            StatusCode::try_from(code_num).map_err(|_| {
+                Error::InvalidStatusCode(format!("Unknown ICAP status code: {}", code_num))
+            })?
         }
     };
     let status_text = if parts.len() > 2 {

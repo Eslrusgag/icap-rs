@@ -434,7 +434,10 @@ async fn preview_non_ieof_requires_100_continue_before_remainder() {
     .expect("timeout waiting for 100 Continue");
 
     let code = icap_status_code(&first_resp).expect("no ICAP code in first response");
-    assert_eq!(code, 100, "server must send 100 Continue after non-ieof preview");
+    assert_eq!(
+        code, 100,
+        "server must send 100 Continue after non-ieof preview"
+    );
 
     let mut tail_wire = Vec::new();
     tail_wire.extend_from_slice(format!("{:X}\r\n", tail.len()).as_bytes());

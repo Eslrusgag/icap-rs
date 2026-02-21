@@ -302,7 +302,7 @@ impl Body<BodyRead> {
         }
 
         match self {
-            Body::Empty => Err("no body".into()),
+            Body::Empty => Err(Error::Body("no body".into())),
             Body::Full { reader } => Ok(reader.as_mut()),
             Body::Preview {
                 bytes,
@@ -557,24 +557,35 @@ impl Request<Vec<u8>> {
 pub(crate) fn parse_icap_request(data: &[u8]) -> IcapResult<Request<Vec<u8>>> {
     trace!("parse_icap_request: len={}", data.len());
 
-    let hdr_end = find_double_crlf(data).ok_or("ICAP request headers not complete")?;
+    let hdr_end =
+        find_double_crlf(data).ok_or_else(|| Error::parse("ICAP request headers not complete"))?;
     let head = &data[..hdr_end];
     let head_str = std::str::from_utf8(head)?;
 
     let mut lines = head_str.split("\r\n");
-    let request_line = lines.next().ok_or("Empty request")?;
+    let request_line = lines.next().ok_or_else(|| Error::parse("Empty request"))?;
     let mut parts = request_line.split_whitespace();
 
-    let method_str = parts.next().ok_or("Invalid request line")?;
+    let method_str = parts
+        .next()
+        .ok_or_else(|| Error::parse("Invalid request line"))?;
     let method = match method_str.trim().to_ascii_uppercase().as_str() {
         "REQMOD" => Method::ReqMod,
         "RESPMOD" => Method::RespMod,
         "OPTIONS" => Method::Options,
-        other => return Err(format!("Unknown ICAP method: {other}").into()),
+        other => {
+            return Err(Error::InvalidMethod(format!(
+                "Unknown ICAP method: {other}"
+            )));
+        }
     };
 
-    let icap_uri = parts.next().ok_or("Invalid request line")?;
-    let version = parts.next().ok_or("Invalid request line")?;
+    let icap_uri = parts
+        .next()
+        .ok_or_else(|| Error::parse("Invalid request line"))?;
+    let version = parts
+        .next()
+        .ok_or_else(|| Error::parse("Invalid request line"))?;
 
     if !version.eq_ignore_ascii_case(ICAP_VERSION) {
         return Err(Error::InvalidVersion(version.to_string()));
@@ -620,7 +631,7 @@ pub(crate) fn parse_icap_request(data: &[u8]) -> IcapResult<Request<Vec<u8>>> {
 
     let enc = match icap_headers.get("Encapsulated") {
         Some(v) => {
-            let raw = v.to_str().map_err(|e| Error::Header(e.to_string()))?;
+            let raw = v.to_str()?;
             crate::parser::icap::parse_encapsulated_value(raw)?
         }
         None => crate::parser::icap::Encapsulated::default(),
@@ -691,7 +702,9 @@ pub(crate) fn parse_icap_request(data: &[u8]) -> IcapResult<Request<Vec<u8>>> {
             let body_slice = slice_encapsulated(enc_area, boff, bend)?;
 
             if boff < hdr_off {
-                return Err("Encapsulated offsets invalid (body before headers)".into());
+                return Err(Error::Header(
+                    "Encapsulated offsets invalid (body before headers)".into(),
+                ));
             }
 
             body_slice.to_vec()
@@ -712,7 +725,7 @@ pub(crate) fn parse_icap_request(data: &[u8]) -> IcapResult<Request<Vec<u8>>> {
             {
                 let headers_mut = builder
                     .headers_mut()
-                    .ok_or("response builder: headers_mut is None")?;
+                    .ok_or_else(|| Error::unexpected("response builder: headers_mut is None"))?;
                 headers_mut.extend(http_headers);
             }
 
@@ -738,7 +751,7 @@ pub(crate) fn parse_icap_request(data: &[u8]) -> IcapResult<Request<Vec<u8>>> {
             {
                 let headers_mut = builder
                     .headers_mut()
-                    .ok_or("request builder: headers_mut is None")?;
+                    .ok_or_else(|| Error::unexpected("request builder: headers_mut is None"))?;
                 headers_mut.extend(http_headers);
             }
 
@@ -793,14 +806,18 @@ fn next_offset_after(enc: &crate::parser::icap::Encapsulated, start: usize) -> O
 
 fn slice_encapsulated(enc_area: &[u8], start: usize, end: Option<usize>) -> IcapResult<&[u8]> {
     if start > enc_area.len() {
-        return Err("Encapsulated offset out of bounds".into());
+        return Err(Error::Header("Encapsulated offset out of bounds".into()));
     }
     let end = end.unwrap_or(enc_area.len());
     if end > enc_area.len() {
-        return Err("Encapsulated end offset out of bounds".into());
+        return Err(Error::Header(
+            "Encapsulated end offset out of bounds".into(),
+        ));
     }
     if end < start {
-        return Err("Encapsulated offsets invalid (end < start)".into());
+        return Err(Error::Header(
+            "Encapsulated offsets invalid (end < start)".into(),
+        ));
     }
     Ok(&enc_area[start..end])
 }

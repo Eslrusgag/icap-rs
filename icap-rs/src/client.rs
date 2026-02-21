@@ -200,7 +200,9 @@ impl ClientBuilder {
             //#[cfg(all(not(feature = "tls-rustls"), not(feature = "tls-openssl")))]
             #[cfg(not(feature = "tls-rustls"))]
             {
-                return Err("`icaps://` requested but crate built without TLS features".into());
+                return Err(Error::Service(
+                    "`icaps://` requested but crate built without TLS features".into(),
+                ));
             }
         }
         Ok(self)
@@ -888,7 +890,9 @@ async fn read_until_len<S: AsyncRead + AsyncWrite + Unpin>(
     while buf.len() < need {
         let n = AsyncReadExt::read(stream, &mut tmp).await?;
         if n == 0 {
-            return Err("Unexpected EOF while reading response body".into());
+            return Err(Error::Body(
+                "Unexpected EOF while reading response body".into(),
+            ));
         }
         buf.extend_from_slice(&tmp[..n]);
     }
@@ -902,10 +906,11 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let Some(h_end) = find_double_crlf(buf) else {
-        return Err("Corrupted ICAP headers".into());
+        return Err(Error::parse("Corrupted ICAP headers"));
     };
 
-    let hdr_text = std::str::from_utf8(&buf[..h_end]).map_err(|_| "Invalid headers utf8")?;
+    let hdr_text = std::str::from_utf8(&buf[..h_end])
+        .map_err(|_| Error::http_parse("Invalid headers utf8"))?;
     let enc = parse_encapsulated_header(hdr_text)?;
 
     let has_enc_body = enc.req_body.is_some() || enc.res_body.is_some() || enc.opt_body.is_some();
@@ -929,8 +934,8 @@ where
         let end = read_chunked_to_end(stream, buf, enc_abs).await?;
         if end > enc_abs {
             let mut chunked_slice = &buf[enc_abs..end];
-            let decoded =
-                dechunk_icap_entity(&mut chunked_slice).map_err(|e| format!("dechunk ICAP entity: {e}"))?;
+            let decoded = dechunk_icap_entity(&mut chunked_slice)
+                .map_err(|e| format!("dechunk ICAP entity: {e}"))?;
             buf.splice(enc_abs..end, decoded);
         }
     }
@@ -948,7 +953,7 @@ where
     W: AsyncWrite + Unpin,
 {
     let Some(h_end) = find_double_crlf(buf) else {
-        return Err("Corrupted ICAP headers".into());
+        return Err(Error::parse("Corrupted ICAP headers"));
     };
 
     read_icap_body_if_any(stream, buf).await?;
@@ -968,10 +973,7 @@ fn dechunk_icap_entity(data: &mut &[u8]) -> Result<Vec<u8>, String> {
         let (size_line, rest) = d.split_at(crlf_pos);
         d = &rest[2..];
 
-        let size_hex = size_line
-            .split(|&b| b == b';')
-            .next()
-            .unwrap_or(size_line);
+        let size_hex = size_line.split(|&b| b == b';').next().unwrap_or(size_line);
         let size_str = std::str::from_utf8(size_hex).map_err(|_| "chunk size not utf8")?;
         let size = usize::from_str_radix(size_str.trim(), 16).map_err(|_| "chunk size not hex")?;
 
@@ -1004,20 +1006,24 @@ fn parse_authority_with_scheme(uri: &str) -> IcapResult<(String, u16, bool)> {
     } else if let Some(r) = s.strip_prefix("icap://") {
         (false, r)
     } else {
-        return Err("URI must start with icap:// or icaps://".into());
+        return Err(Error::InvalidUri(
+            "URI must start with icap:// or icaps://".into(),
+        ));
     };
 
     let authority = rest.split('/').next().unwrap_or(rest);
     let (host, port) = if let Some(i) = authority.rfind(':') {
         let h = &authority[..i];
-        let p: u16 = authority[i + 1..].parse().map_err(|_| "Invalid port")?;
+        let p: u16 = authority[i + 1..]
+            .parse()
+            .map_err(|_| Error::InvalidUri("Invalid port".into()))?;
         (h.to_string(), p)
     } else {
         (authority.to_string(), if tls { 11344 } else { 1344 })
     };
 
     if host.is_empty() {
-        return Err("Empty host in authority".into());
+        return Err(Error::InvalidUri("Empty host in authority".into()));
     }
     Ok((host, port, tls))
 }
@@ -1293,7 +1299,7 @@ where
         }
 
         if hdr_end.is_some() {
-            let c = code.ok_or("missing/bad status code")?;
+            let c = code.ok_or_else(|| Error::parse("missing/bad status code"))?;
             return Ok((c, buf));
         }
 

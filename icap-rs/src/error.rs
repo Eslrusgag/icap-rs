@@ -2,13 +2,18 @@
 //!
 //! This module defines:
 //! - [`enum@Error`]: the main error type for ICAP operations.
-//! - [`IcapResult<T>`]: a convenient alias for `Result<T, IcapError>`.
+//! - [`IcapResult<T>`]: a convenient alias for `Result<T, Error>`.
 //! - [`ToIcapResult`]: a helper trait for converting generic `Result` into `IcapResult`.
 //!
 //! It covers network errors, parsing/serialization, configuration issues, and unexpected failures.
 use http::header::{InvalidHeaderName, InvalidHeaderValue};
+use http::method::InvalidMethod;
+use http::status::InvalidStatusCode;
+use http::uri::{InvalidUri, InvalidUriParts};
+use http::{Error as HttpError, header::ToStrError};
 use std::error::Error as StdError;
 use std::str::Utf8Error;
+use std::string::FromUtf8Error;
 use std::time::Duration;
 use thiserror::Error;
 
@@ -138,6 +143,11 @@ impl Error {
     pub fn unknown(message: impl Into<String>) -> Self {
         Self::Unexpected(message.into())
     }
+
+    /// Create an unexpected/unclassified error.
+    pub fn unexpected(message: impl Into<String>) -> Self {
+        Self::Unexpected(message.into())
+    }
 }
 
 impl From<String> for Error {
@@ -176,6 +186,11 @@ impl From<Utf8Error> for Error {
         Error::HttpParse(e.to_string())
     }
 }
+impl From<FromUtf8Error> for Error {
+    fn from(e: FromUtf8Error) -> Self {
+        Error::HttpParse(e.to_string())
+    }
+}
 impl From<InvalidHeaderName> for Error {
     fn from(e: InvalidHeaderName) -> Self {
         Error::Header(e.to_string())
@@ -184,5 +199,35 @@ impl From<InvalidHeaderName> for Error {
 impl From<InvalidHeaderValue> for Error {
     fn from(e: InvalidHeaderValue) -> Self {
         Error::Header(e.to_string())
+    }
+}
+impl From<ToStrError> for Error {
+    fn from(e: ToStrError) -> Self {
+        Error::Header(e.to_string())
+    }
+}
+impl From<InvalidUri> for Error {
+    fn from(e: InvalidUri) -> Self {
+        Error::InvalidUri(e.to_string())
+    }
+}
+impl From<InvalidUriParts> for Error {
+    fn from(e: InvalidUriParts) -> Self {
+        Error::InvalidUri(e.to_string())
+    }
+}
+impl From<InvalidMethod> for Error {
+    fn from(e: InvalidMethod) -> Self {
+        Error::InvalidMethod(e.to_string())
+    }
+}
+impl From<InvalidStatusCode> for Error {
+    fn from(e: InvalidStatusCode) -> Self {
+        Error::InvalidStatusCode(e.to_string())
+    }
+}
+impl From<HttpError> for Error {
+    fn from(e: HttpError) -> Self {
+        Error::Unexpected(e.to_string())
     }
 }

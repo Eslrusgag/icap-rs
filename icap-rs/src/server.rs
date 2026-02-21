@@ -345,8 +345,7 @@ impl Server {
                 buf.extend_from_slice(&tmp[..n]);
             };
 
-            let hdr_text =
-                std::str::from_utf8(&buf[..h_end])
+            let hdr_text = std::str::from_utf8(&buf[..h_end])
                 .map_err(|_| "Invalid ICAP headers utf8")?
                 .to_string();
             let enc = crate::parser::parse_encapsulated_header(&hdr_text)?;
@@ -368,8 +367,9 @@ impl Server {
                         read_chunked_until_zero(&mut socket, &mut buf, body_abs).await?;
 
                     let mut preview_slice = &buf[body_abs..preview_end];
-                    let (mut decoded, _ieof_seen) = dechunk_icap_entity_with_ieof(&mut preview_slice)
-                        .map_err(|e| format!("dechunk ICAP preview entity: {e}"))?;
+                    let (mut decoded, _ieof_seen) =
+                        dechunk_icap_entity_with_ieof(&mut preview_slice)
+                            .map_err(|e| format!("dechunk ICAP preview entity: {e}"))?;
 
                     if !preview_ieof {
                         socket.write_all(b"ICAP/1.0 100 Continue\r\n\r\n").await?;
@@ -683,10 +683,7 @@ fn parse_one_chunk_meta(
 
     let has_ieof = ext_part
         .and_then(|b| std::str::from_utf8(b).ok())
-        .map(|s| {
-            s.split(';')
-                .any(|t| t.trim().eq_ignore_ascii_case("ieof"))
-        })
+        .map(|s| s.split(';').any(|t| t.trim().eq_ignore_ascii_case("ieof")))
         .unwrap_or(false);
 
     if size == 0 {
@@ -728,10 +725,7 @@ fn dechunk_icap_entity_with_ieof(data: &mut &[u8]) -> Result<(Vec<u8>, bool), St
 
         let has_ieof = ext_part
             .and_then(|b| std::str::from_utf8(b).ok())
-            .map(|s| {
-                s.split(';')
-                    .any(|t| t.trim().eq_ignore_ascii_case("ieof"))
-            })
+            .map(|s| s.split(';').any(|t| t.trim().eq_ignore_ascii_case("ieof")))
             .unwrap_or(false);
 
         if size == 0 {
