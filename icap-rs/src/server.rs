@@ -302,7 +302,6 @@ impl Server {
     ///
     /// Reads one full ICAP message (headers + chunked body if any), parses and dispatches it,
     /// writes the response, then repeats until the peer closes the connection.
-    /// Handle a single client connection (persistent / keep-alive).
     async fn handle_connection<S>(
         mut socket: S,
         routes: Arc<HashMap<String, RouteEntry>>,
@@ -909,25 +908,7 @@ impl ServerBuilder {
 }
 
 #[cfg(feature = "tls-rustls")]
-fn install_rustls_provider_once() {
-    use std::sync::Once;
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| {
-        #[cfg(feature = "tls-rustls")]
-        {
-            rustls::crypto::ring::default_provider()
-                .install_default()
-                .expect("install ring crypto provider");
-        }
-    });
-}
-
-#[cfg(feature = "tls-rustls")]
 fn load_rustls_acceptor(tls: &TlsParams) -> Result<TlsAcceptor, String> {
-    // Ensure a crypto provider is installed
-    #[cfg(feature = "tls-rustls")]
-    install_rustls_provider_once();
-
     use std::io::BufReader;
 
     // Certificates

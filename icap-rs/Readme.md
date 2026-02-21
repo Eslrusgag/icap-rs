@@ -27,8 +27,7 @@ A Rust implementation of the **ICAP** protocol ([RFC 3507]) providing a client A
 - Chunked uploads, streaming large bodies after `100 Continue`.
 - Streaming response body directly into an `AsyncWrite` sink (`...into_writer`) to avoid buffering.
 - Keep-Alive: reuse a single idle connection.
-- **ICAPS (TLS)** with `rustls` (ring) — see
-- **GitHub / crates.io**: [docs/tls.md](docs/tls.md)
+- **ICAPS (TLS)** with `rustls` — see [docs/tls.md](docs/tls.md)
 
 ---
 

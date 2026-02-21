@@ -11,8 +11,7 @@ default = []
 
 # Top-level flag to compile TLS support using Rustls.
 # Pulls in tokio-rustls for async I/O, rustls core, system trust store loading,
-# and PEM parsing for custom roots. You must also choose exactly ONE crypto
-# provider below: `tls-rustls-ring` OR `tls-rustls-aws-lc`.
+# and PEM parsing for custom roots.
 tls-rustls = [
     "dep:tokio-rustls",
     "dep:rustls",
@@ -50,7 +49,7 @@ rustls-pemfile = { version = "2", optional = true }
 
 [dev-dependencies]
 rstest = "0.26.1"
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8.2", features = ["html_reports"] }
 
 
 [[example]]

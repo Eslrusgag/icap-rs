@@ -69,15 +69,15 @@ enum TlsBackendCli {
     styles=cli_styles(),
 )]
 struct Args {
-    /// Full ICAP URI like icap://host[:port]/service or icaps://host[:port]/service
+    /// Full ICAP URI, e.g. `icap://host[:port]/service` or `icaps://host[:port]/service`.
     #[arg(short = 'u', long, default_value = "icap://127.0.0.1:1344/")]
     uri: String,
 
-    /// Sends this file to the ICAP server (defaults to RESPMOD like c-icap-client)
+    /// Send this file to the ICAP server (defaults to RESPMOD like c-icap-client).
     #[arg(short = 'f', long)]
     filename: Option<String>,
 
-    /// Save ICAP response body to file (default: stdout)
+    /// Save ICAP response body to a file (default: stdout).
     #[arg(short = 'o', long)]
     output: Option<String>,
 
@@ -85,83 +85,83 @@ struct Args {
     #[arg(short, long)]
     timeout: Option<u64>,
 
-    /// ICAP method: OPTIONS|REQMOD|RESPMOD
+    /// ICAP method: `OPTIONS|REQMOD|RESPMOD`.
     #[arg(short, long)]
     method: Option<String>,
 
-    /// Send REQMOD with the given request URL (origin-form or absolute URI)
+    /// Send REQMOD with the given request URL (origin-form or absolute URI).
     #[arg(long = "req")]
     req_url: Option<String>,
 
-    /// Send RESPMOD with the given request URL (for tracing)
+    /// Send RESPMOD with the given request URL (for tracing).
     #[arg(long = "resp")]
     resp_url: Option<String>,
 
-    /// Debug level to stdout
+    /// Debug level to stdout.
     #[arg(short = 'd', long)]
     debug_level: Option<u8>,
 
-    /// No-op compatibility flag (kept for parity with c-icap-client)
+    /// No-op compatibility flag (kept for parity with c-icap-client).
     #[arg(long, action = clap::ArgAction::SetTrue)]
     noreshdr: bool,
 
-    /// Force c-icap semantics: Preview: 0 (no ieof).
+    /// Force c-icap semantics: `Preview: 0` (without `ieof`).
     #[arg(long, action = clap::ArgAction::SetTrue)]
     nopreview: bool,
 
-    /// Do not allow 204 outside preview
+    /// Do not advertise `Allow: 204` outside preview flow.
     #[arg(long, action = clap::ArgAction::SetTrue)]
     no204: bool,
 
-    /// Advertise/accept 206
+    /// Advertise/accept `Allow: 206`.
     #[arg(long = "206", action = clap::ArgAction::SetTrue)]
     allow_206: bool,
 
-    /// Extra ICAP headers (repeatable): -x "Header: Value"
+    /// Extra ICAP headers (repeatable): `-x "Header: Value"`.
     #[arg(short = 'x', long)]
     xheader: Vec<String>,
 
-    /// Extra HTTP request headers (repeatable): --hx "Header: Value"
+    /// Extra HTTP request headers (repeatable): `--hx "Header: Value"`.
     #[arg(long = "hx")]
     hx_header: Vec<String>,
 
-    /// Extra HTTP response headers (repeatable): --rhx "Header: Value"
+    /// Extra HTTP response headers (repeatable): `--rhx "Header: Value"`.
     #[arg(long = "rhx")]
     rhx_header: Vec<String>,
 
-    /// Select TLS backend (only effective for icaps://)
+    /// Select TLS backend (effective only for `icaps://`).
     #[arg(long = "tls-backend", value_enum)]
     tls_backend: Option<TlsBackendCli>,
 
-    /// Disable certificate verification
+    /// Compatibility flag. With rustls 0.23 this is ignored.
     #[arg(long, action = clap::ArgAction::SetTrue)]
     insecure: bool,
 
-    /// Use extra CA bundle (PEM) for TLS (rustls only)
+    /// Use extra CA bundle (PEM) for TLS (rustls only).
     #[arg(long = "tls-ca", value_name = "PEM_FILE")]
     tls_ca: Option<String>,
 
-    /// Override SNI hostname (used with TLS)
+    /// Override SNI hostname (used with TLS; ignored for `icap://`).
     #[arg(long = "sni", value_name = "HOSTNAME")]
     sni: Option<String>,
 
-    /// Force Preview: N explicitly (advanced). If not set, negotiated via OPTIONS.
+    /// Force `Preview: N` explicitly (advanced). If not set, negotiated via OPTIONS.
     #[arg(short = 'w', long)]
     preview_size: Option<usize>,
 
-    /// Fast 204: with preview-size 0 send ieof immediately
+    /// Fast 204: with preview-size `0`, send `ieof` immediately.
     #[arg(long, action = clap::ArgAction::SetTrue)]
     ieof: bool,
 
-    /// Stream body from file (do not buffer in memory)
+    /// Stream body from file (do not buffer in memory).
     #[arg(long, action = clap::ArgAction::SetTrue)]
     stream_io: bool,
 
-    /// Print ICAP response headers (c-icap-client style)
+    /// Print ICAP response headers (c-icap-client style).
     #[arg(short = 'v', long, action = clap::ArgAction::SetTrue)]
     verbose: bool,
 
-    /// Print the generated ICAP request
+    /// Print the generated ICAP request.
     #[arg(short, long, action = clap::ArgAction::SetTrue)]
     print_request: bool,
 }
@@ -258,7 +258,11 @@ async fn main() -> IcapResult<()> {
     }
 
     if let Some(sni) = &args.sni {
-        builder = builder.sni_hostname(sni);
+        if is_tls_uri {
+            builder = builder.sni_hostname(sni);
+        } else {
+            eprintln!("Note: --sni is ignored for icap:// (TLS is off).");
+        }
     }
 
     #[cfg(feature = "tls-rustls")]
@@ -279,12 +283,14 @@ async fn main() -> IcapResult<()> {
     }
 
     if args.insecure {
-        builder = builder.danger_disable_cert_verify(true);
-        // We only warn for rustls builds; OpenSSL mention removed.
-        #[cfg(feature = "tls-rustls")]
-        eprintln!(
-            "Warning: rustls 0.23 does not provide a public no-verify API; --insecure may be ignored."
-        );
+        if is_tls_uri {
+            #[cfg(feature = "tls-rustls")]
+            eprintln!(
+                "Warning: --insecure is ignored with rustls 0.23 (public no-verify API is unavailable)."
+            );
+        } else {
+            eprintln!("Note: --insecure is ignored for icap:// (TLS is off).");
+        }
     }
 
     let client = builder
@@ -407,7 +413,9 @@ async fn main() -> IcapResult<()> {
                 }
             }
 
-            let http_req = httpb.body(body_vec).expect("failed to build HTTP request");
+            let http_req = httpb
+                .body(body_vec)
+                .map_err(|e| format!("failed to build HTTP request: {e}"))?;
             icap_req = icap_req.with_http_request(http_req);
         } else {
             // Build embedded HTTP response (HTTP/1.0 by default, like c-icap-client)
@@ -443,7 +451,9 @@ async fn main() -> IcapResult<()> {
             }
 
             let body_vec = file_bytes.clone().unwrap_or_default();
-            let http_resp = httpb.body(body_vec).expect("failed to build HTTP response");
+            let http_resp = httpb
+                .body(body_vec)
+                .map_err(|e| format!("failed to build HTTP response: {e}"))?;
             icap_req = icap_req.with_http_response(http_resp);
         }
 
@@ -649,9 +659,10 @@ async fn send_with_preview(
 ) -> IcapResult<IcapResponse> {
     if cli_nopreview || negotiated_or_forced_preview == Some(0) {
         icap_req = icap_req.preview(0);
-        return client
-            .send_streaming(&icap_req, file_path_opt.expect("file path required"))
-            .await;
+        if let Some(file_path) = file_path_opt {
+            return client.send_streaming(&icap_req, file_path).await;
+        }
+        return client.send(&icap_req).await;
     }
 
     if let Some(n) = negotiated_or_forced_preview

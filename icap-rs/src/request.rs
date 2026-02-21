@@ -49,8 +49,8 @@ use std::future::Future;
 use std::str::FromStr;
 use tracing::trace;
 
-use std::io::Write as _;
 use std::io::Read as _;
+use std::io::Write as _;
 use std::pin::Pin;
 use tokio::io::AsyncRead;
 
@@ -266,7 +266,6 @@ impl Body<BodyRead> {
     /// send `ICAP/1.0 100 Continue` **exactly once**, then convert the body into
     /// `Full { reader }` where `reader` yields `preview-bytes` followed by the
     /// remainder stream.
-    /// Ensure a full stream is available (SAFE version, no `unsafe`).
     pub async fn ensure_full(&mut self) -> IcapResult<&mut (dyn AsyncRead + Unpin + Send)> {
         struct Concat<A, B>(Option<A>, B);
 
@@ -767,7 +766,9 @@ fn next_offset_after(enc: &crate::parser::icap::Encapsulated, start: usize) -> O
     let mut min: Option<usize> = None;
 
     let mut consider = |v: Option<usize>| {
-        if let Some(o) = v && o > start {
+        if let Some(o) = v
+            && o > start
+        {
             min = Some(match min {
                 Some(m) => m.min(o),
                 None => o,
@@ -1225,5 +1226,4 @@ mod rfc_tests {
         let err = parse_icap_request(&raw).unwrap_err();
         assert!(err.to_string().contains("not complete"), "err: {err}");
     }
-
 }

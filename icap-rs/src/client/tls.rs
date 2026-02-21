@@ -30,6 +30,7 @@ pub enum TlsBackend {
 #[async_trait]
 pub trait TlsConnector: Send + Sync + std::fmt::Debug {
     /// Establish a (possibly TLS-wrapped) connection on top of the given TCP stream.
+    ///
     /// `server_name` is used for SNI and certificate verification.
     async fn connect(&self, tcp: TcpStream, server_name: &str) -> IcapResult<Conn>;
 }

@@ -9,7 +9,7 @@ use std::fmt::Write;
 
 /// Find end of ICAP header block (position after CRLFCRLF).
 #[inline]
-pub (crate) fn find_double_crlf(buf: &[u8]) -> Option<usize> {
+pub(crate) fn find_double_crlf(buf: &[u8]) -> Option<usize> {
     memchr::memmem::find(buf, b"\r\n\r\n").map(|i| i + 4)
 }
 

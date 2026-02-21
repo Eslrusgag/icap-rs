@@ -1,6 +1,6 @@
 # TLS (ICAPS)
 
-`icap-rs` supports **ICAPS (ICAP over TLS)** via **rustls** (ring) behind a cargo feature.
+`icap-rs` supports **ICAPS (ICAP over TLS)** via **rustls** behind a cargo feature.
 
 > If you use icaps://… URI but build without tls-rustls feature, the client will throw an error.
 

@@ -26,16 +26,12 @@ This binary lives in the `examples` (or a sub-crate) of the repository and uses 
 # Plain (no TLS):
 cargo build --release
 
-# With TLS (rustls + ring provider):
-cargo build --release --features "tls-rustls tls-rustls-ring"
-
-# Or: rustls with aws-lc provider
-cargo build --release --features "tls-rustls tls-rustls-aws-lc"
+# With TLS (rustls):
+cargo build --release --features "tls-rustls"
 ```
 
 > **Note on TLS**  
-> `icaps://` requires building with `tls-rustls` (pick exactly one provider: `tls-rustls-ring` **or**
-`tls-rustls-aws-lc`).  
+> `icaps://` requires building with `tls-rustls`.  
 > If you run the tool against an `icaps://…` URI without these features, the program will refuse to run.
 
 ---
@@ -79,8 +75,7 @@ These are effective only when URI starts with `icaps://` **and** the binary is b
 - `--tls-backend rustls` — Select rustls (only valid choice for this build)
 - `--tls-ca <PEM_FILE>` — Add a local CA bundle (PEM) to rustls trust store (for self‑signed/testing)
 - `--sni <HOSTNAME>` — Override SNI used during TLS handshake
-- `--insecure` — Attempt to disable certificate verification  
-  *Note:* rustls **0.23** doesn’t expose a public “no-verify” API; this flag may be ignored when using rustls.
+- `--insecure` — Compatibility flag. With rustls **0.23** it is ignored.
 
 ### Output & debug
 
@@ -142,8 +137,7 @@ rs-icap-client -u icap://127.0.0.1:1344/scan \
 First, build with rustls:
 
 ```bash
-cargo build --release --features "tls-rustls tls-rustls-ring"
-# or: --features "tls-rustls tls-rustls-aws-lc"
+cargo build --release --features "tls-rustls"
 ```
 
 Then run:
@@ -157,7 +151,7 @@ rs-icap-client -u icaps://localhost:2346/test \
 ```
 
 > If your server uses a self‑signed certificate, add its **CA** via `--tls-ca`.  
-> `--insecure` may be ignored with rustls 0.23 and is not recommended for production.
+> `--insecure` is ignored with rustls 0.23 and is not recommended for production.
 
 ---
 

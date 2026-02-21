@@ -76,7 +76,8 @@ async fn start_server(port: u16) {
 }
 
 #[tokio::test]
-async fn streaming_response_is_forwarded_to_writer_and_not_buffered_in_response() -> IcapResult<()> {
+async fn streaming_response_is_forwarded_to_writer_and_not_buffered_in_response() -> IcapResult<()>
+{
     let port = 13531;
     start_server(port).await;
 
@@ -107,8 +108,14 @@ async fn streaming_response_is_forwarded_to_writer_and_not_buffered_in_response(
     let payload = writer.into_inner();
     let s = String::from_utf8(payload).expect("utf8 payload");
     let s_lc = s.to_ascii_lowercase();
-    assert!(s.starts_with("HTTP/1.1 200 OK\r\n"), "unexpected payload: {s}");
-    assert!(s_lc.contains("content-length: 13\r\n"), "missing content-length in payload: {s}");
+    assert!(
+        s.starts_with("HTTP/1.1 200 OK\r\n"),
+        "unexpected payload: {s}"
+    );
+    assert!(
+        s_lc.contains("content-length: 13\r\n"),
+        "missing content-length in payload: {s}"
+    );
     assert!(s.ends_with(ECHO_BODY), "payload tail mismatch: {s}");
 
     Ok(())

@@ -54,4 +54,3 @@ pub fn serialize_http_response(resp: &HttpResponse<Vec<u8>>) -> Vec<u8> {
     bytes.extend_from_slice(resp.body());
     bytes
 }
-

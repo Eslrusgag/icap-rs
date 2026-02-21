@@ -78,7 +78,10 @@ pub struct Response {
 }
 
 #[inline]
-fn ensure_owned_response<'a>(owned: &'a mut Option<Response>, original: &Response) -> &'a mut Response {
+fn ensure_owned_response<'a>(
+    owned: &'a mut Option<Response>,
+    original: &Response,
+) -> &'a mut Response {
     if owned.is_none() {
         *owned = Some(original.clone());
     }
@@ -281,12 +284,12 @@ impl Response {
         self.status_code.is_success()
     }
 
-    /// Whether the response indicates an client error (4xx).
+    /// Whether the response indicates a client error (4xx).
     pub fn is_client_error(&self) -> bool {
         self.status_code.is_client_error()
     }
 
-    /// Whether the response indicates an server error (5xx).
+    /// Whether the response indicates a server error (5xx).
     pub fn is_server_error(&self) -> bool {
         self.status_code.is_server_error()
     }

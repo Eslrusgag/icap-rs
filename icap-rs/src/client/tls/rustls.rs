@@ -3,10 +3,10 @@
 //! - Loads platform root CAs via `rustls-native-certs` and optionally
 //!   appends user-provided extra roots.
 //! - SNI is required (`server_name` must be a valid DNS name).
-//! - Exactly one crypto provider feature must be enabled:
-//!   `tls-rustls-ring` **or** `tls-rustls-aws-lc`.
+//! - Uses rustls default crypto provider selected by crate features.
 
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 use async_trait::async_trait;
 use tokio::net::TcpStream;
@@ -22,7 +22,7 @@ use crate::net::Conn;
 /// Configuration for the rustls-based TLS connector.
 #[derive(Debug, Clone)]
 pub struct RustlsConfig {
-    /// Kept for compatibility; rustls 0.23 has no public "disable verify" switch.
+    /// Compatibility field; rustls 0.23 has no public "disable verify" switch.
     #[allow(dead_code)]
     pub danger_disable_verify: bool,
     /// Extra root certificates in **DER** form to be appended to the platform store.
@@ -33,12 +33,16 @@ pub struct RustlsConfig {
 #[derive(Debug, Clone)]
 pub struct RustlsConnector {
     cfg: RustlsConfig,
+    cached_client_cfg: Arc<OnceLock<Result<Arc<ClientConfig>, String>>>,
 }
 
 impl RustlsConnector {
     /// Create a new rustls connector with the given configuration.
     pub fn new(cfg: RustlsConfig) -> Self {
-        Self { cfg }
+        Self {
+            cfg,
+            cached_client_cfg: Arc::new(OnceLock::new()),
+        }
     }
 }
 
@@ -49,29 +53,41 @@ impl crate::client::tls::TlsConnector for RustlsConnector {
         let server_name =
             ServerName::try_from(server_name.to_string()).map_err(|_| "invalid SNI server name")?;
 
-        // Build root store: platform roots + user-supplied extra roots.
-        let mut roots = RootCertStore::empty();
-        for cert in rustls_native_certs::load_native_certs().expect("failed to load platform certs")
-        {
-            let _ = roots.add(cert);
-        }
-        for cert in &self.cfg.extra_roots {
-            let _ = roots.add(cert.clone());
-        }
-
-        let provider: Arc<rustls::crypto::CryptoProvider> =
-            rustls::crypto::ring::default_provider().into();
-
-        // Build client config with safe defaults and our root store.
-        let cfg: ClientConfig = ClientConfig::builder_with_provider(provider)
-            .with_safe_default_protocol_versions()
-            .map_err(|e| format!("protocol versions: {e}"))?
-            .with_root_certificates(roots)
-            .with_no_client_auth();
+        let cfg = self
+            .cached_client_cfg
+            .get_or_init(|| build_client_config(&self.cfg).map(Arc::new))
+            .as_ref()
+            .map_err(|e| e.clone())?;
 
         // Drive the handshake using tokio-rustls.
-        let connector = TokioTlsConnector::from(Arc::new(cfg));
+        let connector = TokioTlsConnector::from(Arc::clone(cfg));
         let tls: TlsStream<TcpStream> = connector.connect(server_name, tcp).await?;
         Ok(Conn::Rustls { inner: tls })
     }
+}
+
+fn build_client_config(cfg: &RustlsConfig) -> Result<ClientConfig, String> {
+    // Build root store: platform roots + user-supplied extra roots.
+    let mut roots = RootCertStore::empty();
+    let native = rustls_native_certs::load_native_certs();
+    if !native.errors.is_empty() {
+        return Err(format!(
+            "failed to load platform certs: {} error(s)",
+            native.errors.len()
+        ));
+    }
+    for cert in native.certs {
+        roots
+            .add(cert)
+            .map_err(|e| format!("failed to add platform cert: {e}"))?;
+    }
+    for cert in &cfg.extra_roots {
+        roots
+            .add(cert.clone())
+            .map_err(|e| format!("failed to add extra root cert: {e}"))?;
+    }
+
+    Ok(ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth())
 }

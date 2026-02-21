@@ -177,8 +177,12 @@ impl From<Utf8Error> for Error {
     }
 }
 impl From<InvalidHeaderName> for Error {
-    fn from(e: InvalidHeaderName) -> Self { Error::Header(e.to_string()) }
+    fn from(e: InvalidHeaderName) -> Self {
+        Error::Header(e.to_string())
+    }
 }
 impl From<InvalidHeaderValue> for Error {
-    fn from(e: InvalidHeaderValue) -> Self { Error::Header(e.to_string()) }
+    fn from(e: InvalidHeaderValue) -> Self {
+        Error::Header(e.to_string())
+    }
 }

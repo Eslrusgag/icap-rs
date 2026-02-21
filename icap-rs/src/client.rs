@@ -179,11 +179,11 @@ impl ClientBuilder {
         self
     }
 
-    /// Configure the builder from an ICAP authority URI (`icap://host[:port]`).
+    /// Configure the builder from an ICAP URI (`icap://...` or `icaps://...`).
     ///
     /// This extracts `host` and `port` for use in the TCP connection. The service path,
     /// if present in the URI, is ignored here and should be set on the request itself.
-    /// Configure from `icap://` or `icaps://` (`icaps` enables TLS).
+    /// `icaps://` enables TLS automatically.
     pub fn with_uri(mut self, uri: &str) -> IcapResult<Self> {
         let (host, port, tls) = parse_authority_with_scheme(uri)?;
         self.host = Some(host);
@@ -224,7 +224,9 @@ impl ClientBuilder {
         self
     }
 
-    /// Disable certificate verification
+    /// Compatibility toggle for disabling certificate verification.
+    ///
+    /// With rustls 0.23 this is currently a no-op, kept for API compatibility.
     pub fn danger_disable_cert_verify(mut self, yes: bool) -> Self {
         self.danger_disable_verify = yes;
         self
@@ -262,18 +264,18 @@ impl ClientBuilder {
                     extra_roots: self.extra_roots,
                 })
             } // Some(TlsBackend::Openssl) => {
-              //     #[cfg(feature = "tls-openssl")]
-              //     {
-              //         use crate::client::tls::openssl::OpensslConfig;
-              //         AnyTlsConnector::openssl(OpensslConfig {
-              //             danger_disable_verify: self.danger_disable_verify,
-              //         })
-              //     }
-              //     #[cfg(not(feature = "tls-openssl"))]
-              //     {
-              //         panic!("enable `tls-openssl` feature")
-              //     }
-              // }
+            //     #[cfg(feature = "tls-openssl")]
+            //     {
+            //         use crate::client::tls::openssl::OpensslConfig;
+            //         AnyTlsConnector::openssl(OpensslConfig {
+            //             danger_disable_verify: self.danger_disable_verify,
+            //         })
+            //     }
+            //     #[cfg(not(feature = "tls-openssl"))]
+            //     {
+            //         panic!("enable `tls-openssl` feature")
+            //     }
+            // }
             #[cfg(not(feature = "tls-rustls"))]
             Some(_) => panic!("enable `tls-rustls` feature"),
         };
@@ -326,7 +328,7 @@ impl Client {
         Ok(built.bytes)
     }
 
-    /// Send an ICAP request with a embedded HTTP message.
+    /// Send an ICAP request with an embedded HTTP message.
     ///
     /// This method:
     /// - writes ICAP headers and the embedded HTTP headers/body,
@@ -414,14 +416,17 @@ impl Client {
     /// This API avoids requiring an in-memory `Vec<u8>` body in the request object.
     /// Pair it with `Request::with_http_request_head(...)` / `with_http_response_head(...)`
     /// for head-only embedded HTTP.
-    pub async fn send_streaming_reader<R>(&self, req: &Request, mut reader: R) -> IcapResult<Response>
+    pub async fn send_streaming_reader<R>(
+        &self,
+        req: &Request,
+        mut reader: R,
+    ) -> IcapResult<Response>
     where
         R: AsyncRead + Unpin + Send,
     {
         trace!(
             "client.send_streaming_reader: method={} service={}",
-            req.method,
-            req.service
+            req.method, req.service
         );
 
         let mut stream = match self.inner.connection_policy {
@@ -585,7 +590,8 @@ impl Client {
         W: AsyncWrite + Unpin + Send,
     {
         let file = TokioFile::open(file_path).await?;
-        self.send_streaming_reader_into_writer(req, file, writer).await
+        self.send_streaming_reader_into_writer(req, file, writer)
+            .await
     }
 
     /// Build the exact wire representation of a request, including preview tail when applicable.
@@ -705,7 +711,12 @@ impl Client {
                 };
                 let will_send_body = force_has_body || body_from_emb.is_some();
                 if will_send_body && !hdrs.is_empty() {
-                    (hdrs, body_from_emb, Some((hdr_key, hdr_len)), Some(body_key))
+                    (
+                        hdrs,
+                        body_from_emb,
+                        Some((hdr_key, hdr_len)),
+                        Some(body_key),
+                    )
                 } else if !hdrs.is_empty() {
                     (hdrs, None, Some((hdr_key, 0usize)), None)
                 } else {
@@ -1152,13 +1163,21 @@ fn write_icap_headers(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.trim().to_string())
     {
-        if allow_204 && !allow.split(',').any(|p| p.trim().eq_ignore_ascii_case("204")) {
+        if allow_204
+            && !allow
+                .split(',')
+                .any(|p| p.trim().eq_ignore_ascii_case("204"))
+        {
             if !allow.is_empty() {
                 allow.push_str(", ");
             }
             allow.push_str("204");
         }
-        if allow_206 && !allow.split(',').any(|p| p.trim().eq_ignore_ascii_case("206")) {
+        if allow_206
+            && !allow
+                .split(',')
+                .any(|p| p.trim().eq_ignore_ascii_case("206"))
+        {
             if !allow.is_empty() {
                 allow.push_str(", ");
             }
@@ -1204,7 +1223,6 @@ fn write_icap_headers(
 }
 
 fn response_wants_close(resp: &Response) -> bool {
-
     let Some(v) = resp.headers().get(http::header::CONNECTION) else {
         return false;
     };
@@ -1213,8 +1231,7 @@ fn response_wants_close(resp: &Response) -> bool {
         return true;
     };
 
-    s.split(',')
-        .any(|t| t.trim().eq_ignore_ascii_case("close"))
+    s.split(',').any(|t| t.trim().eq_ignore_ascii_case("close"))
 }
 
 async fn read_icap_headers<S>(stream: &mut S) -> IcapResult<(u16, Vec<u8>)>
@@ -1311,7 +1328,9 @@ where
             }
         }
 
-        if code.is_none() && let Some(end) = status_line_end {
+        if code.is_none()
+            && let Some(end) = status_line_end
+        {
             let line = &buf[..end];
             if let Some(c) = parse_status_code_from_status_line(line) {
                 code = Some(c);
@@ -1423,7 +1442,8 @@ mod tests {
         Client::builder()
             .host("icap.example")
             .port(1344)
-            .default_header("x-trace-id", "test-123").unwrap()
+            .default_header("x-trace-id", "test-123")
+            .unwrap()
             .keep_alive(true)
             .build()
     }
@@ -1688,7 +1708,7 @@ mod tests {
     }
 
     /// 4) Non-error: 200 OK + single CRLF, connection kept open.
-    /// Expectation: in strict mode for non-errors, method should NOT return     #[tokio::test]
+    /// Expectation: in strict mode for non-errors, method should not return.
     #[tokio::test]
     async fn non_error_200_single_crlf_kept_open_times_out() {
         let (mut client, server) = connect_pair().await;
