@@ -1,6 +1,7 @@
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
 use http::{Request as HttpRequest, Response as HttpResponse};
 use icap_rs::{Client, Request, Response, StatusCode};
+use std::hint::black_box;
 
 fn sample_icap_response_with_http() -> Vec<u8> {
     let body = b"hello world";

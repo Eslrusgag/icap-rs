@@ -20,16 +20,11 @@ tls-rustls = [
     "rustls/ring",
 ]
 
-# Alternative TLS backend using OpenSSL (tokio-openssl).
-# Can be enabled alongside `tls-rustls` to allow runtime selection of the TLS backend.
-#tls-openssl = ["dep:tokio-openssl", "dep:openssl"]
-
 
 [dependencies]
 tokio = { version = "1.49", features = ["full"] }
 thiserror = "2.0"
 tracing = "0.1"
-tracing-subscriber = "0.3"
 http = "1.4.0"
 smallvec = "2.0.0-alpha.12"
 memchr = "2.7.6"
@@ -43,13 +38,10 @@ rustls = { version = "0.23", default-features = false, features = ["std"], optio
 rustls-native-certs = { version = "0.8.3", optional = true }
 rustls-pemfile = { version = "2", optional = true }
 
-
-#tokio-openssl = { version = "0.6", optional = true }
-#openssl = { version = "0.10", optional = true }
-
 [dev-dependencies]
 rstest = "0.26.1"
 criterion = { version = "0.8.2", features = ["html_reports"] }
+tracing-subscriber = "0.3"
 
 
 [[example]]
@@ -63,16 +55,6 @@ path = "examples/client.rs"
 [[example]]
 name = "tls_client"
 path = "examples/tls_client.rs"
-
-
-
-#[[bench]]
-#name = "server_bench"
-#harness = false
-#
-#[[bench]]
-#name = "client_bench"
-#harness = false
 
 [[bench]]
 name = "protocol_bench"
