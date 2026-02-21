@@ -12,7 +12,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::runtime::{Builder as RtBuilder, Runtime};
 use tokio::sync::Mutex;
-use tokio::task::{JoinHandle, JoinSet};
+use tokio::task::JoinSet;
 use tokio::time::{Duration, sleep};
 
 const CONCURRENCY_LEVELS: &[usize] = &[1, 4, 16];
@@ -23,7 +23,6 @@ struct BenchEnv {
     request: Request,
     wire_request: Vec<u8>,
     addr: String,
-    _server_task: JoinHandle<()>,
 }
 
 impl BenchEnv {
@@ -37,7 +36,7 @@ impl BenchEnv {
             .build()
             .expect("build tokio runtime for bench");
 
-        let server_task = rt.block_on(async {
+        rt.block_on(async {
             let server = Server::builder()
                 .bind(&addr)
                 .route("respmod", [Method::RespMod], fast_204_handler, None)
@@ -45,11 +44,10 @@ impl BenchEnv {
                 .await
                 .expect("build benchmark server");
 
-            let handle = tokio::spawn(async move {
+            tokio::spawn(async move {
                 let _ = server.run().await;
             });
             sleep(Duration::from_millis(60)).await;
-            handle
         });
 
         let client = Client::builder()
@@ -72,7 +70,6 @@ impl BenchEnv {
             request,
             wire_request,
             addr,
-            _server_task: server_task,
         }
     }
 }
@@ -153,7 +150,8 @@ async fn run_raw_parallel_keepalive_once(
     wire: Arc<Vec<u8>>,
 ) -> IcapResult<()> {
     let mut set = JoinSet::new();
-    for socket in sockets.iter().cloned() {
+    for socket in sockets.iter() {
+        let socket = Arc::clone(socket);
         let wire = Arc::clone(&wire);
         set.spawn(async move {
             let mut socket = socket.lock().await;

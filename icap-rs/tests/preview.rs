@@ -290,7 +290,7 @@ async fn preview_non_ieof_full_body_roundtrip() {
         .expect("write preview only");
 
     let mut first_resp = Vec::new();
-    let _ = tokio::time::timeout(Duration::from_millis(700), async {
+    tokio::time::timeout(Duration::from_millis(700), async {
         let mut tmp = [0u8; 4096];
         loop {
             let n = stream.read(&mut tmp).await.expect("read 100");
@@ -417,7 +417,7 @@ async fn preview_non_ieof_requires_100_continue_before_remainder() {
         .expect("write preview only");
 
     let mut first_resp = Vec::new();
-    let _ = tokio::time::timeout(Duration::from_millis(700), async {
+    tokio::time::timeout(Duration::from_millis(700), async {
         let mut tmp = [0u8; 4096];
         loop {
             let n = stream.read(&mut tmp).await.expect("read 100");
@@ -446,7 +446,7 @@ async fn preview_non_ieof_requires_100_continue_before_remainder() {
     stream.write_all(&tail_wire).await.expect("write tail");
 
     let mut final_resp = Vec::new();
-    let _ = tokio::time::timeout(Duration::from_millis(1000), async {
+    tokio::time::timeout(Duration::from_millis(1000), async {
         let mut tmp = [0u8; 8192];
         loop {
             let n = stream.read(&mut tmp).await.expect("read final response");
