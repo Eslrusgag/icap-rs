@@ -5,6 +5,8 @@ use icap_rs::request::Request;
 use icap_rs::response::{Response, StatusCode};
 use icap_rs::server::Server;
 use icap_rs::server::options::ServiceOptions;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tokio::time::Duration;
 
 async fn always_204_handler(_req: Request) -> IcapResult<Response> {
@@ -35,6 +37,26 @@ async fn start_server_on(port: u16) {
     tokio::time::sleep(Duration::from_millis(60)).await;
 }
 
+async fn start_reqmod_server_on(port: u16) {
+    let reqmod_opts = ServiceOptions::new()
+        .with_service("Request Modifier")
+        .with_options_ttl(60)
+        .add_allow("204");
+
+    let server = Server::builder()
+        .bind(&format!("127.0.0.1:{port}"))
+        .route_reqmod("request", always_204_handler, Some(reqmod_opts))
+        .build()
+        .await
+        .expect("build reqmod server");
+
+    tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(60)).await;
+}
+
 fn make_embedded_http(body: &str) -> HttpResponse<Vec<u8>> {
     HttpResponse::builder()
         .status(HttpStatus::OK)
@@ -43,6 +65,48 @@ fn make_embedded_http(body: &str) -> HttpResponse<Vec<u8>> {
         .header("Content-Length", body.len().to_string())
         .body(body.as_bytes().to_vec())
         .unwrap()
+}
+
+#[tokio::test]
+async fn reqmod_null_body_reads_embedded_http_head() {
+    let port = 13521;
+    start_reqmod_server_on(port).await;
+
+    let embedded = b"GET http://baidu.com/ HTTP/1.1\r\n\
+User-Agent: curl/7.68.0\r\n\
+Accept: */*\r\n\
+Host: baidu.com\r\n\
+\r\n";
+    let headers = format!(
+        "REQMOD icap://127.0.0.1:{port}/request ICAP/1.0\r\n\
+Host: 127.0.0.1:{port}\r\n\
+Encapsulated: req-hdr=0, null-body={}\r\n\
+Allow: 204, trailers\r\n\
+X-Client-IP: 10.3.12.1\r\n\
+\r\n",
+        embedded.len()
+    );
+
+    let mut stream = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect");
+    stream
+        .write_all(headers.as_bytes())
+        .await
+        .expect("write icap headers");
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    stream
+        .write_all(embedded)
+        .await
+        .expect("write embedded HTTP");
+
+    let mut buf = vec![0; 1024];
+    let n = stream.read(&mut buf).await.expect("read response");
+    let response = String::from_utf8_lossy(&buf[..n]);
+    assert!(
+        response.starts_with("ICAP/1.0 204 No Content"),
+        "unexpected response: {response}"
+    );
 }
 
 #[tokio::test]

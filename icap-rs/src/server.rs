@@ -400,6 +400,16 @@ impl Server {
                         msg_end = body_abs + decoded_len;
                     }
                 }
+            } else if let Some(end_rel) = enc.null_body {
+                let end_abs = h_end + end_rel;
+                while buf.len() < end_abs {
+                    let n = socket.read(&mut tmp).await?;
+                    if n == 0 {
+                        return Err("Unexpected EOF before null-body boundary".into());
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                }
+                msg_end = end_abs;
             }
 
             // === Parse + route ===

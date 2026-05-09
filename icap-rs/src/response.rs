@@ -644,6 +644,8 @@ fn validate_istag(raw: &str) -> IcapResult<()> {
 
 #[inline]
 fn is_http_token_char(c: char) -> bool {
+    // Accept '/' and '=' for compatibility with c-icap, which can send
+    // unquoted base64-like ISTag values.
     c.is_ascii()
         && !c.is_control()
         && !matches!(
@@ -657,11 +659,9 @@ fn is_http_token_char(c: char) -> bool {
                 | ':'
                 | '\\'
                 | '"'
-                | '/'
                 | '['
                 | ']'
                 | '?'
-                | '='
                 | '{'
                 | '}'
                 | ' '
@@ -874,10 +874,11 @@ mod rfc_tests {
     #[case(format!(r#""{}""#, "A".repeat(33)), false)] // >32 chars in quotes
     #[case(r#""ABC_DEF""#.to_string(), true)] // quoted-string allows visible ASCII
     #[case(r#""QUJDREUrLw==""#.to_string(), true)] // quoted base64 (+,/)
+    #[case("QUJDREUrLw==".to_string(), true)] // c-icap base64 ISTag compatibility
     #[case("TAG 1".to_string(), false)] // space not allowed
     #[case("TAG_1".to_string(), true)] // '_' allowed in HTTP token
     #[case("TAG+1".to_string(), true)] // '+' allowed in HTTP token
-    #[case("TAG/1".to_string(), false)] // '/' requires quoted-string
+    #[case("TAG/1".to_string(), true)] // c-icap may send base64-like unquoted ISTags
     #[case("TAG#1".to_string(), true)] // '#' allowed in HTTP token
     #[case("TAG@1".to_string(), false)] // '@' not allowed
     fn istag_validate_cases(#[case] value: String, #[case] ok: bool) {
