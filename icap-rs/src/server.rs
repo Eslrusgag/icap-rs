@@ -1053,6 +1053,8 @@ impl ServerBuilder {
 
     /// Finalize the builder and create a [`Server`].
     pub async fn build(self) -> IcapResult<Server> {
+        validate_builder_config(&self.routes, &self.aliases, self.default_service.as_deref())?;
+
         let bind_addr = self
             .bind_addr
             .unwrap_or_else(|| "127.0.0.1:1344".to_string());
@@ -1083,6 +1085,49 @@ impl ServerBuilder {
             tls: tls_acceptor,
         })
     }
+}
+
+fn validate_builder_config(
+    routes: &HashMap<String, RouteEntry>,
+    aliases: &HashMap<String, String>,
+    default_service: Option<&str>,
+) -> IcapResult<()> {
+    for (service, entry) in routes {
+        if entry.handlers.is_empty() {
+            return Err(crate::error::Error::service(format!(
+                "Service '{service}' has no handlers"
+            )));
+        }
+        if let Some(options) = &entry.options
+            && let Err(err) = options.validate()
+        {
+            return Err(crate::error::Error::service(format!(
+                "Invalid options for service '{service}': {err}"
+            )));
+        }
+    }
+
+    if let Some(default) = default_service {
+        let resolved = Server::resolve_service(default, aliases, None);
+        if !routes.contains_key(resolved.as_ref()) {
+            return Err(crate::error::Error::service(format!(
+                "Default service '{default}' resolves to unknown service '{}'",
+                resolved.as_ref()
+            )));
+        }
+    }
+
+    for (from, to) in aliases {
+        let resolved = Server::resolve_service(to, aliases, None);
+        if !routes.contains_key(resolved.as_ref()) {
+            return Err(crate::error::Error::service(format!(
+                "Alias '{from}' resolves to unknown service '{}'",
+                resolved.as_ref()
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(feature = "tls-rustls")]
@@ -1295,6 +1340,53 @@ mod tests {
                 let _ = Server::builder().route("/svc", [opt], h, None);
             },
             &["OPTIONS"],
+        );
+    }
+
+    #[tokio::test]
+    async fn build_errors_when_default_service_is_unknown() {
+        let result = Server::builder().default_service("missing").build().await;
+        let err = result
+            .err()
+            .expect("unknown default service should fail at build time");
+
+        let msg = err.to_string();
+        assert!(msg.contains("Default service"), "unexpected error: {msg}");
+        assert!(msg.contains("missing"), "unexpected error: {msg}");
+    }
+
+    #[tokio::test]
+    async fn build_errors_when_alias_target_is_unknown() {
+        let result = Server::builder()
+            .route_reqmod("svc", handler_ok, None)
+            .alias("alt", "missing")
+            .build()
+            .await;
+        let err = result
+            .err()
+            .expect("unknown alias target should fail at build time");
+
+        let msg = err.to_string();
+        assert!(msg.contains("Alias"), "unexpected error: {msg}");
+        assert!(msg.contains("missing"), "unexpected error: {msg}");
+    }
+
+    #[tokio::test]
+    async fn build_errors_when_service_options_are_invalid() {
+        let options = ServiceOptions::new().add_transfer_rule("exe", TransferBehavior::Preview);
+        let result = Server::builder()
+            .route_reqmod("svc", handler_ok, Some(options))
+            .build()
+            .await;
+        let err = result
+            .err()
+            .expect("invalid service options should fail at build time");
+
+        let msg = err.to_string();
+        assert!(msg.contains("Invalid options"), "unexpected error: {msg}");
+        assert!(
+            msg.contains("Default transfer behavior"),
+            "unexpected error: {msg}"
         );
     }
 }

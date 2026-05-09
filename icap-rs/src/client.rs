@@ -139,6 +139,19 @@ impl ClientBuilder {
         Ok(self)
     }
 
+    /// Tries to set the ICAP `User-Agent` header for all requests created by this client.
+    ///
+    /// A per-request override via `Request::icap_header("User-Agent", "...")`
+    /// takes precedence over the value set here.
+    /// Prefer this fallible variant when the value comes from user input.
+    pub fn try_user_agent(mut self, user_agent: &str) -> IcapResult<Self> {
+        self.default_headers.insert(
+            HeaderName::from_static("user-agent"),
+            HeaderValue::from_str(user_agent)?,
+        );
+        Ok(self)
+    }
+
     /// Sets the ICAP `User-Agent` header for all requests created by this client.
     ///
     /// A per-request override via `Request::icap_header("User-Agent", "...")`
@@ -153,12 +166,14 @@ impl ClientBuilder {
     ///     .user_agent("my-app/1.2.3")
     ///     .build();
     /// ```
-    pub fn user_agent(mut self, user_agent: &str) -> Self {
-        self.default_headers.insert(
-            HeaderName::from_static("user-agent"),
-            HeaderValue::from_str(user_agent).expect("invalid User-Agent header value"),
-        );
-        self
+    ///
+    /// # Panics
+    ///
+    /// Panics if `user_agent` is not a valid HTTP header value. Use
+    /// [`ClientBuilder::try_user_agent`] for untrusted input.
+    pub fn user_agent(self, user_agent: &str) -> Self {
+        self.try_user_agent(user_agent)
+            .expect("invalid User-Agent header value")
     }
 
     /// Enable or disable connection reuse (keep-alive).
@@ -252,8 +267,11 @@ impl ClientBuilder {
         Ok(self)
     }
 
-    pub fn build(self) -> Client {
-        let host = self.host.expect("ClientBuilder: host is required");
+    /// Build a [`Client`], returning an error when required configuration is missing.
+    pub fn try_build(self) -> IcapResult<Client> {
+        let host = self
+            .host
+            .ok_or_else(|| Error::service("ClientBuilder: host is required"))?;
         let port = self.port.unwrap_or(1344);
 
         let any_tls = match self.tls_backend {
@@ -279,10 +297,10 @@ impl ClientBuilder {
             //     }
             // }
             #[cfg(not(feature = "tls-rustls"))]
-            Some(_) => panic!("enable `tls-rustls` feature"),
+            Some(_) => return Err(Error::service("enable `tls-rustls` feature")),
         };
 
-        Client {
+        Ok(Client {
             inner: Arc::new(ClientRef {
                 host,
                 port,
@@ -294,7 +312,17 @@ impl ClientBuilder {
                 idle_conn: Mutex::new(None),
                 sni_hostname: self.sni_hostname,
             }),
-        }
+        })
+    }
+
+    /// Build a [`Client`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if required configuration is missing. Use
+    /// [`ClientBuilder::try_build`] for fallible construction.
+    pub fn build(self) -> Client {
+        self.try_build().expect("ClientBuilder build failed")
     }
 }
 
@@ -1447,6 +1475,15 @@ mod tests {
         assert!(s.contains("204"));
         assert!(s.contains("206"));
         assert_eq!(s.matches("204").count(), 1);
+    }
+
+    #[test]
+    fn try_user_agent_rejects_invalid_header_value() {
+        let err = Client::builder()
+            .try_user_agent("bad\r\nvalue")
+            .expect_err("invalid header value should be rejected");
+
+        assert!(matches!(err, Error::Header(_)));
     }
 
     #[rstest]

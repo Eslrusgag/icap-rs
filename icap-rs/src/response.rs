@@ -122,23 +122,42 @@ impl Response {
         })
     }
 
+    /// Try to add or overwrite a header.
+    ///
+    /// Setting `ISTag` here is discouraged; prefer [`Response::try_set_istag`].
+    pub fn try_add_header(mut self, name: &str, value: &str) -> IcapResult<Self> {
+        if name.eq_ignore_ascii_case("ISTag") {
+            validate_istag(value)?;
+            let val = HeaderValue::from_str(value)?;
+            self.headers.insert(HeaderName::from_static("istag"), val);
+            return Ok(self);
+        }
+
+        let n: HeaderName = name.parse()?;
+        let v: HeaderValue = HeaderValue::from_str(value)?;
+        self.headers.insert(n, v);
+        Ok(self)
+    }
+
     /// Add or overwrite a header.
     /// NOTE: Setting `ISTag` here is discouraged; prefer `try_set_istag()`.
-    pub fn add_header(mut self, name: &str, value: &str) -> Self {
-        if name.eq_ignore_ascii_case("ISTag") {
-            if let Err(e) = validate_istag(value) {
-                trace!("ignoring invalid ISTag passed to add_header: {}", e);
-                return self;
-            }
-            let val = HeaderValue::from_str(value).expect("invalid ISTag header value");
-            self.headers.insert(HeaderName::from_static("istag"), val);
+    ///
+    /// # Panics
+    ///
+    /// Panics if `name` or `value` is not a valid HTTP header field. Invalid
+    /// `ISTag` values are ignored for compatibility with previous releases; use
+    /// [`Response::try_add_header`] or [`Response::try_set_istag`] for fallible
+    /// handling.
+    pub fn add_header(self, name: &str, value: &str) -> Self {
+        if name.eq_ignore_ascii_case("ISTag")
+            && let Err(e) = validate_istag(value)
+        {
+            trace!("ignoring invalid ISTag passed to add_header: {}", e);
             return self;
         }
 
-        let n: HeaderName = name.parse().expect("invalid header name");
-        let v: HeaderValue = HeaderValue::from_str(value).expect("invalid header value");
-        self.headers.insert(n, v);
-        self
+        self.try_add_header(name, value)
+            .expect("invalid response header name or value")
     }
 
     /// Set ISTag header with validation (length ≤32; unquoted must be HTTP token,
@@ -370,8 +389,13 @@ fn compute_enc_for_req_body(body: &[u8]) -> IcapResult<String> {
     }
 }
 
-pub(crate) fn parse_icap_response(raw: &[u8]) -> IcapResult<Response> {
-    trace!(len = raw.len(), "parse_icap_response");
+struct ParsedResponseHead {
+    response: Response,
+    header_end: usize,
+    encapsulated_value: Option<String>,
+}
+
+fn parse_response_head_parts(raw: &[u8]) -> IcapResult<ParsedResponseHead> {
     if raw.is_empty() {
         return Err(Error::parse("Empty response"));
     }
@@ -393,7 +417,6 @@ pub(crate) fn parse_icap_response(raw: &[u8]) -> IcapResult<Response> {
     }
 
     let version = parts[0].to_string();
-
     let status_code = match StatusCode::from_str(parts[1]) {
         Ok(code) => code,
         Err(_) => {
@@ -416,7 +439,7 @@ pub(crate) fn parse_icap_response(raw: &[u8]) -> IcapResult<Response> {
 
     let mut headers = HeaderMap::new();
     let mut seen_encapsulated = false;
-    let mut encapsulated_value: Option<&str> = None;
+    let mut encapsulated_value = None;
     for line in lines {
         if line.is_empty() {
             break;
@@ -430,7 +453,7 @@ pub(crate) fn parse_icap_response(raw: &[u8]) -> IcapResult<Response> {
                     return Err(Error::Header("duplicate Encapsulated header".into()));
                 }
                 seen_encapsulated = true;
-                encapsulated_value = Some(value);
+                encapsulated_value = Some(value.to_string());
             }
 
             if name.eq_ignore_ascii_case("ISTag") {
@@ -454,14 +477,41 @@ pub(crate) fn parse_icap_response(raw: &[u8]) -> IcapResult<Response> {
         }
     }
 
-    let body = raw[hdr_end..].to_vec();
+    Ok(ParsedResponseHead {
+        response: Response {
+            version,
+            status_code,
+            status_text,
+            headers,
+            body: Vec::new(),
+        },
+        header_end: hdr_end,
+        encapsulated_value,
+    })
+}
+
+pub(crate) fn parse_icap_response(raw: &[u8]) -> IcapResult<Response> {
+    trace!(len = raw.len(), "parse_icap_response");
+    let ParsedResponseHead {
+        mut response,
+        header_end,
+        encapsulated_value,
+    } = parse_response_head_parts(raw)?;
+
+    let body = raw[header_end..].to_vec();
     trace!(body_len = body.len(), "parsed body");
-    if require_istag {
+    if response.status_code.is_success() {
         let enc_val = encapsulated_value
-            .or_else(|| headers.get("Encapsulated").and_then(|v| v.to_str().ok()))
+            .as_deref()
+            .or_else(|| {
+                response
+                    .headers
+                    .get("Encapsulated")
+                    .and_then(|v| v.to_str().ok())
+            })
             .ok_or(Error::MissingHeader("Encapsulated"))?;
 
-        match status_code {
+        match response.status_code {
             StatusCode::NO_CONTENT => {
                 if !enc_val.trim().eq_ignore_ascii_case("null-body=0") {
                     return Err(Error::Header(
@@ -480,92 +530,13 @@ pub(crate) fn parse_icap_response(raw: &[u8]) -> IcapResult<Response> {
         }
     }
 
-    Ok(Response {
-        version,
-        status_code,
-        status_text,
-        headers,
-        body,
-    })
+    response.body = body;
+    Ok(response)
 }
 
 pub(crate) fn parse_icap_response_head(raw: &[u8]) -> IcapResult<Response> {
     trace!(len = raw.len(), "parse_icap_response_head");
-    if raw.is_empty() {
-        return Err(Error::parse("Empty response"));
-    }
-
-    let hdr_end =
-        find_double_crlf(raw).ok_or_else(|| Error::parse("ICAP response headers not complete"))?;
-    let head = &raw[..hdr_end];
-    let head_str = std::str::from_utf8(head)?;
-    let mut lines = head_str.split("\r\n");
-
-    let status_line = lines.next().ok_or_else(|| Error::parse("Empty response"))?;
-    let parts: Vec<&str> = status_line.split_whitespace().collect();
-    if parts.len() < 2 {
-        return Err(Error::parse("Invalid status line format"));
-    }
-    if parts[0] != ICAP_VERSION {
-        return Err(Error::InvalidVersion(parts[0].to_string()));
-    }
-
-    let version = parts[0].to_string();
-    let status_code = match StatusCode::from_str(parts[1]) {
-        Ok(code) => code,
-        Err(_) => {
-            let code_num = parts[1]
-                .parse::<u16>()
-                .map_err(|_| Error::InvalidStatusCode("Invalid status code".into()))?;
-            StatusCode::try_from(code_num).map_err(|_| {
-                Error::InvalidStatusCode(format!("Unknown ICAP status code: {}", code_num))
-            })?
-        }
-    };
-    let status_text = if parts.len() > 2 {
-        parts[2..].join(" ")
-    } else {
-        String::new()
-    };
-
-    let mut headers = HeaderMap::new();
-    let mut seen_encapsulated = false;
-    for line in lines {
-        if line.is_empty() {
-            break;
-        }
-        if let Some(colon) = memchr(b':', line.as_bytes()) {
-            let name = &line[..colon];
-            let value = line[colon + 1..].trim();
-
-            if name.eq_ignore_ascii_case("Encapsulated") {
-                if seen_encapsulated {
-                    return Err(Error::Header("duplicate Encapsulated header".into()));
-                }
-                seen_encapsulated = true;
-            }
-            if name.eq_ignore_ascii_case("ISTag") {
-                validate_istag(value)?;
-            }
-
-            headers.insert(
-                HeaderName::from_bytes(name.as_bytes())?,
-                HeaderValue::from_str(value)?,
-            );
-        }
-    }
-
-    if status_code.is_success() && !headers.contains_key("ISTag") {
-        return Err(Error::MissingHeader("ISTag"));
-    }
-
-    Ok(Response {
-        version,
-        status_code,
-        status_text,
-        headers,
-        body: Vec::new(),
-    })
+    Ok(parse_response_head_parts(raw)?.response)
 }
 
 fn validate_encapsulated_offsets(enc: &Encapsulated, enc_len: usize) -> IcapResult<()> {
@@ -729,6 +700,24 @@ mod tests {
     fn add_header_istag_rejects_invalid_but_does_not_panic() {
         let resp = Response::new(StatusCode::OK, "OK").add_header("ISTag", "BAD TAG WITH SPACE");
         assert!(resp.get_header("ISTag").is_none());
+    }
+
+    #[test]
+    fn try_add_header_rejects_invalid_header_input() {
+        let err = Response::new(StatusCode::OK, "OK")
+            .try_add_header("Bad Header", "value")
+            .expect_err("invalid header name should be rejected");
+
+        assert!(matches!(err, Error::Header(_)));
+    }
+
+    #[test]
+    fn try_add_header_rejects_invalid_istag() {
+        let err = Response::new(StatusCode::OK, "OK")
+            .try_add_header("ISTag", "BAD TAG WITH SPACE")
+            .expect_err("invalid ISTag should be rejected");
+
+        assert!(matches!(err, Error::InvalidISTag(_)));
     }
 
     #[test]

@@ -471,12 +471,23 @@ impl<R> Request<R> {
         Self::new(Method::RespMod, service)
     }
 
-    /// Set/override an ICAP header.
-    pub fn icap_header(mut self, name: &str, value: &str) -> Self {
-        let n: HeaderName = name.parse().expect("invalid ICAP header name");
-        let v: HeaderValue = HeaderValue::from_str(value).expect("invalid ICAP header value");
+    /// Try to set or override an ICAP header.
+    pub fn try_icap_header(mut self, name: &str, value: &str) -> IcapResult<Self> {
+        let n: HeaderName = name.parse()?;
+        let v: HeaderValue = HeaderValue::from_str(value)?;
         self.icap_headers.insert(n, v);
-        self
+        Ok(self)
+    }
+
+    /// Set or override an ICAP header.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `name` or `value` is not a valid HTTP header field. Use
+    /// [`Request::try_icap_header`] for untrusted input.
+    pub fn icap_header(self, name: &str, value: &str) -> Self {
+        self.try_icap_header(name, value)
+            .expect("invalid ICAP header name or value")
     }
 
     /// Preview controls.
@@ -950,6 +961,15 @@ mod tests {
             req.icap_headers.get("Host").unwrap(),
             &HeaderValue::from_static("icap2.example.org")
         );
+    }
+
+    #[test]
+    fn try_icap_header_rejects_invalid_header_input() {
+        let err = Request::<Vec<u8>>::options("icap/test")
+            .try_icap_header("Bad Header", "value")
+            .expect_err("invalid header name should be rejected");
+
+        assert!(matches!(err, Error::Header(_)));
     }
 
     #[test]
