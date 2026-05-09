@@ -1,10 +1,10 @@
 [package]
 name = "icap-rs"
 version = "0.2.0"
-edition = "2024"
+edition.workspace = true
 description = "ICAP client and server crate"
-repository = "https://github.com/Eslrusgag/icap-rs"
-license = "MIT"
+repository.workspace = true
+license.workspace = true
 
 [features]
 default = []
@@ -22,26 +22,33 @@ tls-rustls = [
 
 
 [dependencies]
-tokio = { version = "1.49", features = ["full"] }
-thiserror = "2.0"
-tracing = "0.1"
-http = "1.4.0"
-smallvec = "2.0.0-alpha.12"
-memchr = "2.7.6"
-pin-project-lite = "0.2"
-async-trait = "0.1"
-bytes = "1.11.1"
+# Async runtime and I/O
+tokio = { workspace = true, features = ["full"] }
 
+# Protocol/data types
+bytes = { workspace = true }
+http = { workspace = true }
+smallvec = { workspace = true }
 
-tokio-rustls = { version = "0.26", optional = true }
-rustls = { version = "0.23", default-features = false, features = ["std"], optional = true }
-rustls-native-certs = { version = "0.8.3", optional = true }
-rustls-pemfile = { version = "2", optional = true }
+# Parsing and async helpers
+async-trait = { workspace = true }
+memchr = { workspace = true }
+pin-project-lite = { workspace = true }
+
+# TLS
+rustls = { workspace = true, features = ["std"], optional = true }
+rustls-native-certs = { workspace = true, optional = true }
+rustls-pemfile = { workspace = true, optional = true }
+tokio-rustls = { workspace = true, optional = true }
+
+# Diagnostics and errors
+thiserror = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
-rstest = "0.26.1"
-criterion = { version = "0.8.2", features = ["html_reports"] }
-tracing-subscriber = "0.3"
+criterion = { workspace = true, features = ["html_reports"] }
+rstest = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 
 [[example]]

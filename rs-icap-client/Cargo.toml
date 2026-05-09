@@ -1,10 +1,10 @@
 [package]
 name = "rs-icap-client"
 version = "0.2.0"
-edition = "2024"
+edition.workspace = true
 description = "ICAP client on Rust"
-repository = "https://github.com/Eslrusgag/icap-rs"
-license = "MIT"
+repository.workspace = true
+license.workspace = true
 
 [features]
 default = ["tls-rustls"]
@@ -12,10 +12,19 @@ default = ["tls-rustls"]
 tls-rustls = ["icap-rs/tls-rustls"]
 
 [dependencies]
-clap = { version = "4.5", features = ["derive"] }
-tokio = { version = "1.49", features = ["full"] }
-icap-rs = { path = "../icap-rs" }
-tracing = "0.1"
-tracing-subscriber = "0.3"
-http = "1.4.0"
-chrono = "0.4.43"
+# Workspace crates
+icap-rs = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true, features = ["full"] }
+
+# CLI and time
+chrono = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+
+# Protocol/data types
+http = { workspace = true }
+
+# Diagnostics
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
