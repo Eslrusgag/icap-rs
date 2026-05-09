@@ -3,9 +3,10 @@ use std::time::Duration;
 
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
-use tokio::time::{sleep, timeout};
+use tokio::time::{Instant, sleep, timeout};
 
 use icap_rs::client::Client;
+use icap_rs::error::Error;
 use icap_rs::request::Request;
 use icap_rs::response::{Response, StatusCode};
 
@@ -65,16 +66,40 @@ async fn early_503_when_conn_limit_exceeded() {
     let (addr, _handle) = spawn_server_with_limit(1).await;
 
     let _hold = TcpStream::connect(&addr).await.expect("occupy permit");
-    sleep(Duration::from_millis(40)).await;
 
     let sa: SocketAddr = addr.parse().unwrap();
     let client = make_client("127.0.0.1", sa.port());
     let req = Request::options("svc-options");
 
-    let resp: Response = timeout(Duration::from_secs(1), client.send(&req))
-        .await
-        .expect("client.send timed out")
-        .expect("client.send failed");
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let resp: Response = loop {
+        let result = timeout(Duration::from_millis(200), client.send(&req)).await;
+        match result {
+            Ok(Ok(resp)) if resp.status_code == StatusCode::SERVICE_UNAVAILABLE => break resp,
+            Ok(Ok(resp)) if resp.status_code == StatusCode::OK && Instant::now() < deadline => {
+                sleep(Duration::from_millis(10)).await;
+            }
+            Ok(Ok(resp)) => break resp,
+            Ok(Err(err)) if Instant::now() < deadline => {
+                if matches!(
+                    err,
+                    Error::Network(ref io_err)
+                        if matches!(
+                            io_err.kind(),
+                            std::io::ErrorKind::ConnectionAborted
+                                | std::io::ErrorKind::ConnectionReset
+                        )
+                ) {
+                    sleep(Duration::from_millis(10)).await;
+                    continue;
+                }
+                panic!("client.send failed: {err}");
+            }
+            Ok(Err(err)) => panic!("client.send failed: {err}"),
+            Err(_) if Instant::now() < deadline => continue,
+            Err(_) => panic!("client.send timed out"),
+        }
+    };
 
     assert_eq!(
         resp.status_code,

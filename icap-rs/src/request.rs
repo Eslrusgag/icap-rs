@@ -42,8 +42,8 @@ use crate::error::{Error, IcapResult};
 use crate::parser::icap::find_double_crlf;
 use bytes::Bytes;
 use http::{
-    HeaderMap, HeaderName, HeaderValue, Request as HttpRequest, Response as HttpResponse,
-    StatusCode as HttpStatus, Version,
+    HeaderMap, HeaderName, HeaderValue, Method as HttpMethod, Request as HttpRequest,
+    Response as HttpResponse, StatusCode as HttpStatus, Version,
 };
 use memchr::memchr;
 use memchr::memmem;
@@ -646,8 +646,7 @@ pub(crate) fn parse_icap_request(data: &[u8]) -> IcapResult<Request<Vec<u8>>> {
     let embedded = if let Some(hdr_off) = http_hdr_off {
         let hdr_end_off = next_offset_after(&enc, hdr_off);
         let http_region = slice_encapsulated(enc_area, hdr_off, hdr_end_off)?;
-
-        let Some(http_hdr_len) = find_double_crlf(http_region) else {
+        if http_region.is_empty() {
             return Ok(Request {
                 method,
                 service,
@@ -658,18 +657,21 @@ pub(crate) fn parse_icap_request(data: &[u8]) -> IcapResult<Request<Vec<u8>>> {
                 allow_206,
                 preview_ieof: false,
             });
-        };
+        }
+
+        let http_hdr_len = find_double_crlf(http_region)
+            .ok_or_else(|| Error::HttpParse("embedded HTTP headers not complete".to_string()))?;
         let http_head_bytes = &http_region[..http_hdr_len];
         let inline_body = &http_region[http_hdr_len..];
 
         let first_line_end =
             memmem::find(http_head_bytes, b"\r\n").unwrap_or(http_head_bytes.len());
         let start_bytes = &http_head_bytes[..first_line_end];
-        let is_response = start_bytes.starts_with(b"HTTP/");
+        let start = std::str::from_utf8(start_bytes)?;
 
         let http_head_str = std::str::from_utf8(http_head_bytes)?;
         let mut hlines = http_head_str.split("\r\n");
-        let start = hlines.next().unwrap_or_default();
+        let _ = hlines.next();
 
         let mut http_headers = HeaderMap::new();
         for line in hlines {
@@ -712,15 +714,10 @@ pub(crate) fn parse_icap_request(data: &[u8]) -> IcapResult<Request<Vec<u8>>> {
             inline_body.to_vec()
         };
 
-        if is_response {
-            // HTTP Response
-            let mut p = start.split_whitespace();
-            let _ver = p.next().unwrap_or("HTTP/1.1");
-            let code = p.next().unwrap_or("200").parse::<u16>().unwrap_or(200);
+        if method == Method::RespMod {
+            let (version, status) = parse_embedded_http_response_start_line(start)?;
 
-            let mut builder = HttpResponse::builder()
-                .status(HttpStatus::from_u16(code).unwrap_or(HttpStatus::OK))
-                .version(Version::HTTP_11);
+            let mut builder = HttpResponse::builder().status(status).version(version);
 
             {
                 let headers_mut = builder
@@ -738,15 +735,12 @@ pub(crate) fn parse_icap_request(data: &[u8]) -> IcapResult<Request<Vec<u8>>> {
                 body: Body::Full { reader: body_bytes },
             })
         } else {
-            // HTTP Request
-            let mut p = start.split_whitespace();
-            let m = p.next().unwrap_or("GET");
-            let u = p.next().unwrap_or("/");
+            let (http_method, uri, version) = parse_embedded_http_request_start_line(start)?;
 
             let mut builder = HttpRequest::builder()
-                .method(m)
-                .uri(u)
-                .version(Version::HTTP_11);
+                .method(http_method)
+                .uri(uri)
+                .version(version);
 
             {
                 let headers_mut = builder
@@ -778,6 +772,63 @@ pub(crate) fn parse_icap_request(data: &[u8]) -> IcapResult<Request<Vec<u8>>> {
         allow_206,
         preview_ieof: false,
     })
+}
+
+fn parse_embedded_http_request_start_line(start: &str) -> IcapResult<(HttpMethod, &str, Version)> {
+    let mut parts = start.split_whitespace();
+    let method = parts
+        .next()
+        .ok_or_else(|| Error::http_parse("embedded HTTP request line missing method"))?;
+    let uri = parts
+        .next()
+        .ok_or_else(|| Error::http_parse("embedded HTTP request line missing URI"))?;
+    let version = parts
+        .next()
+        .ok_or_else(|| Error::http_parse("embedded HTTP request line missing version"))?;
+
+    if parts.next().is_some() {
+        return Err(Error::http_parse(
+            "embedded HTTP request line has extra fields",
+        ));
+    }
+
+    Ok((
+        HttpMethod::from_str(method)?,
+        uri,
+        parse_http_version(version)?,
+    ))
+}
+
+fn parse_embedded_http_response_start_line(start: &str) -> IcapResult<(Version, HttpStatus)> {
+    let mut parts = start.split_whitespace();
+    let version = parts
+        .next()
+        .ok_or_else(|| Error::http_parse("embedded HTTP status line missing version"))?;
+    if !version.starts_with("HTTP/") {
+        return Err(Error::http_parse(format!(
+            "embedded HTTP status line must start with HTTP/, got {version}"
+        )));
+    }
+
+    let status = parts
+        .next()
+        .ok_or_else(|| Error::http_parse("embedded HTTP status line missing status code"))?;
+    let status = status
+        .parse::<u16>()
+        .map_err(|_| Error::http_parse(format!("invalid embedded HTTP status code: {status}")))?;
+
+    Ok((parse_http_version(version)?, HttpStatus::from_u16(status)?))
+}
+
+fn parse_http_version(version: &str) -> IcapResult<Version> {
+    match version {
+        "HTTP/0.9" => Ok(Version::HTTP_09),
+        "HTTP/1.0" => Ok(Version::HTTP_10),
+        "HTTP/1.1" => Ok(Version::HTTP_11),
+        "HTTP/2.0" | "HTTP/2" => Ok(Version::HTTP_2),
+        "HTTP/3.0" | "HTTP/3" => Ok(Version::HTTP_3),
+        _ => Err(Error::InvalidVersion(version.to_string())),
+    }
 }
 
 fn next_offset_after(enc: &crate::parser::icap::Encapsulated, start: usize) -> Option<usize> {
@@ -1175,6 +1226,62 @@ Encapsulated: req-hdr=0, req-body={}, null-body={}\r\n\
             }
             _ => panic!("expected embedded HTTP request"),
         }
+    }
+
+    #[test]
+    fn rejects_incomplete_embedded_http_headers() {
+        let raw = icap_bytes(
+            "REQMOD icap://icap.example.org/icap/test ICAP/1.0\r\n\
+             Host: icap.example.org\r\n\
+             Encapsulated: req-hdr=0\r\n\
+             \r\n\
+             GET / HTTP/1.1\r\n\
+             Host: example.com\r\n",
+        );
+
+        let err = parse_icap_request(&raw).unwrap_err();
+        assert!(
+            matches!(err, Error::HttpParse(_)),
+            "expected embedded HTTP parse error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_respmod_with_http_request_start_line() {
+        let raw = icap_bytes(
+            "RESPMOD icap://icap.example.org/icap/test ICAP/1.0\r\n\
+             Host: icap.example.org\r\n\
+             Encapsulated: res-hdr=0\r\n\
+             \r\n\
+             GET / HTTP/1.1\r\n\
+             Host: example.com\r\n\
+             \r\n",
+        );
+
+        let err = parse_icap_request(&raw).unwrap_err();
+        assert!(
+            matches!(err, Error::HttpParse(_)),
+            "expected embedded HTTP status-line parse error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_respmod_with_invalid_status_code() {
+        let raw = icap_bytes(
+            "RESPMOD icap://icap.example.org/icap/test ICAP/1.0\r\n\
+             Host: icap.example.org\r\n\
+             Encapsulated: res-hdr=0\r\n\
+             \r\n\
+             HTTP/1.1 nope OK\r\n\
+             Content-Length: 0\r\n\
+             \r\n",
+        );
+
+        let err = parse_icap_request(&raw).unwrap_err();
+        assert!(
+            matches!(err, Error::HttpParse(_)),
+            "expected embedded HTTP status code parse error, got: {err}"
+        );
     }
 
     #[test]

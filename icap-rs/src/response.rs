@@ -30,7 +30,7 @@
 
 use crate::ICAP_VERSION;
 use crate::error::{Error, IcapResult};
-use crate::parser::icap::find_double_crlf;
+use crate::parser::icap::{Encapsulated, find_double_crlf, parse_encapsulated_value};
 use crate::parser::{serialize_http_request, serialize_http_response};
 use http::{HeaderMap, HeaderName, HeaderValue};
 use memchr::memchr;
@@ -141,7 +141,8 @@ impl Response {
         self
     }
 
-    /// Set ISTag header with validation (length ≤32, charset [A-Za-z0-9.-]).
+    /// Set ISTag header with validation (length ≤32; unquoted must be HTTP token,
+    /// quoted-string is accepted per RFC 3507/2616).
     /// Returns `Self` on success; otherwise `Error::InvalidISTag`.
     pub fn try_set_istag(mut self, istag: &str) -> IcapResult<Self> {
         validate_istag(istag)?;
@@ -472,8 +473,8 @@ pub(crate) fn parse_icap_response(raw: &[u8]) -> IcapResult<Response> {
                 }
             }
             StatusCode::OK | StatusCode::PARTIAL_CONTENT => {
-                let pairs = parse_encapsulated_pairs_strict(enc_val)?;
-                validate_encapsulated_offsets(&pairs, body.len())?;
+                let enc = parse_encapsulated_value(enc_val)?;
+                validate_encapsulated_offsets(&enc, body.len())?;
             }
             _ => {}
         }
@@ -567,62 +568,28 @@ pub(crate) fn parse_icap_response_head(raw: &[u8]) -> IcapResult<Response> {
     })
 }
 
-fn parse_encapsulated_pairs_strict(s: &str) -> IcapResult<Vec<(String, usize)>> {
-    let mut out = Vec::new();
-    if s.trim().is_empty() {
-        return Err(Error::MissingHeader("Encapsulated"));
-    }
-
-    for part in s.split(',') {
-        let p = part.trim();
-        let (name, off_str) = p
-            .split_once('=')
-            .ok_or_else(|| Error::Header(format!("invalid Encapsulated token: {p}")))?;
-        let name_norm = name.trim();
-        let name_lc = name_norm.to_ascii_lowercase();
-
-        let ok_name = matches!(
-            name_lc.as_str(),
-            "req-hdr" | "res-hdr" | "req-body" | "res-body" | "opt-body" | "null-body"
-        );
-        if !ok_name {
+fn validate_encapsulated_offsets(enc: &Encapsulated, enc_len: usize) -> IcapResult<()> {
+    for off in encapsulated_offsets(enc) {
+        if off > enc_len {
             return Err(Error::Header(format!(
-                "invalid Encapsulated part name: {name_norm}"
-            )));
-        }
-
-        // оффсет
-        let off: usize = off_str
-            .trim()
-            .parse::<usize>()
-            .map_err(|_| Error::Header(format!("invalid Encapsulated offset: {off_str}")))?;
-
-        out.push((name_lc, off));
-    }
-
-    Ok(out)
-}
-
-fn validate_encapsulated_offsets(pairs: &[(String, usize)], enc_len: usize) -> IcapResult<()> {
-    for (_, off) in pairs {
-        if *off > enc_len {
-            return Err(Error::Header(format!(
-                "Encapsulated offset {} out of range (len={})",
-                off, enc_len
-            )));
-        }
-    }
-    for w in pairs.windows(2) {
-        let prev = w[0].1;
-        let curr = w[1].1;
-        if curr < prev {
-            return Err(Error::Header(format!(
-                "Encapsulated offsets not monotonic: {} -> {}",
-                prev, curr
+                "Encapsulated offset {off} out of range (len={enc_len})"
             )));
         }
     }
     Ok(())
+}
+
+fn encapsulated_offsets(enc: &Encapsulated) -> impl Iterator<Item = usize> {
+    [
+        enc.req_hdr,
+        enc.res_hdr,
+        enc.req_body,
+        enc.res_body,
+        enc.opt_body,
+        enc.null_body,
+    ]
+    .into_iter()
+    .flatten()
 }
 
 #[inline]
@@ -630,7 +597,8 @@ fn validate_istag(raw: &str) -> IcapResult<()> {
     let s = raw.trim();
 
     let mut val = String::new();
-    if s.starts_with('"') {
+    let quoted = s.starts_with('"');
+    if quoted {
         if !s.ends_with('"') || s.len() < 2 {
             return Err(Error::InvalidISTag("unterminated quoted ISTag".into()));
         }
@@ -662,15 +630,43 @@ fn validate_istag(raw: &str) -> IcapResult<()> {
             val.len()
         )));
     }
-    if !val
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
-    {
+    if quoted {
+        return Ok(());
+    }
+
+    if !val.chars().all(is_http_token_char) {
         return Err(Error::InvalidISTag(format!(
-            "invalid characters in: {raw} (allowed: [A-Za-z0-9.-])"
+            "invalid unquoted ISTag: {raw} (use quoted-string to allow extra symbols)"
         )));
     }
     Ok(())
+}
+
+#[inline]
+fn is_http_token_char(c: char) -> bool {
+    c.is_ascii()
+        && !c.is_control()
+        && !matches!(
+            c,
+            '(' | ')'
+                | '<'
+                | '>'
+                | '@'
+                | ','
+                | ';'
+                | ':'
+                | '\\'
+                | '"'
+                | '/'
+                | '['
+                | ']'
+                | '?'
+                | '='
+                | '{'
+                | '}'
+                | ' '
+                | '\t'
+        )
 }
 
 #[cfg(test)]
@@ -805,7 +801,8 @@ mod rfc_tests {
     //! RFC 3507 conformance tests for ICAP **responses**.
     //! These tests assert behavior that follows the spec explicitly:
     //! - Status line & version (`ICAP/1.0` only), multi-word reason phrase
-    //! - ISTag (RFC 3507 §4.7): required for 2xx; ≤32 bytes; charset [A-Za-z0-9.-]
+    //! - ISTag (RFC 3507 §4.7): required for 2xx; ≤32 bytes; unquoted HTTP token
+    //!   or quoted-string.
     //! - `Encapsulated` header constraints
     //! - 204 semantics (`null-body=0`, no body)
     //! - Basic status codes recognition
@@ -875,10 +872,13 @@ mod rfc_tests {
     #[case(r#""5BDEEEA9-12E4-2""#.to_string(), true)] // valid quoted form
     #[case(r#""ABC"#.to_string(), false)] // unterminated quote
     #[case(format!(r#""{}""#, "A".repeat(33)), false)] // >32 chars in quotes
-    #[case(r#""ABC_DEF""#.to_string(), false)] // '_' not allowed in quoted value
+    #[case(r#""ABC_DEF""#.to_string(), true)] // quoted-string allows visible ASCII
+    #[case(r#""QUJDREUrLw==""#.to_string(), true)] // quoted base64 (+,/)
     #[case("TAG 1".to_string(), false)] // space not allowed
-    #[case("TAG_1".to_string(), false)] // '_' not allowed
-    #[case("TAG#1".to_string(), false)] // '#' not allowed
+    #[case("TAG_1".to_string(), true)] // '_' allowed in HTTP token
+    #[case("TAG+1".to_string(), true)] // '+' allowed in HTTP token
+    #[case("TAG/1".to_string(), false)] // '/' requires quoted-string
+    #[case("TAG#1".to_string(), true)] // '#' allowed in HTTP token
     #[case("TAG@1".to_string(), false)] // '@' not allowed
     fn istag_validate_cases(#[case] value: String, #[case] ok: bool) {
         // 1) direct validator check
@@ -947,6 +947,25 @@ mod rfc_tests {
         assert!(
             m.contains("duplicate") || m.contains("encapsulated"),
             "expected duplicate Encapsulated error; got: {m}"
+        );
+    }
+
+    #[test]
+    fn duplicate_encapsulated_parts_are_rejected() {
+        let raw = icap_bytes(
+            "ICAP/1.0 200 OK\r\n\
+             ISTag: x\r\n\
+             Encapsulated: res-hdr=0, res-hdr=10\r\n\
+             \r\n\
+             HTTP/1.1 200 OK\r\n\
+             Content-Length: 0\r\n\
+             \r\n",
+        );
+        let err = parse_icap_response(&raw).unwrap_err();
+        let m = err.to_string().to_lowercase();
+        assert!(
+            m.contains("duplicate") && m.contains("encapsulated"),
+            "expected duplicate Encapsulated part error; got: {m}"
         );
     }
 
