@@ -1377,7 +1377,6 @@ fn build_preview_and_chunks(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::StatusCode;
     use crate::parser::icap::find_double_crlf;
     use http::{Request as HttpReq, Version, header};
     use rstest::{fixture, rstest};
@@ -1502,19 +1501,6 @@ mod tests {
             (Some(a), Some(b)) => assert_eq!(a, b),
             other => panic!("rest mismatch: {other:?}"),
         }
-    }
-
-    #[test]
-    fn options_has_null_body_and_headers() {
-        let c = client();
-        let req = Request::options("options");
-        let wire = c.get_request_wire(&req, false).unwrap();
-        let head = extract_headers_text(&wire);
-        assert!(head.starts_with("OPTIONS icap://icap.example:1344/options ICAP/1.0\r\n"));
-        assert!(find_header_line(&head, "Host").is_some());
-        assert!(find_header_line(&head, "X-Trace-Id").is_some());
-        let enc = find_header_line(&head, "Encapsulated").unwrap();
-        assert!(enc.contains("null-body=0"));
     }
 
     #[test]
@@ -1689,48 +1675,5 @@ mod tests {
         tokio::spawn(server_write(server, b"ICAP/1.0 200 OK\r\n", true));
         let res = timeout(Duration::from_millis(50), read_icap_headers(&mut client)).await;
         assert!(res.is_err());
-    }
-
-    #[tokio::test]
-    async fn client_reads_rfc_response_with_unchunked_http_head_and_chunked_body() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-
-        tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = Vec::new();
-            let mut tmp = [0u8; 1024];
-            loop {
-                let n = socket.read(&mut tmp).await.unwrap();
-                assert!(n > 0, "client closed before sending request");
-                request.extend_from_slice(&tmp[..n]);
-                if find_double_crlf(&request).is_some() {
-                    break;
-                }
-            }
-
-            let wire = b"ICAP/1.0 200 OK\r\n\
-                         ISTag: x\r\n\
-                         Encapsulated: res-hdr=0, res-body=38\r\n\
-                         \r\n\
-                         HTTP/1.1 200 OK\r\n\
-                         Content-Length: 5\r\n\
-                         \r\n\
-                         5\r\n\
-                         hello\r\n\
-                         0\r\n\
-                         \r\n";
-            socket.write_all(wire).await.unwrap();
-            socket.flush().await.unwrap();
-        });
-
-        let client = Client::builder().host("127.0.0.1").port(port).build();
-        let response = client.send(&Request::options("svc")).await.unwrap();
-
-        assert_eq!(response.status_code, StatusCode::OK);
-        assert_eq!(
-            response.body,
-            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"
-        );
     }
 }

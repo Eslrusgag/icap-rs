@@ -1109,18 +1109,9 @@ mod tests {
 }
 
 #[cfg(test)]
-mod rfc_tests {
-    //! RFC 3507 conformance tests for ICAP **responses**.
-    //! These tests assert behavior that follows the spec explicitly:
-    //! - Status line & version (`ICAP/1.0` only), multi-word reason phrase
-    //! - `ISTag` (RFC 3507 §4.7): required for 2xx; ≤32 bytes; unquoted HTTP token
-    //!   or quoted-string.
-    //! - `Encapsulated` header constraints
-    //! - 204 semantics (`null-body=0`, no body)
-    //! - Basic status codes recognition
-    //! - Case-insensitive headers
-    //! - Framing (CRLFCRLF)
-    //! - Sanity case for 200 with `res-hdr` skeleton
+mod response_wire_parser_tests {
+    //! Low-level response parser regressions for private helpers.
+    //! Release-facing RFC coverage lives in `tests/rfc3507.rs`.
 
     use super::*;
     use http::HeaderValue;

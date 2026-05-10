@@ -1028,6 +1028,17 @@ mod tests {
     }
 
     #[test]
+    fn preview_zero_does_not_imply_ieof() {
+        let req: Request = Request::reqmod("svc").preview(0);
+        assert_eq!(req.preview_size, Some(0));
+        assert!(!req.preview_ieof);
+
+        let req: Request = Request::reqmod("svc").preview(0).preview_ieof();
+        assert_eq!(req.preview_size, Some(0));
+        assert!(req.preview_ieof);
+    }
+
+    #[test]
     fn builder_sets_and_overrides_headers() {
         let req: Request = Request::options("icap/test")
             .icap_header("Host", "icap.example.org")
@@ -1508,90 +1519,5 @@ Encapsulated: req-hdr=0, req-body={req_body_off}\r\n\
         assert!(!r.allow_204);
         assert!(!r.allow_206);
         assert_eq!(r.preview_size, None);
-    }
-}
-
-#[cfg(test)]
-mod rfc_tests {
-    //! RFC 3507 conformance tests for ICAP **requests**.
-    //!
-    //! These tests check:
-    //! - Method parsing (case-insensitive, unknown → panic by design)
-    //! - Service extraction from ICAP URI (last path segment)
-    //! - `Allow: 204/206` & `Preview: n` parsing (with whitespace variants)
-    //! - Embedded HTTP request/response extraction
-    //! - Case-insensitive headers
-    //! - Request-line/headers framing errors
-    use super::*;
-    use http::StatusCode as HttpStatus;
-
-    fn icap_bytes(s: &str) -> Vec<u8> {
-        s.as_bytes().to_vec()
-    }
-
-    #[test]
-    fn preview_zero_does_not_imply_ieof() {
-        let r: Request = Request::reqmod("svc").preview(0);
-        assert_eq!(r.preview_size, Some(0));
-        assert!(!r.preview_ieof);
-
-        let r2: Request = Request::reqmod("svc").preview(0).preview_ieof();
-        assert_eq!(r2.preview_size, Some(0));
-        assert!(r2.preview_ieof);
-    }
-
-    #[test]
-    fn rejects_embedded_http_without_encapsulated() {
-        let raw = b"REQMOD icap://icap.example.org/icap/test ICAP/1.0\r\n\
-                Host: icap.example.org\r\n\
-                \r\n\
-                GET / HTTP/1.1\r\n\
-                Host: example.com\r\n\
-                \r\n";
-        let err = parse_icap_request(raw).unwrap_err();
-        assert!(matches!(err, Error::MissingHeader(h) if h == "Encapsulated"));
-    }
-
-    #[test]
-    fn parses_embedded_http_response_with_res_hdr_token() {
-        let raw = icap_bytes(
-            "RESPMOD icap://icap.example.org/icap/test ICAP/1.0\r\n\
-             Host: icap.example.org\r\n\
-             Encapsulated: res-hdr=0\r\n\
-             \r\n\
-             HTTP/1.1 200 OK\r\n\
-             Content-Length: 5\r\n\
-             \r\n\
-             hello",
-        );
-        let r = parse_icap_request(&raw).expect("parse");
-        match r.embedded {
-            Some(EmbeddedHttp::Resp { ref head, ref body }) => {
-                assert_eq!(head.status(), HttpStatus::OK);
-                assert_eq!(head.headers().get("Content-Length").unwrap(), "5");
-                match body {
-                    Body::Full { reader } => assert_eq!(reader, b"hello"),
-                    _ => panic!("expected Full body"),
-                }
-            }
-            _ => panic!("expected embedded HTTP response"),
-        }
-    }
-
-    #[test]
-    fn request_line_must_have_method_uri_and_version() {
-        let raw = icap_bytes("REQMOD icap://h/s\r\n\r\n");
-        let err = parse_icap_request(&raw).unwrap_err();
-        assert!(
-            err.to_string().contains("Invalid request line"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn error_on_incomplete_headers_request_side() {
-        let raw = icap_bytes("REQMOD icap://h/s ICAP/1.0\r\nHost: h\r\n");
-        let err = parse_icap_request(&raw).unwrap_err();
-        assert!(err.to_string().contains("not complete"), "err: {err}");
     }
 }
