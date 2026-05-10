@@ -5,6 +5,11 @@ edition.workspace = true
 description = "ICAP client on Rust"
 repository.workspace = true
 license.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
 
 [features]
 default = ["tls-rustls"]

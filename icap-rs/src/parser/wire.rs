@@ -2,7 +2,7 @@ use crate::error::IcapResult;
 use std::io::Write;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-/// Parse a single chunk: returns (next_pos, is_final_zero, size).
+/// Parse a single chunk: returns (`next_pos`, `is_final_zero`, size).
 pub fn parse_one_chunk(buf: &[u8], from: usize) -> Option<(usize, bool, usize)> {
     let mut i = from;
     while i + 1 < buf.len() {
@@ -39,34 +39,30 @@ where
     S: AsyncRead + Unpin,
 {
     loop {
-        match parse_one_chunk(buf, pos) {
-            Some((next_pos, is_final, _)) => {
-                if is_final {
-                    pos = next_pos;
-                    while buf.len() < pos + 2 {
-                        let mut tmp = [0u8; 4096];
-                        let n = AsyncReadExt::read(stream, &mut tmp).await?;
-                        if n == 0 {
-                            return Err("Unexpected EOF after zero chunk".into());
-                        }
-                        buf.extend_from_slice(&tmp[..n]);
+        if let Some((next_pos, is_final, _)) = parse_one_chunk(buf, pos) {
+            if is_final {
+                pos = next_pos;
+                while buf.len() < pos + 2 {
+                    let mut tmp = [0u8; 4096];
+                    let n = AsyncReadExt::read(stream, &mut tmp).await?;
+                    if n == 0 {
+                        return Err("Unexpected EOF after zero chunk".into());
                     }
-                    if &buf[pos..pos + 2] != b"\r\n" {
-                        return Err("Invalid chunked terminator".into());
-                    }
-                    return Ok(pos + 2);
-                } else {
-                    pos = next_pos;
+                    buf.extend_from_slice(&tmp[..n]);
                 }
-            }
-            None => {
-                let mut tmp = [0u8; 4096];
-                let n = AsyncReadExt::read(stream, &mut tmp).await?;
-                if n == 0 {
-                    return Err("Unexpected EOF while reading ICAP chunked body".into());
+                if &buf[pos..pos + 2] != b"\r\n" {
+                    return Err("Invalid chunked terminator".into());
                 }
-                buf.extend_from_slice(&tmp[..n]);
+                return Ok(pos + 2);
             }
+            pos = next_pos;
+        } else {
+            let mut tmp = [0u8; 4096];
+            let n = AsyncReadExt::read(stream, &mut tmp).await?;
+            if n == 0 {
+                return Err("Unexpected EOF while reading ICAP chunked body".into());
+            }
+            buf.extend_from_slice(&tmp[..n]);
         }
     }
 }

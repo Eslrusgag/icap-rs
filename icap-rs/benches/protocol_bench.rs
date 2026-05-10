@@ -25,7 +25,7 @@ fn sample_icap_response_with_http() -> Vec<u8> {
 fn bench_response_parse(c: &mut Criterion) {
     let raw = sample_icap_response_with_http();
     c.bench_function("response_from_raw_200", |b| {
-        b.iter(|| Response::from_raw(black_box(&raw)).unwrap())
+        b.iter(|| Response::from_raw(black_box(&raw)).unwrap());
     });
 }
 
@@ -45,7 +45,7 @@ fn bench_response_serialize(c: &mut Criterion) {
                 .unwrap()
                 .to_raw()
                 .unwrap()
-        })
+        });
     });
 }
 
@@ -67,7 +67,7 @@ fn bench_client_request_build(c: &mut Criterion) {
                 .preview(1024)
                 .with_http_request(http_req.clone());
             client.get_request(black_box(&req)).unwrap()
-        })
+        });
     });
 }
 

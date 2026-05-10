@@ -5,6 +5,8 @@ edition.workspace = true
 description = "ICAP client and server crate"
 repository.workspace = true
 license.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [features]
 default = []
@@ -70,3 +72,6 @@ harness = false
 [[bench]]
 name = "rps_bench"
 harness = false
+
+[lints]
+workspace = true

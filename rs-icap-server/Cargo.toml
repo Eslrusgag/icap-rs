@@ -2,5 +2,12 @@
 name = "rs-icap-server"
 version = "0.1.0"
 edition.workspace = true
+description = "ICAP server on Rust"
+readme = "../README.md"
 repository.workspace = true
 license.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true

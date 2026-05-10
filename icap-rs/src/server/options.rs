@@ -5,12 +5,12 @@
 //! - [`Method`] — ICAP methods
 //! - [`TransferBehavior`] — per-extension transfer hints (Preview/Ignore/Complete)
 //! - [`ServiceOptions`] — a builder-like struct that serializes to an ICAP response
-//!   and supports a dynamic ISTag provider.
+//!   and supports a dynamic `ISTag` provider.
 //!
-//! ## Dynamic ISTag provider
-//! Some deployments need the ICAP ISTag to reflect a mutable policy (e.g. a
+//! ## Dynamic `ISTag` provider
+//! Some deployments need the ICAP `ISTag` to reflect a mutable policy (e.g. a
 //! filtering rule-set version). Use [`ServiceOptions::with_istag_provider`] to
-//! supply a closure that computes the ISTag *per request* (including `OPTIONS`).
+//! supply a closure that computes the `ISTag` *per request* (including `OPTIONS`).
 //!
 //! ### Example
 //! ```no_run
@@ -35,7 +35,7 @@ use smallvec::SmallVec;
 use std::collections::HashMap;
 
 /// Transfer behavior for file extensions advertised via `Transfer-*` headers.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransferBehavior {
     /// Files should be sent with preview.
     Preview,
@@ -45,11 +45,11 @@ pub enum TransferBehavior {
     Complete,
 }
 
-/// Source of the ISTag value used in responses.
+/// Source of the `ISTag` value used in responses.
 ///
 /// - `Static`: fixed at configuration time (backward compatible).
 /// - `Dynamic`: computed per incoming request via a user-provided closure.
-///   This allows the ISTag to track a mutable policy or any other runtime state.
+///   This allows the `ISTag` to track a mutable policy or any other runtime state.
 #[derive(Clone)]
 pub enum IstagSource {
     Static(String),
@@ -57,24 +57,25 @@ pub enum IstagSource {
 }
 
 impl IstagSource {
-    /// Resolve the current ISTag for the given request.
+    /// Resolve the current `ISTag` for the given request.
     #[inline]
     pub fn current_for(&self, req: &Request) -> String {
         match self {
-            IstagSource::Static(s) => s.clone(),
-            IstagSource::Dynamic(f) => (f)(req),
+            Self::Static(s) => s.clone(),
+            Self::Dynamic(f) => (f)(req),
         }
     }
 }
 
 /// Configuration for generating an ICAP `OPTIONS` response.
 #[derive(Clone)]
+#[must_use]
 pub struct ServiceOptions {
     /// Supported ICAP methods (injected by the router).
     pub(crate) methods: SmallVec<Method, 2>,
     /// Human-readable service description (optional).
     pub service: Option<String>,
-    /// ISTag source (static or dynamic provider).
+    /// `ISTag` source (static or dynamic provider).
     pub istag: IstagSource,
     /// Max concurrent connections hint (optional).
     pub max_connections: Option<usize>,
@@ -108,7 +109,7 @@ impl Default for ServiceOptions {
 impl ServiceOptions {
     /// Create a new OPTIONS config with required fields.
     ///
-    /// This uses a **static** ISTag by default. To make ISTag dynamic, call
+    /// This uses a **static** `ISTag` by default. To make `ISTag` dynamic, call
     /// [`with_istag_provider`](Self::with_istag_provider).
     pub fn new() -> Self {
         Self {
@@ -128,7 +129,7 @@ impl ServiceOptions {
         }
     }
 
-    /// Provide a **dynamic ISTag provider** that will be invoked for **each request**
+    /// Provide a **dynamic `ISTag` provider** that will be invoked for **each request**
     /// (including `OPTIONS`). The closure should be fast and lock-free if possible.
     ///
     /// Typical sources include: a version string stored in an `Arc<RwLock<String>>`,
@@ -154,7 +155,7 @@ impl ServiceOptions {
         self
     }
 
-    /// Use a **static** ISTag for responses.
+    /// Use a **static** `ISTag` for responses.
     pub fn with_static_istag(mut self, istag: &str) -> Self {
         self.istag = IstagSource::Static(istag.to_string());
         self
@@ -167,12 +168,12 @@ impl ServiceOptions {
     }
 
     /// Router-only: set Max-Connections from global advertised limit if not set.
-    pub(crate) fn with_max_connections(&mut self, n: usize) {
+    pub(crate) const fn with_max_connections(&mut self, n: usize) {
         self.max_connections = Some(n);
     }
 
     /// Set `Options-TTL` (seconds).
-    pub fn with_options_ttl(mut self, ttl: u32) -> Self {
+    pub const fn with_options_ttl(mut self, ttl: u32) -> Self {
         self.options_ttl = Some(ttl);
         self
     }
@@ -190,7 +191,7 @@ impl ServiceOptions {
     }
 
     /// Set Preview size (bytes).
-    pub fn with_preview(mut self, preview: u32) -> Self {
+    pub const fn with_preview(mut self, preview: u32) -> Self {
         self.preview = Some(preview);
         self
     }
@@ -202,7 +203,7 @@ impl ServiceOptions {
     }
 
     /// Set default transfer behavior (applied when an extension is not matched).
-    pub fn with_default_transfer_behavior(mut self, behavior: TransferBehavior) -> Self {
+    pub const fn with_default_transfer_behavior(mut self, behavior: TransferBehavior) -> Self {
         self.default_transfer_behavior = Some(behavior);
         self
     }
@@ -229,7 +230,7 @@ impl ServiceOptions {
         self.methods = methods.into();
     }
 
-    /// Get the ISTag for a specific request (static or dynamic).
+    /// Get the `ISTag` for a specific request (static or dynamic).
     #[inline]
     pub fn istag_for(&self, req: &Request) -> String {
         self.istag.current_for(req)
@@ -248,14 +249,14 @@ impl ServiceOptions {
         let methods_str = self
             .methods
             .iter()
-            .map(|m| m.to_string())
+            .map(std::string::ToString::to_string)
             .collect::<Vec<_>>()
             .join(", ");
         response = response.add_header("Methods", &methods_str);
 
         // ISTag — dynamic per-request
         let istag_now = self.istag_for(req);
-        response = response.add_header("ISTag", &format!("\"{}\"", istag_now));
+        response = response.add_header("ISTag", &format!("\"{istag_now}\""));
 
         // Encapsulated
         let encapsulated_value = if self.opt_body.is_some() {
@@ -333,7 +334,7 @@ impl ServiceOptions {
 
     /// Validate invariants for this configuration.
     ///
-    /// For dynamic ISTag providers it is not possible to validate non-emptiness
+    /// For dynamic `ISTag` providers it is not possible to validate non-emptiness
     /// at configuration time; perform validation when computing the value if needed.
     pub fn validate(&self) -> Result<(), String> {
         // No eager validation for dynamic ISTag; keep other invariants.

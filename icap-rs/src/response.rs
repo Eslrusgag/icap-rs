@@ -48,7 +48,7 @@ use tracing::{trace, warn};
 /// `ICAP/1.0 <code> <reason>`
 /// and obtain the numeric part via `as_str()` or `as_u16()`.
 ///
-/// ICAP-specific behavior (e.g., ISTag requirements for 2xx, `Encapsulated`
+/// ICAP-specific behavior (e.g., `ISTag` requirements for 2xx, `Encapsulated`
 /// rules for 204/2xx) is implemented elsewhere in this crate.
 ///
 /// # Examples
@@ -64,6 +64,7 @@ pub type StatusCode = http::StatusCode;
 /// Contains version string, status code and text, ICAP headers,
 /// and an optional body (such as encapsulated HTTP or chunked data).
 #[derive(Debug, Clone)]
+#[must_use]
 pub struct Response {
     /// ICAP protocol version (usually `"ICAP/1.0"`).
     pub version: String,
@@ -160,7 +161,7 @@ impl Response {
             .expect("invalid response header name or value")
     }
 
-    /// Set ISTag header with validation (length ≤32; unquoted must be HTTP token,
+    /// Set `ISTag` header with validation (length ≤32; unquoted must be HTTP token,
     /// quoted-string is accepted per RFC 3507/2616).
     /// Returns `Self` on success; otherwise `Error::InvalidISTag`.
     pub fn try_set_istag(mut self, istag: &str) -> IcapResult<Self> {
@@ -199,7 +200,7 @@ impl Response {
             validate_istag(s)?;
         }
 
-        let mut owned: Option<Response> = None;
+        let mut owned: Option<Self> = None;
 
         match self.status_code {
             StatusCode::NO_CONTENT => {
@@ -266,8 +267,7 @@ impl Response {
         }
 
         let resp_ref = owned.as_ref().unwrap_or(self);
-        crate::parser::serialize_icap_response(resp_ref)
-            .map_err(|e| Error::Serialization(e.to_string()))
+        Ok(crate::parser::serialize_icap_response(resp_ref))
     }
 
     /// Parse an ICAP response from raw bytes.
@@ -281,7 +281,7 @@ impl Response {
     }
 
     /// Return a read-only view of all ICAP headers.
-    pub fn headers(&self) -> &HeaderMap {
+    pub const fn headers(&self) -> &HeaderMap {
         &self.headers
     }
 
@@ -349,7 +349,7 @@ impl fmt::Display for Response {
             self.status_code.as_str(),
             self.status_text
         )?;
-        for (name, value) in self.headers.iter() {
+        for (name, value) in &self.headers {
             writeln!(
                 f,
                 "{}: {}",
@@ -373,7 +373,7 @@ fn compute_enc_for_res_body(body: &[u8]) -> IcapResult<String> {
     let hdr_end = find_double_crlf(body)
         .ok_or_else(|| Error::Header("embedded HTTP missing CRLFCRLF".into()))?;
     if body.len() > hdr_end {
-        Ok(format!("res-hdr=0, res-body={}", hdr_end))
+        Ok(format!("res-hdr=0, res-body={hdr_end}"))
     } else {
         Ok("res-hdr=0".to_string())
     }
@@ -383,7 +383,7 @@ fn compute_enc_for_req_body(body: &[u8]) -> IcapResult<String> {
     let hdr_end = find_double_crlf(body)
         .ok_or_else(|| Error::Header("embedded HTTP missing CRLFCRLF".into()))?;
     if body.len() > hdr_end {
-        Ok(format!("req-hdr=0, req-body={}", hdr_end))
+        Ok(format!("req-hdr=0, req-body={hdr_end}"))
     } else {
         Ok("req-hdr=0".to_string())
     }
@@ -417,16 +417,15 @@ fn parse_response_head_parts(raw: &[u8]) -> IcapResult<ParsedResponseHead> {
     }
 
     let version = parts[0].to_string();
-    let status_code = match StatusCode::from_str(parts[1]) {
-        Ok(code) => code,
-        Err(_) => {
-            let code_num = parts[1]
-                .parse::<u16>()
-                .map_err(|_| Error::InvalidStatusCode("Invalid status code".into()))?;
-            StatusCode::try_from(code_num).map_err(|_| {
-                Error::InvalidStatusCode(format!("Unknown ICAP status code: {}", code_num))
-            })?
-        }
+    let status_code = if let Ok(code) = StatusCode::from_str(parts[1]) {
+        code
+    } else {
+        let code_num = parts[1]
+            .parse::<u16>()
+            .map_err(|_| Error::InvalidStatusCode("Invalid status code".into()))?;
+        StatusCode::try_from(code_num).map_err(|_| {
+            Error::InvalidStatusCode(format!("Unknown ICAP status code: {code_num}"))
+        })?
     };
 
     let status_text = if parts.len() > 2 {
@@ -472,9 +471,8 @@ fn parse_response_head_parts(raw: &[u8]) -> IcapResult<ParsedResponseHead> {
     if !headers.contains_key("ISTag") {
         if require_istag {
             return Err(Error::MissingHeader("ISTag"));
-        } else {
-            warn!(code = %status_code, "response without ISTag on non-2xx (accepted for compatibility)");
         }
+        warn!(code = %status_code, "response without ISTag on non-2xx (accepted for compatibility)");
     }
 
     Ok(ParsedResponseHead {
@@ -790,7 +788,7 @@ mod rfc_tests {
     //! RFC 3507 conformance tests for ICAP **responses**.
     //! These tests assert behavior that follows the spec explicitly:
     //! - Status line & version (`ICAP/1.0` only), multi-word reason phrase
-    //! - ISTag (RFC 3507 §4.7): required for 2xx; ≤32 bytes; unquoted HTTP token
+    //! - `ISTag` (RFC 3507 §4.7): required for 2xx; ≤32 bytes; unquoted HTTP token
     //!   or quoted-string.
     //! - `Encapsulated` header constraints
     //! - 204 semantics (`null-body=0`, no body)
@@ -881,10 +879,9 @@ mod rfc_tests {
         // 2) integration with ICAP response parser
         let raw = format!(
             "ICAP/1.0 200 OK\r\n\
-         ISTag: {}\r\n\
+         ISTag: {value}\r\n\
          Encapsulated: null-body=0\r\n\
          \r\n",
-            value
         );
 
         match (ok, parse_icap_response(raw.as_bytes())) {

@@ -57,7 +57,7 @@ impl crate::client::tls::TlsConnector for RustlsConnector {
             .cached_client_cfg
             .get_or_init(|| build_client_config(&self.cfg).map(Arc::new))
             .as_ref()
-            .map_err(|e| e.clone())?;
+            .map_err(std::clone::Clone::clone)?;
 
         // Drive the handshake using tokio-rustls.
         let connector = TokioTlsConnector::from(Arc::clone(cfg));

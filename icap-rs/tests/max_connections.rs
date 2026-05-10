@@ -138,16 +138,14 @@ async fn returns_503_when_over_connection_limit() -> Result<(), io::Error> {
 
     assert!(
         start.starts_with("ICAP/1.0 503"),
-        "expected ICAP/1.0 503 status line, got:\n{}",
-        start
+        "expected ICAP/1.0 503 status line, got:\n{start}"
     );
 
     // Also check Encapsulated and absence of a body.
     let lower = text.to_ascii_lowercase();
     assert!(
         lower.contains("encapsulated: null-body=0"),
-        "expected 'Encapsulated: null-body=0' header, got:\n{}",
-        text
+        "expected 'Encapsulated: null-body=0' header, got:\n{text}"
     );
 
     Ok(())

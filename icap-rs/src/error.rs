@@ -61,7 +61,7 @@ pub enum Error {
     #[error("Invalid protocol version: {0}")]
     InvalidVersion(String),
 
-    /// Invalid ISTag header
+    /// Invalid `ISTag` header
     #[error("Invalid ISTag: {0}")]
     InvalidISTag(String),
 
@@ -183,51 +183,51 @@ where
 
 impl From<Utf8Error> for Error {
     fn from(e: Utf8Error) -> Self {
-        Error::HttpParse(e.to_string())
+        Self::HttpParse(e.to_string())
     }
 }
 impl From<FromUtf8Error> for Error {
     fn from(e: FromUtf8Error) -> Self {
-        Error::HttpParse(e.to_string())
+        Self::HttpParse(e.to_string())
     }
 }
 impl From<InvalidHeaderName> for Error {
     fn from(e: InvalidHeaderName) -> Self {
-        Error::Header(e.to_string())
+        Self::Header(e.to_string())
     }
 }
 impl From<InvalidHeaderValue> for Error {
     fn from(e: InvalidHeaderValue) -> Self {
-        Error::Header(e.to_string())
+        Self::Header(e.to_string())
     }
 }
 impl From<ToStrError> for Error {
     fn from(e: ToStrError) -> Self {
-        Error::Header(e.to_string())
+        Self::Header(e.to_string())
     }
 }
 impl From<InvalidUri> for Error {
     fn from(e: InvalidUri) -> Self {
-        Error::InvalidUri(e.to_string())
+        Self::InvalidUri(e.to_string())
     }
 }
 impl From<InvalidUriParts> for Error {
     fn from(e: InvalidUriParts) -> Self {
-        Error::InvalidUri(e.to_string())
+        Self::InvalidUri(e.to_string())
     }
 }
 impl From<InvalidMethod> for Error {
     fn from(e: InvalidMethod) -> Self {
-        Error::InvalidMethod(e.to_string())
+        Self::InvalidMethod(e.to_string())
     }
 }
 impl From<InvalidStatusCode> for Error {
     fn from(e: InvalidStatusCode) -> Self {
-        Error::InvalidStatusCode(e.to_string())
+        Self::InvalidStatusCode(e.to_string())
     }
 }
 impl From<HttpError> for Error {
     fn from(e: HttpError) -> Self {
-        Error::Unexpected(e.to_string())
+        Self::Unexpected(e.to_string())
     }
 }

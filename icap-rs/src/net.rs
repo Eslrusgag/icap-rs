@@ -12,7 +12,7 @@ use tokio::net::TcpStream;
 
 #[cfg(feature = "tls-rustls")]
 mod conn_def {
-    use super::*;
+    use super::{AsyncRead, AsyncWrite, TcpStream, pin_project};
 
     pin_project! {
         /// Transport connection when the rustls TLS backend is compiled in.
@@ -147,11 +147,11 @@ pub use conn_def::Conn;
 
 impl Conn {
     /// Returns mutable access to the underlying plain TCP stream when transport is non-TLS.
-    pub fn plain_mut(&mut self) -> Option<&mut TcpStream> {
+    pub const fn plain_mut(&mut self) -> Option<&mut TcpStream> {
         match self {
-            Conn::Plain { inner } => Some(inner),
+            Self::Plain { inner } => Some(inner),
             #[cfg(feature = "tls-rustls")]
-            Conn::Rustls { .. } => None,
+            Self::Rustls { .. } => None,
         }
     }
 }

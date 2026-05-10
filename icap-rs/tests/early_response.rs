@@ -96,8 +96,8 @@ async fn early_503_when_conn_limit_exceeded() {
                 panic!("client.send failed: {err}");
             }
             Ok(Err(err)) => panic!("client.send failed: {err}"),
-            Err(_) if Instant::now() < deadline => continue,
-            Err(_) => panic!("client.send timed out"),
+            Err(_) if Instant::now() < deadline => {}
+            Err(elapsed) => panic!("client.send timed out after {elapsed:?}"),
         }
     };
 
@@ -110,7 +110,7 @@ async fn early_503_when_conn_limit_exceeded() {
     let enc = resp
         .get_header("Encapsulated")
         .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_ascii_lowercase());
+        .map(str::to_ascii_lowercase);
     if let Some(v) = enc {
         assert_eq!(v, "null-body=0");
     }
@@ -133,7 +133,7 @@ async fn not_found_404_for_unknown_service() {
     if let Some(v) = resp
         .get_header("Encapsulated")
         .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_ascii_lowercase())
+        .map(str::to_ascii_lowercase)
     {
         assert_eq!(v, "null-body=0");
     }

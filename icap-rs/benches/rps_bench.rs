@@ -157,7 +157,9 @@ async fn run_raw_parallel_keepalive_once(
             let mut socket = socket.lock().await;
             socket.write_all(&wire).await?;
             socket.flush().await?;
-            read_icap_headers(&mut socket).await
+            let response = read_icap_headers(&mut socket).await;
+            drop(socket);
+            response
         });
     }
     while let Some(joined) = set.join_next().await {
@@ -167,7 +169,7 @@ async fn run_raw_parallel_keepalive_once(
     Ok(())
 }
 
-fn bench_client_rps(c: &mut Criterion, env: Arc<BenchEnv>) {
+fn bench_client_rps(c: &mut Criterion, env: &Arc<BenchEnv>) {
     let mut group = c.benchmark_group("client_rps");
     group.throughput(Throughput::Elements(1));
     group.bench_with_input(
@@ -185,7 +187,7 @@ fn bench_client_rps(c: &mut Criterion, env: Arc<BenchEnv>) {
     group.finish();
 }
 
-fn bench_server_rps(c: &mut Criterion, env: Arc<BenchEnv>) {
+fn bench_server_rps(c: &mut Criterion, env: &Arc<BenchEnv>) {
     let mut group = c.benchmark_group("server_rps");
     group.throughput(Throughput::Elements(1));
     group.bench_with_input(
@@ -210,7 +212,7 @@ fn bench_server_rps(c: &mut Criterion, env: Arc<BenchEnv>) {
     group.finish();
 }
 
-fn bench_server_rps_parallel(c: &mut Criterion, env: Arc<BenchEnv>) {
+fn bench_server_rps_parallel(c: &mut Criterion, env: &Arc<BenchEnv>) {
     let mut group = c.benchmark_group("server_rps_parallel");
     for &concurrency in CONCURRENCY_LEVELS {
         group.throughput(Throughput::Elements(concurrency as u64));
@@ -239,9 +241,9 @@ fn bench_server_rps_parallel(c: &mut Criterion, env: Arc<BenchEnv>) {
 
 fn rps_benches(c: &mut Criterion) {
     let env = Arc::new(BenchEnv::new());
-    bench_client_rps(c, Arc::clone(&env));
-    bench_server_rps(c, Arc::clone(&env));
-    bench_server_rps_parallel(c, env);
+    bench_client_rps(c, &env);
+    bench_server_rps(c, &env);
+    bench_server_rps_parallel(c, &env);
 }
 
 criterion_group!(benches, rps_benches);

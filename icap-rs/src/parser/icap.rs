@@ -9,7 +9,7 @@ use std::fmt::Write;
 
 /// Find end of ICAP header block (position after CRLFCRLF).
 #[inline]
-pub(crate) fn find_double_crlf(buf: &[u8]) -> Option<usize> {
+pub fn find_double_crlf(buf: &[u8]) -> Option<usize> {
     memchr::memmem::find(buf, b"\r\n\r\n").map(|i| i + 4)
 }
 
@@ -100,11 +100,10 @@ pub fn parse_encapsulated_header(headers_text: &str) -> IcapResult<Encapsulated>
     Ok(Encapsulated::default())
 }
 
-pub fn http_version_str(v: Version) -> &'static str {
+pub const fn http_version_str(v: Version) -> &'static str {
     match v {
         Version::HTTP_09 => "HTTP/0.9",
         Version::HTTP_10 => "HTTP/1.0",
-        Version::HTTP_11 => "HTTP/1.1",
         Version::HTTP_2 => "HTTP/2.0",
         Version::HTTP_3 => "HTTP/3.0",
         _ => "HTTP/1.1",
@@ -139,7 +138,7 @@ pub fn http_version_str(v: Version) -> &'static str {
 //     Ok(bytes)
 // }
 
-pub fn serialize_icap_response(resp: &Response) -> IcapResult<Vec<u8>> {
+pub fn serialize_icap_response(resp: &Response) -> Vec<u8> {
     let mut head = String::new();
     write!(
         &mut head,
@@ -149,7 +148,7 @@ pub fn serialize_icap_response(resp: &Response) -> IcapResult<Vec<u8>> {
         resp.status_text
     )
     .unwrap();
-    for (name, value) in resp.headers.iter() {
+    for (name, value) in &resp.headers {
         let canon = canon_icap_header(name.as_str());
         write!(
             &mut head,
@@ -163,18 +162,18 @@ pub fn serialize_icap_response(resp: &Response) -> IcapResult<Vec<u8>> {
 
     let mut out = head.into_bytes();
     if resp.body.is_empty() {
-        return Ok(out);
+        return out;
     }
 
     let size_line = format!("{:X}\r\n", resp.body.len());
     out.extend_from_slice(size_line.as_bytes());
     out.extend_from_slice(&resp.body);
     out.extend_from_slice(b"\r\n0\r\n\r\n");
-    Ok(out)
+    out
 }
 
 /// Return canonical ICAP header name (title-cased, with special-cases).
-/// Input should be lowercased (http::HeaderName::as_str() already is).
+/// Input should be lowercased (`http::HeaderName::as_str()` already is).
 pub fn canon_icap_header(name: &str) -> Cow<'_, str> {
     match name {
         // ICAP core / common headers

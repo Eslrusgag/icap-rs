@@ -50,14 +50,14 @@ pub enum AnyTlsConnector {
 
 impl AnyTlsConnector {
     /// Construct a non-TLS connector.
-    pub fn plain() -> Self {
-        AnyTlsConnector::Plain
+    pub const fn plain() -> Self {
+        Self::Plain
     }
 
     /// Construct a rustls connector (available when `tls-rustls` is enabled).
     #[cfg(feature = "tls-rustls")]
     pub fn rustls(cfg: rustls::RustlsConfig) -> Self {
-        AnyTlsConnector::Rustls(rustls::RustlsConnector::new(cfg))
+        Self::Rustls(rustls::RustlsConnector::new(cfg))
     }
 
     // /// Construct an OpenSSL connector (available when `tls-openssl` is enabled).
@@ -74,9 +74,9 @@ impl TlsConnector for AnyTlsConnector {
         let _ = server_name;
 
         match self {
-            AnyTlsConnector::Plain => Ok(Conn::Plain { inner: tcp }),
+            Self::Plain => Ok(Conn::Plain { inner: tcp }),
             #[cfg(feature = "tls-rustls")]
-            AnyTlsConnector::Rustls(c) => c.connect(tcp, server_name).await,
+            Self::Rustls(c) => c.connect(tcp, server_name).await,
             // #[cfg(feature = "tls-openssl")]
             // AnyTlsConnector::Openssl(c) => c.connect(tcp, server_name).await,
         }

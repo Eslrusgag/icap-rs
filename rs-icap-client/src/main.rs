@@ -20,7 +20,7 @@ use std::time::Duration;
 const BIN_NAME: &str = env!("CARGO_PKG_NAME");
 const BIN_VER: &str = env!("CARGO_PKG_VERSION");
 
-pub fn cli_styles() -> Styles {
+pub const fn cli_styles() -> Styles {
     Styles::styled()
         .usage(
             Style::new()
@@ -213,8 +213,7 @@ async fn main() -> IcapResult<()> {
         .await
         .ok()
         .and_then(|mut it| it.next())
-        .map(|sa| sa.ip().to_string())
-        .unwrap_or_else(|| "?".into());
+        .map_or_else(|| "?".into(), |sa| sa.ip().to_string());
 
     let ua = format!(
         "{}/{} (lib: icap-rs/{})",
@@ -379,10 +378,15 @@ async fn main() -> IcapResult<()> {
     if icap_method == "REQMOD" || icap_method == "RESPMOD" {
         if icap_method == "REQMOD" {
             // Build embedded HTTP request
-            let (host_hdr, uri) = match args.req_url.as_deref() {
-                Some(url) => (host_from_url(url).map(|s| s.to_string()), url.to_string()),
-                None => (Some("localhost".into()), "/rs-icap-client".into()),
-            };
+            let (host_hdr, uri) = args.req_url.as_deref().map_or_else(
+                || (Some("localhost".into()), "/rs-icap-client".into()),
+                |url| {
+                    (
+                        host_from_url(url).map(std::string::ToString::to_string),
+                        url.to_string(),
+                    )
+                },
+            );
 
             let body_vec = file_bytes.clone().unwrap_or_default();
             let use_post = !body_vec.is_empty() || file_len_opt.unwrap_or(0) > 0;
@@ -515,10 +519,7 @@ async fn output_response(
     response: IcapResponse,
 ) -> IcapResult<()> {
     if args.verbose {
-        println!(
-            "ICAP server:{}, ip:{}, port:{}\n",
-            server_host, server_ip, server_port
-        );
+        println!("ICAP server:{server_host}, ip:{server_ip}, port:{server_port}\n");
 
         if matches!(response.status_code, IcapStatus::NO_CONTENT) {
             println!("No modification needed (Allow 204 response)\n");

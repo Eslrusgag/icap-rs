@@ -8,7 +8,7 @@ use tokio::{
     task::JoinHandle,
 };
 
-pub fn options_200_wire() -> &'static [u8] {
+pub const fn options_200_wire() -> &'static [u8] {
     b"ICAP/1.0 200 OK\r\n\
       ISTag: x\r\n\
       Encapsulated: null-body=0\r\n\
@@ -86,11 +86,10 @@ async fn timeout_fires_when_server_is_too_slow() {
             assert_eq!(d.as_secs(), 1);
             assert!(
                 elapsed >= Duration::from_millis(900),
-                "returned too fast: {:?}",
-                elapsed
+                "returned too fast: {elapsed:?}"
             );
         }
-        other => panic!("expected timeout error, got: {:?}", other),
+        other => panic!("expected timeout error, got: {other:?}"),
     }
 }
 

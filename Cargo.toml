@@ -10,6 +10,8 @@ resolver = "3"
 edition = "2024"
 repository = "https://github.com/Eslrusgag/icap-rs"
 license = "MIT"
+keywords = ["icap", "proxy", "async"]
+categories = ["network-programming"]
 
 [workspace.dependencies]
 # Workspace crates
@@ -46,3 +48,20 @@ clap = "4.6.1"
 # Tests and benchmarks
 criterion = "0.8.2"
 rstest = "0.26.1"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+cargo = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+multiple_crate_versions = "allow"
+too_many_lines = "allow"
+struct_excessive_bools = "allow"

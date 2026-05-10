@@ -13,7 +13,7 @@ pub fn serialize_http_request(req: &HttpRequest<Vec<u8>>) -> Vec<u8> {
         http_version_str(req.version())
     )
     .unwrap();
-    for (name, value) in req.headers().iter() {
+    for (name, value) in req.headers() {
         write!(
             &mut out,
             "{}: {}\r\n",
@@ -40,7 +40,7 @@ pub fn serialize_http_response(resp: &HttpResponse<Vec<u8>>) -> Vec<u8> {
         code.canonical_reason().unwrap_or("")
     )
     .unwrap();
-    for (name, value) in resp.headers().iter() {
+    for (name, value) in resp.headers() {
         write!(
             &mut out,
             "{}: {}\r\n",

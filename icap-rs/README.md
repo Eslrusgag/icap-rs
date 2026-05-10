@@ -12,7 +12,7 @@ A Rust implementation of the **ICAP** protocol ([RFC 3507]) providing a client A
 
 - **Client**: functional — supports `OPTIONS`, `REQMOD`, `RESPMOD`, Preview (including `ieof`), embedded HTTP/1.x
   messages, streaming bodies, and optional connection reuse.
-- **Server**: per-service routing, automatic `OPTIONS` responses (with optional **dynamic ISTag**),
+- **Server**: per-service routing, automatic `OPTIONS` responses (with optional **dynamic `ISTag`**),
   duplicate-route detection, Preview handshake (`100 Continue` on non-`ieof` preview),
   strict `Encapsulated` validation, and an RFC-friendly **200 echo** fallback when `Allow: 204` is absent and
   `Preview` is not used.
@@ -36,7 +36,7 @@ A Rust implementation of the **ICAP** protocol ([RFC 3507]) providing a client A
 
 ## Client
 
-Builder-based configuration (host/port, keep-alive, default headers, timeouts).  
+Builder-based configuration (host/port, keep-alive, default headers, timeouts).\
 Generate exact wire bytes for debugging without sending.
 
 ### Quick start — `OPTIONS`
@@ -108,7 +108,7 @@ async fn main() -> icap_rs::error::IcapResult<()> {
 - **Routing per service**, with **one handler** able to serve multiple methods.
 - **Automatic `OPTIONS`** per service: `Methods` injected from registered routes; `Max-Connections` inherited from
   global limit.
-- **Dynamic ISTag provider**: `ServiceOptions::with_istag_provider` lets you compute `ISTag` per request (incl.
+- **Dynamic `ISTag` provider**: `ServiceOptions::with_istag_provider` lets you compute `ISTag` per request (incl.
   `OPTIONS`).
 - **RFC guard**: if the request has **no** `Allow: 204` and **no** `Preview`, the server **must not** reply `204`;
   it will automatically send `200 OK` and **echo back** the embedded HTTP message (request for `REQMOD`, response for

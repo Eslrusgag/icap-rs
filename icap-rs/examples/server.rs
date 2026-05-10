@@ -197,11 +197,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 fn can_return_204(h: &HeaderMap) -> bool {
     h.get("Allow")
         .and_then(|v| v.to_str().ok())
-        .map(|s| s.split(',').any(|p| p.trim().eq_ignore_ascii_case("204")))
-        .unwrap_or(false)
+        .is_some_and(|s| s.split(',').any(|p| p.trim().eq_ignore_ascii_case("204")))
 }
 
-/// Build a simple HTTP 403 page with a reason (as http::Response<Vec<u8>>).
+/// Build a simple HTTP 403 page with a reason (as `http::Response<Vec<u8>>`).
 fn build_block_403_http(reason: &str, istag: &str) -> HttpResponse<Vec<u8>> {
     let html = format!(
         r#"<!DOCTYPE html>
@@ -212,10 +211,9 @@ fn build_block_403_http(reason: &str, istag: &str) -> HttpResponse<Vec<u8>> {
 </head>
 <body>
   <h1>Blocked!</h1>
-  <p>{}</p>
+  <p>{reason}</p>
 </body>
 </html>"#,
-        reason
     );
 
     HttpResponse::builder()

@@ -31,15 +31,8 @@ fn icap_status_code(buf: &[u8]) -> Option<u16> {
 fn http_content_length(http_head: &[u8]) -> Option<usize> {
     let mut len: Option<usize> = None;
     for line in http_head.split(|&b| b == b'\n') {
-        let line = if let Some(b) = line.strip_suffix(b"\r") {
-            b
-        } else {
-            line
-        };
-        let lower = line
-            .iter()
-            .map(|c| c.to_ascii_lowercase())
-            .collect::<Vec<_>>();
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let lower = line.iter().map(u8::to_ascii_lowercase).collect::<Vec<_>>();
         if lower.starts_with(b"content-length:") {
             let v = &line[b"Content-Length:".len()..].trim_ascii();
             len = std::str::from_utf8(v).ok()?.trim().parse::<usize>().ok();
@@ -140,12 +133,11 @@ async fn icap_reqmod_with_preview(
     let req_body_off = http_head_bytes.len();
 
     let icap = format!(
-        "REQMOD icap://{}/{} ICAP/1.0\r\n\
-         Host: {}\r\n\
-         Encapsulated: req-hdr=0, req-body={}\r\n\
-         Preview: {}\r\n\
+        "REQMOD icap://{host_port}/{service} ICAP/1.0\r\n\
+         Host: {host_port}\r\n\
+         Encapsulated: req-hdr=0, req-body={req_body_off}\r\n\
+         Preview: {preview_n}\r\n\
          \r\n",
-        host_port, service, host_port, req_body_off, preview_n
     );
 
     stream
@@ -184,7 +176,7 @@ async fn icap_reqmod_with_preview(
         let mut tmp = [0u8; 8192];
         loop {
             match stream.read(&mut tmp).await {
-                Ok(0) => break,
+                Ok(0) | Err(_) => break,
                 Ok(n) => {
                     resp.extend_from_slice(&tmp[..n]);
                     if let Some(h_end) = find_double_crlf(&resp)
@@ -204,7 +196,6 @@ async fn icap_reqmod_with_preview(
                         }
                     }
                 }
-                Err(_) => break,
             }
         }
     })
@@ -214,8 +205,8 @@ async fn icap_reqmod_with_preview(
     if code == 100
         && let Some(h1) = find_double_crlf(&resp)
     {
-        let rest = &resp[h1 + 4..];
-        if let Some(c2) = icap_status_code(rest) {
+        let after_first_response = &resp[h1 + 4..];
+        if let Some(c2) = icap_status_code(after_first_response) {
             code = c2;
         }
     }
@@ -322,7 +313,7 @@ async fn preview_non_ieof_full_body_roundtrip() {
         let mut tmp = [0u8; 8192];
         loop {
             match stream.read(&mut tmp).await {
-                Ok(0) => break,
+                Ok(0) | Err(_) => break,
                 Ok(n) => {
                     resp.extend_from_slice(&tmp[..n]);
                     if let Some(h_end) = find_double_crlf(&resp)
@@ -342,7 +333,6 @@ async fn preview_non_ieof_full_body_roundtrip() {
                         }
                     }
                 }
-                Err(_) => break,
             }
         }
     })
@@ -381,8 +371,7 @@ async fn preview_non_ieof_requires_100_continue_before_remainder() {
     let tail = b"efghij";
     let total_len = preview.len() + tail.len();
     let http_head = format!(
-        "POST /upload HTTP/1.1\r\nHost: example.com\r\nContent-Length: {}\r\n\r\n",
-        total_len
+        "POST /upload HTTP/1.1\r\nHost: example.com\r\nContent-Length: {total_len}\r\n\r\n"
     );
     let req_body_off = http_head.len();
 

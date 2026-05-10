@@ -51,6 +51,7 @@ use tracing::trace;
 /// You can also generate the exact wire bytes
 /// without sending using [`Client::get_request`] / [`Client::get_request_wire`].
 #[derive(Debug, Clone)]
+#[must_use]
 pub struct Client {
     inner: Arc<ClientRef>,
 }
@@ -72,7 +73,7 @@ struct ClientRef {
 ///
 /// - [`ConnectionPolicy::Close`] — close the TCP connection after every request.
 /// - [`ConnectionPolicy::KeepAlive`] — keep a single idle connection and reuse it.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ConnectionPolicy {
     #[default]
     Close,
@@ -87,6 +88,7 @@ pub enum ConnectionPolicy {
 /// - no host/port are set until you call [`ClientBuilder::host`] / [`ClientBuilder::port`]
 ///   or [`ClientBuilder::with_uri`].
 #[derive(Debug)]
+#[must_use]
 pub struct ClientBuilder {
     host: Option<String>,
     port: Option<u16>,
@@ -117,7 +119,7 @@ impl ClientBuilder {
     }
 
     /// Set ICAP server TCP port (default 1344 if not set).
-    pub fn port(mut self, port: u16) -> Self {
+    pub const fn port(mut self, port: u16) -> Self {
         self.port = Some(port);
         self
     }
@@ -177,7 +179,7 @@ impl ClientBuilder {
     }
 
     /// Enable or disable connection reuse (keep-alive).
-    pub fn keep_alive(mut self, yes: bool) -> Self {
+    pub const fn keep_alive(mut self, yes: bool) -> Self {
         self.connection_policy = if yes {
             ConnectionPolicy::KeepAlive
         } else {
@@ -189,7 +191,7 @@ impl ClientBuilder {
     /// Set a read timeout for network operations.
     ///
     /// If `None`, operations have no explicit read timeout and rely on OS defaults.
-    pub fn read_timeout(mut self, dur: Option<Duration>) -> Self {
+    pub const fn read_timeout(mut self, dur: Option<Duration>) -> Self {
         self.read_timeout = dur;
         self
     }
@@ -224,7 +226,7 @@ impl ClientBuilder {
     }
 
     #[cfg(feature = "tls-rustls")]
-    pub fn use_rustls(mut self) -> Self {
+    pub const fn use_rustls(mut self) -> Self {
         self.tls_backend = Some(TlsBackend::Rustls);
         self
     }
@@ -244,7 +246,7 @@ impl ClientBuilder {
     /// Compatibility toggle for disabling certificate verification.
     ///
     /// With rustls 0.23 this is currently a no-op, kept for API compatibility.
-    pub fn danger_disable_cert_verify(mut self, yes: bool) -> Self {
+    pub const fn danger_disable_cert_verify(mut self, yes: bool) -> Self {
         self.danger_disable_verify = yes;
         self
     }
@@ -372,7 +374,8 @@ impl Client {
 
         let mut stream = match self.inner.connection_policy {
             ConnectionPolicy::KeepAlive => {
-                if let Some(s) = self.inner.idle_conn.lock().await.take() {
+                let idle = self.inner.idle_conn.lock().await.take();
+                if let Some(s) = idle {
                     s
                 } else {
                     self.inner.connect().await?
@@ -438,13 +441,12 @@ impl Client {
                 // read final response
                 let response_buf = self.read_response_buffer(&mut stream).await?;
                 return self.finalize_response(stream, response_buf).await;
-            } else {
-                // non-100 early final response
-                let response_buf = self
-                    .read_response_buffer_with_headers(&mut stream, hdr_buf)
-                    .await?;
-                return self.finalize_response(stream, response_buf).await;
             }
+            // non-100 early final response
+            let response_buf = self
+                .read_response_buffer_with_headers(&mut stream, hdr_buf)
+                .await?;
+            return self.finalize_response(stream, response_buf).await;
         }
 
         // Normal request: read response, parse, then decide reuse
@@ -482,7 +484,8 @@ impl Client {
 
         let mut stream = match self.inner.connection_policy {
             ConnectionPolicy::KeepAlive => {
-                if let Some(s) = self.inner.idle_conn.lock().await.take() {
+                let idle = self.inner.idle_conn.lock().await.take();
+                if let Some(s) = idle {
                     s
                 } else {
                     self.inner.connect().await?
@@ -559,7 +562,8 @@ impl Client {
     {
         let mut stream = match self.inner.connection_policy {
             ConnectionPolicy::KeepAlive => {
-                if let Some(s) = self.inner.idle_conn.lock().await.take() {
+                let idle = self.inner.idle_conn.lock().await.take();
+                if let Some(s) = idle {
                     s
                 } else {
                     self.inner.connect().await?
@@ -667,11 +671,10 @@ impl Client {
     where
         F: std::future::Future<Output = Result<T, Error>>,
     {
-        if let Some(d) = dur {
-            match timeout(d, fut).await {
-                Ok(res) => res,
-                Err(_) => Err(Error::ClientTimeout(d)),
-            }
+        if let Some(timeout_duration) = dur {
+            timeout(timeout_duration, fut)
+                .await
+                .unwrap_or_else(|_| Err(Error::ClientTimeout(timeout_duration)))
         } else {
             fut.await
         }
@@ -753,29 +756,30 @@ impl Client {
 
         // Encapsulated
         let (http_headers_bytes, http_body_bytes, enc_head_key, enc_body_key) = if req.is_mod() {
-            if let Some(ref emb) = req.embedded {
-                let (hdrs, body_from_emb) = serialize_embedded_http(emb);
-                let hdr_len = hdrs.len();
-                let (hdr_key, body_key) = match req.method.as_str() {
-                    "REQMOD" => ("req-hdr", "req-body"),
-                    _ => ("res-hdr", "res-body"),
-                };
-                let will_send_body = force_has_body || body_from_emb.is_some();
-                if will_send_body && !hdrs.is_empty() {
-                    (
-                        hdrs,
-                        body_from_emb,
-                        Some((hdr_key, hdr_len)),
-                        Some(body_key),
-                    )
-                } else if !hdrs.is_empty() {
-                    (hdrs, None, Some((hdr_key, 0usize)), None)
-                } else {
-                    (hdrs, None, None, None)
-                }
-            } else {
-                (Vec::new(), None, None, None)
-            }
+            req.embedded.as_ref().map_or_else(
+                || (Vec::new(), None, None, None),
+                |emb| {
+                    let (hdrs, body_from_emb) = serialize_embedded_http(emb);
+                    let hdr_len = hdrs.len();
+                    let (hdr_key, body_key) = match req.method.as_str() {
+                        "REQMOD" => ("req-hdr", "req-body"),
+                        _ => ("res-hdr", "res-body"),
+                    };
+                    let will_send_body = force_has_body || body_from_emb.is_some();
+                    if will_send_body && !hdrs.is_empty() {
+                        (
+                            hdrs,
+                            body_from_emb,
+                            Some((hdr_key, hdr_len)),
+                            Some(body_key),
+                        )
+                    } else if !hdrs.is_empty() {
+                        (hdrs, None, Some((hdr_key, 0usize)), None)
+                    } else {
+                        (hdrs, None, None, None)
+                    }
+                },
+            )
         } else {
             (Vec::new(), None, None, None)
         };
@@ -789,18 +793,17 @@ impl Client {
             req.allow_204,
             req.allow_206,
             req.preview_size,
-        )?;
+        );
         // Encapsulated last + CRLF
         if let Some((hdr_key, hdr_len)) = enc_head_key {
             if let Some(body_key) = enc_body_key {
                 write!(
                     &mut out,
-                    "Encapsulated: {}=0, {}={}\r\n",
-                    hdr_key, body_key, hdr_len
+                    "Encapsulated: {hdr_key}=0, {body_key}={hdr_len}\r\n"
                 )
                 .map_err(Error::Network)?;
             } else {
-                write!(&mut out, "Encapsulated: {}=0\r\n", hdr_key).map_err(Error::Network)?;
+                write!(&mut out, "Encapsulated: {hdr_key}=0\r\n").map_err(Error::Network)?;
             }
         } else {
             out.extend_from_slice(b"Encapsulated: null-body=0\r\n");
@@ -817,7 +820,7 @@ impl Client {
             && let Some(body_now) = http_body_bytes
         {
             let (bytes, expect_continue, remaining) =
-                build_preview_and_chunks(req.preview_size, body_now, preview0_ieof)?;
+                build_preview_and_chunks(req.preview_size, body_now, preview0_ieof);
             out.extend_from_slice(&bytes);
             return Ok(BuiltIcap {
                 bytes: out,
@@ -866,7 +869,6 @@ impl Client {
                         let _ = read_icap_body_if_any(stream, &mut buf).await;
                         return parse_icap_response(&buf).map(Some);
                     }
-                    continue;
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     return Ok(None);
@@ -883,8 +885,7 @@ impl ClientRef {
         // Priority order for SNI selection: user-provided SNI → host_override → host
         let sni = self
             .sni_hostname
-            .as_ref()
-            .cloned()
+            .clone()
             .or_else(|| self.host_override.clone())
             .unwrap_or_else(|| self.host.clone());
         self.tls.connect(tcp, &sni).await
@@ -1077,7 +1078,7 @@ fn append_to_allow(headers: &mut HeaderMap, code: &str) {
 }
 
 #[inline]
-fn is_virtual_icap_header(name: &str) -> bool {
+const fn is_virtual_icap_header(name: &str) -> bool {
     name.eq_ignore_ascii_case("host")
         || name.eq_ignore_ascii_case("encapsulated")
         || name.eq_ignore_ascii_case("allow")
@@ -1092,7 +1093,7 @@ fn write_icap_headers(
     allow_204: bool,
     allow_206: bool,
     preview_size: Option<usize>,
-) -> IcapResult<()> {
+) {
     // Host is always emitted; request-level Host overrides computed host.
     out.extend_from_slice(canon_icap_header("host").as_bytes());
     out.extend_from_slice(b": ");
@@ -1103,10 +1104,10 @@ fn write_icap_headers(
     }
     out.extend_from_slice(b"\r\n");
 
-    let req_names: HashSet<&str> = req_headers.keys().map(|n| n.as_str()).collect();
+    let req_names: HashSet<&str> = req_headers.keys().map(http::HeaderName::as_str).collect();
 
     // Default headers first, unless overridden by request-level headers.
-    for (name, value) in default_headers.iter() {
+    for (name, value) in default_headers {
         let key = name.as_str();
         if is_virtual_icap_header(key) || req_names.contains(key) {
             continue;
@@ -1119,7 +1120,7 @@ fn write_icap_headers(
     }
 
     // Request-level headers override defaults.
-    for (name, value) in req_headers.iter() {
+    for (name, value) in req_headers {
         let key = name.as_str();
         if is_virtual_icap_header(key) {
             continue;
@@ -1193,8 +1194,6 @@ fn write_icap_headers(
         out.extend_from_slice(v.as_bytes());
         out.extend_from_slice(b"\r\n");
     }
-
-    Ok(())
 }
 
 fn response_wants_close(resp: &Response) -> bool {
@@ -1207,6 +1206,26 @@ fn response_wants_close(resp: &Response) -> bool {
     };
 
     s.split(',').any(|t| t.trim().eq_ignore_ascii_case("close"))
+}
+
+const CRLFCRLF: u32 = 0x0D0A_0D0A;
+
+fn parse_status_code_from_status_line(line: &[u8]) -> Option<u16> {
+    let sp1 = line.iter().position(|&b| b == b' ')?;
+    let mut i = sp1;
+    while i < line.len() && line[i] == b' ' {
+        i += 1;
+    }
+    if i + 3 > line.len() {
+        return None;
+    }
+    let d0 = line[i];
+    let d1 = line[i + 1];
+    let d2 = line[i + 2];
+    if !d0.is_ascii_digit() || !d1.is_ascii_digit() || !d2.is_ascii_digit() {
+        return None;
+    }
+    Some(u16::from(d0 - b'0') * 100 + u16::from(d1 - b'0') * 10 + u16::from(d2 - b'0'))
 }
 
 async fn read_icap_headers<S>(stream: &mut S) -> IcapResult<(u16, Vec<u8>)>
@@ -1222,27 +1241,7 @@ where
     let mut code: Option<u16> = None;
 
     let mut win: u32 = 0;
-    const CRLFCRLF: u32 = 0x0D0A0D0A;
-
     let mut prev: Option<u8> = None;
-
-    fn parse_status_code_from_status_line(line: &[u8]) -> Option<u16> {
-        let sp1 = line.iter().position(|&b| b == b' ')?;
-        let mut i = sp1;
-        while i < line.len() && line[i] == b' ' {
-            i += 1;
-        }
-        if i + 3 > line.len() {
-            return None;
-        }
-        let d0 = line[i];
-        let d1 = line[i + 1];
-        let d2 = line[i + 2];
-        if !d0.is_ascii_digit() || !d1.is_ascii_digit() || !d2.is_ascii_digit() {
-            return None;
-        }
-        Some((d0 - b'0') as u16 * 100 + (d1 - b'0') as u16 * 10 + (d2 - b'0') as u16)
-    }
 
     loop {
         let n = AsyncReadExt::read(stream, &mut tmp)
@@ -1294,7 +1293,7 @@ where
                     }
                 }
 
-                win = (win << 8) | (b as u32);
+                win = (win << 8) | u32::from(b);
                 if hdr_end.is_none() && win == CRLFCRLF {
                     hdr_end = Some(i - 3);
                 }
@@ -1345,7 +1344,7 @@ fn build_preview_and_chunks(
     preview_size: Option<usize>,
     body: Vec<u8>,
     preview0_ieof: bool,
-) -> IcapResult<(Vec<u8>, bool, Option<Vec<u8>>)> {
+) -> (Vec<u8>, bool, Option<Vec<u8>>) {
     let mut out = Vec::new();
     match preview_size {
         None => {
@@ -1353,20 +1352,20 @@ fn build_preview_and_chunks(
                 write_chunk_into(&mut out, &body);
             }
             out.extend_from_slice(b"0\r\n\r\n");
-            Ok((out, false, None))
+            (out, false, None)
         }
         Some(0) => {
             if body.is_empty() {
                 if preview0_ieof {
                     out.extend_from_slice(b"0; ieof\r\n\r\n");
-                    Ok((out, false, None))
+                    (out, false, None)
                 } else {
                     out.extend_from_slice(b"0\r\n\r\n");
-                    Ok((out, true, Some(Vec::new())))
+                    (out, true, Some(Vec::new()))
                 }
             } else {
                 out.extend_from_slice(b"0\r\n\r\n");
-                Ok((out, true, Some(body)))
+                (out, true, Some(body))
             }
         }
         Some(ps) => {
@@ -1377,10 +1376,10 @@ fn build_preview_and_chunks(
             let rest = body.len().saturating_sub(send_n);
             if rest == 0 {
                 out.extend_from_slice(b"0; ieof\r\n\r\n");
-                Ok((out, false, None))
+                (out, false, None)
             } else {
                 out.extend_from_slice(b"0\r\n\r\n");
-                Ok((out, true, Some(body[send_n..].to_vec())))
+                (out, true, Some(body[send_n..].to_vec()))
             }
         }
     }
@@ -1409,7 +1408,7 @@ mod tests {
         let needle = format!("{}:", name_ci.to_ascii_lowercase());
         hdrs.lines()
             .find(|l| l.to_ascii_lowercase().starts_with(&needle))
-            .map(|s| s.to_string())
+            .map(std::string::ToString::to_string)
     }
 
     #[fixture]
@@ -1440,7 +1439,7 @@ mod tests {
             let _ = s.flush().await;
         }
         if keep_open {
-            let _ = future::pending::<()>().await;
+            let () = future::pending::<()>().await;
         }
     }
 
@@ -1460,8 +1459,8 @@ mod tests {
     ) {
         match (parse_authority_with_scheme(input), expected) {
             (Ok((h, p, t)), Ok((eh, ep, et))) => assert_eq!((h, p, t), (eh, ep, et)),
-            (Err(_), Err(_)) => {}
-            other => panic!("mismatch: {:?}", other),
+            (Err(_), Err(())) => {}
+            other => panic!("mismatch: {other:?}"),
         }
     }
 
@@ -1503,7 +1502,7 @@ mod tests {
         #[case] rest: Option<&[u8]>,
     ) {
         let (bytes, got_expect_continue, rest_opt) =
-            build_preview_and_chunks(preview, body.to_vec(), ieof).unwrap();
+            build_preview_and_chunks(preview, body.to_vec(), ieof);
 
         assert!(bytes.starts_with(expected_prefix));
         assert_eq!(got_expect_continue, expect_continue);
@@ -1511,7 +1510,7 @@ mod tests {
         match (rest_opt.as_deref(), rest) {
             (None, None) => {}
             (Some(a), Some(b)) => assert_eq!(a, b),
-            other => panic!("rest mismatch: {:?}", other),
+            other => panic!("rest mismatch: {other:?}"),
         }
     }
 
@@ -1628,7 +1627,7 @@ mod tests {
     }
 
     /// 1) 404 + single CRLF, connection kept open.
-    /// Expectation: read_icap_headers returns quickly with code=404 and buffer normalized to CRLFCRLF.
+    /// Expectation: `read_icap_headers` returns quickly with code=404 and buffer normalized to CRLFCRLF.
     #[tokio::test]
     async fn error_404_single_crlf_kept_open_returns_quickly() {
         let (mut client, server) = connect_pair().await;
@@ -1663,7 +1662,7 @@ mod tests {
 
         assert_eq!(code, 404);
         assert!(buf.ends_with(b"\r\n\r\n"));
-        let text = String::from_utf8(buf.clone()).unwrap();
+        let text = String::from_utf8(buf).unwrap();
         assert!(text.contains("ISTag: x"));
         assert!(text.contains("Date: "));
     }
@@ -1684,7 +1683,7 @@ mod tests {
 
         assert_eq!(code, 404);
         assert!(buf.ends_with(b"\r\n\r\n"), "normalized to CRLFCRLF on EOF");
-        let text = String::from_utf8(buf.clone()).unwrap();
+        let text = String::from_utf8(buf).unwrap();
         assert!(
             text.contains("ISTag: y"),
             "header bytes should be preserved"

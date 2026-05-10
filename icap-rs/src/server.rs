@@ -158,7 +158,7 @@ impl Server {
     /// - Accepts TCP connections and enforces an optional global limit (semaphore).
     ///   If the limit is reached, send an early `ICAP/1.0 503 Service Unavailable`
     ///   with `Connection: close`; `to_raw()` auto-adds `Encapsulated: null-body=0`
-    ///   (no ISTag on errors). Set `SO_LINGER(1s)`, non-blocking `try_read` drain,
+    ///   (no `ISTag` on errors). Set `SO_LINGER(1s)`, non-blocking `try_read` drain,
     ///   then drop the socket (graceful FIN, fewer RSTs).
     /// - Otherwise, move the permit into a spawned task and call `handle_connection(...)`
     ///   which reads full ICAP messages (incl. chunked bodies) and dispatches to
@@ -172,14 +172,14 @@ impl Server {
             let (socket, addr) = self.listener.accept().await?;
             trace!(client=%addr, "new connection");
 
-            let (permit_opt, over_limit) = if let Some(sem) = &self.conn_limit {
-                match sem.clone().try_acquire_owned() {
-                    Ok(p) => (Some(p), false),
-                    Err(_) => (None, true),
-                }
-            } else {
-                (None, false)
-            };
+            let (permit_opt, over_limit) = self.conn_limit.as_ref().map_or_else(
+                || (None, false),
+                |sem| {
+                    sem.clone()
+                        .try_acquire_owned()
+                        .map_or_else(|_| (None, true), |p| (Some(p), false))
+                },
+            );
 
             let routes = Arc::clone(&self.routes);
             let aliases = Arc::clone(&self.aliases);
@@ -278,11 +278,7 @@ impl Server {
         default_service: Option<&'a str>,
     ) -> Cow<'a, str> {
         let mut cur: Cow<'a, str> = if raw.is_empty() || raw == "/" {
-            if let Some(def) = default_service {
-                Cow::Borrowed(def)
-            } else {
-                Cow::Borrowed(raw)
-            }
+            default_service.map_or(Cow::Borrowed(raw), Cow::Borrowed)
         } else {
             Cow::Borrowed(raw)
         };
@@ -371,7 +367,9 @@ impl Server {
                         dechunk_icap_entity_with_ieof(&mut preview_slice)
                             .map_err(|e| format!("dechunk ICAP preview entity: {e}"))?;
 
-                    if !preview_ieof {
+                    if preview_ieof {
+                        msg_end = preview_end;
+                    } else {
                         socket.write_all(b"ICAP/1.0 100 Continue\r\n\r\n").await?;
                         socket.flush().await?;
 
@@ -382,8 +380,6 @@ impl Server {
                             .map_err(|e| format!("dechunk ICAP remainder entity: {e}"))?;
                         decoded.extend_from_slice(&rest_decoded);
                         msg_end = rest_end;
-                    } else {
-                        msg_end = preview_end;
                     }
 
                     let decoded_len = decoded.len();
@@ -426,97 +422,90 @@ impl Server {
             );
 
             let resp = if let Some(entry) = routes.get(service_resolved.as_ref()) {
-                match method {
-                    Method::Options => {
-                        let mut allowed: SmallVec<Method, 2> =
-                            entry.handlers.keys().copied().collect();
-                        allowed.sort_unstable();
-                        let mut cfg = if let Some(cfg) = &entry.options {
-                            cfg.clone()
-                        } else {
+                if method == Method::Options {
+                    let mut allowed: SmallVec<Method, 2> = entry.handlers.keys().copied().collect();
+                    allowed.sort_unstable();
+                    let mut cfg = entry.options.as_ref().map_or_else(
+                        || {
                             ServiceOptions::new()
-                                .with_static_istag(&format!("{}-default-1.0", service_resolved))
+                                .with_static_istag(&format!("{service_resolved}-default-1.0"))
                                 .with_options_ttl(3600)
                                 .add_allow("204")
-                        };
-                        cfg.set_methods(allowed);
-                        if cfg.service.is_none() {
-                            cfg = cfg.with_service(&format!(
-                                "ICAP Service {}",
-                                service_resolved.as_ref()
-                            ));
-                        }
-                        if let (Some(n), None) = (advertised_max_conn, cfg.max_connections) {
-                            cfg.with_max_connections(n);
-                        }
-                        cfg.build_response_for(&req)
+                        },
+                        Clone::clone,
+                    );
+                    cfg.set_methods(allowed);
+                    if cfg.service.is_none() {
+                        cfg = cfg
+                            .with_service(&format!("ICAP Service {}", service_resolved.as_ref()));
                     }
-                    _ => {
-                        let allow_204 = req
-                            .icap_headers
-                            .get("Allow")
-                            .and_then(|v| v.to_str().ok())
-                            .map(|s| s.split(',').any(|t| t.trim() == "204"))
-                            .unwrap_or(false);
-                        let has_preview = req.icap_headers.get("Preview").is_some();
+                    if let (Some(n), None) = (advertised_max_conn, cfg.max_connections) {
+                        cfg.with_max_connections(n);
+                    }
+                    cfg.build_response_for(&req)
+                } else {
+                    let allow_204 = req
+                        .icap_headers
+                        .get("Allow")
+                        .and_then(|v| v.to_str().ok())
+                        .is_some_and(|s| s.split(',').any(|t| t.trim() == "204"));
+                    let has_preview = req.icap_headers.get("Preview").is_some();
 
-                        if !allow_204 && !has_preview {
-                            let istag_now = entry
-                                .options
-                                .as_ref()
-                                .map(|opts| opts.istag_for(&req))
-                                .unwrap_or_else(|| format!("{}-default-1.0", service_resolved));
+                    if !allow_204 && !has_preview {
+                        let istag_now = entry.options.as_ref().map_or_else(
+                            || format!("{service_resolved}-default-1.0"),
+                            |opts| opts.istag_for(&req),
+                        );
 
-                            let mut out =
-                                Response::new(StatusCode::OK, "OK").try_set_istag(&istag_now)?;
+                        let mut out =
+                            Response::new(StatusCode::OK, "OK").try_set_istag(&istag_now)?;
 
-                            match (&req.embedded, method) {
-                                (
-                                    Some(EmbeddedHttp::Resp {
-                                        head,
-                                        body: Body::Full { reader },
-                                    }),
-                                    Method::RespMod,
-                                ) => {
-                                    let mut builder = http::Response::builder()
-                                        .status(head.status())
-                                        .version(head.version());
-                                    if let Some(h) = builder.headers_mut() {
-                                        h.extend(head.headers().clone());
-                                    }
-                                    let http_resp = builder.body(reader.clone()).map_err(|e| {
-                                        format!("build http::Response from embedded: {e}")
-                                    })?;
-                                    out = out.with_http_response(&http_resp)?;
+                        match (&req.embedded, method) {
+                            (
+                                Some(EmbeddedHttp::Resp {
+                                    head,
+                                    body: Body::Full { reader },
+                                }),
+                                Method::RespMod,
+                            ) => {
+                                let mut builder = http::Response::builder()
+                                    .status(head.status())
+                                    .version(head.version());
+                                if let Some(h) = builder.headers_mut() {
+                                    h.extend(head.headers().clone());
                                 }
-                                (
-                                    Some(EmbeddedHttp::Req {
-                                        head,
-                                        body: Body::Full { reader },
-                                    }),
-                                    Method::ReqMod,
-                                ) => {
-                                    let mut builder = http::Request::builder()
-                                        .method(head.method().clone())
-                                        .uri(head.uri().clone())
-                                        .version(head.version());
-                                    if let Some(h) = builder.headers_mut() {
-                                        h.extend(head.headers().clone());
-                                    }
-                                    let http_req = builder.body(reader.clone()).map_err(|e| {
-                                        format!("build http::Request from embedded: {e}")
-                                    })?;
-                                    out = out.with_http_request(&http_req)?;
-                                }
-                                _ => {}
+                                let http_resp = builder.body(reader.clone()).map_err(|e| {
+                                    format!("build http::Response from embedded: {e}")
+                                })?;
+                                out = out.with_http_response(&http_resp)?;
                             }
-
-                            out
-                        } else if let Some(h) = entry.handlers.get(&method) {
-                            h(req).await?
-                        } else {
-                            Response::new(StatusCode::METHOD_NOT_ALLOWED, "Method Not Allowed")
+                            (
+                                Some(EmbeddedHttp::Req {
+                                    head,
+                                    body: Body::Full { reader },
+                                }),
+                                Method::ReqMod,
+                            ) => {
+                                let mut builder = http::Request::builder()
+                                    .method(head.method().clone())
+                                    .uri(head.uri().clone())
+                                    .version(head.version());
+                                if let Some(h) = builder.headers_mut() {
+                                    h.extend(head.headers().clone());
+                                }
+                                let http_req = builder.body(reader.clone()).map_err(|e| {
+                                    format!("build http::Request from embedded: {e}")
+                                })?;
+                                out = out.with_http_request(&http_req)?;
+                            }
+                            _ => {}
                         }
+
+                        out
+                    } else if let Some(h) = entry.handlers.get(&method) {
+                        h(req).await?
+                    } else {
+                        Response::new(StatusCode::METHOD_NOT_ALLOWED, "Method Not Allowed")
                     }
                 }
             } else if method == Method::Options {
@@ -561,7 +550,7 @@ impl Server {
         let mut cfg = ServiceOptions::new().with_static_istag(service_name);
 
         cfg.set_methods([Method::RespMod]);
-        cfg = cfg.with_service(&format!("ICAP Service {}", service_name));
+        cfg = cfg.with_service(&format!("ICAP Service {service_name}"));
 
         if let Some(n) = advertised_max {
             cfg.with_max_connections(n);
@@ -589,9 +578,7 @@ fn dechunk_icap_entity(data: &mut &[u8]) -> Result<Vec<u8>, String> {
         d = &rest[2..];
 
         // Strip optional chunk extensions starting with ';'
-        let size_hex = memchr(b';', size_line)
-            .map(|i| &size_line[..i])
-            .unwrap_or(size_line);
+        let size_hex = memchr(b';', size_line).map_or(size_line, |i| &size_line[..i]);
 
         let size_str = core::str::from_utf8(size_hex).map_err(|_| "chunk size not utf8")?;
         let size = usize::from_str_radix(size_str.trim(), 16).map_err(|_| "chunk size not hex")?;
@@ -645,21 +632,18 @@ where
     S: AsyncRead + Unpin,
 {
     loop {
-        match parse_one_chunk_meta(buf, pos)? {
-            Some((next_pos, is_zero, has_ieof, _size)) => {
-                if is_zero {
-                    return Ok((next_pos, has_ieof));
-                }
-                pos = next_pos;
+        if let Some((next_pos, is_zero, has_ieof, _size)) = parse_one_chunk_meta(buf, pos)? {
+            if is_zero {
+                return Ok((next_pos, has_ieof));
             }
-            None => {
-                let mut tmp = [0u8; 4096];
-                let n = stream.read(&mut tmp).await?;
-                if n == 0 {
-                    return Err("Unexpected EOF while reading ICAP preview body".into());
-                }
-                buf.extend_from_slice(&tmp[..n]);
+            pos = next_pos;
+        } else {
+            let mut tmp = [0u8; 4096];
+            let n = stream.read(&mut tmp).await?;
+            if n == 0 {
+                return Err("Unexpected EOF while reading ICAP preview body".into());
             }
+            buf.extend_from_slice(&tmp[..n]);
         }
     }
 }
@@ -680,11 +664,9 @@ fn parse_one_chunk_meta(
     let size_line = &buf[from..line_end];
     let after_size = line_end + 2;
 
-    let (size_hex, ext_part) = if let Some(i) = memchr(b';', size_line) {
+    let (size_hex, ext_part) = memchr(b';', size_line).map_or((size_line, None), |i| {
         (&size_line[..i], Some(&size_line[i + 1..]))
-    } else {
-        (size_line, None)
-    };
+    });
 
     let size_str = std::str::from_utf8(size_hex)
         .map_err(|_| "chunk size not utf8".to_string())?
@@ -693,8 +675,7 @@ fn parse_one_chunk_meta(
 
     let has_ieof = ext_part
         .and_then(|b| std::str::from_utf8(b).ok())
-        .map(|s| s.split(';').any(|t| t.trim().eq_ignore_ascii_case("ieof")))
-        .unwrap_or(false);
+        .is_some_and(|s| s.split(';').any(|t| t.trim().eq_ignore_ascii_case("ieof")));
 
     if size == 0 {
         if buf.len() < after_size + 2 {
@@ -724,19 +705,15 @@ fn dechunk_icap_entity_with_ieof(data: &mut &[u8]) -> Result<(Vec<u8>, bool), St
         let line = &d[..rel];
         d = &d[rel + 2..];
 
-        let (size_hex, ext_part) = if let Some(i) = memchr(b';', line) {
-            (&line[..i], Some(&line[i + 1..]))
-        } else {
-            (line, None)
-        };
+        let (size_hex, ext_part) =
+            memchr(b';', line).map_or((line, None), |i| (&line[..i], Some(&line[i + 1..])));
 
         let size_str = std::str::from_utf8(size_hex).map_err(|_| "chunk size not utf8")?;
         let size = usize::from_str_radix(size_str.trim(), 16).map_err(|_| "chunk size not hex")?;
 
         let has_ieof = ext_part
             .and_then(|b| std::str::from_utf8(b).ok())
-            .map(|s| s.split(';').any(|t| t.trim().eq_ignore_ascii_case("ieof")))
-            .unwrap_or(false);
+            .is_some_and(|s| s.split(';').any(|t| t.trim().eq_ignore_ascii_case("ieof")));
 
         if size == 0 {
             if d.starts_with(b"\r\n") {
@@ -778,6 +755,7 @@ struct TlsParams {
 /// Duplicate registration of the **same (service, method)** panics with a clear error,
 /// like axum.
 #[derive(Default)]
+#[must_use]
 pub struct ServerBuilder {
     bind_addr: Option<String>,
     routes: HashMap<String, RouteEntry>,
@@ -961,17 +939,15 @@ impl ServerBuilder {
         for item in methods {
             let m: Method = item.into();
 
-            if m == Method::Options {
-                panic!(
-                    "OPTIONS cannot have a handler; it's answered automatically for '{service}'"
-                );
-            }
-            if entry.handlers.contains_key(&m) {
-                panic!(
-                    "Overlapping method route. Handler for '{} {service}' already exists",
-                    m
-                );
-            }
+            assert_ne!(
+                m,
+                Method::Options,
+                "OPTIONS cannot have a handler; it's answered automatically for '{service}'"
+            );
+            assert!(
+                !entry.handlers.contains_key(&m),
+                "Overlapping method route. Handler for '{m} {service}' already exists"
+            );
 
             let h_clone = h_arc.clone();
             let h: RequestHandler = Box::new(move |req| Box::pin(h_clone(req)));
@@ -980,9 +956,10 @@ impl ServerBuilder {
 
         // Attach options if provided for this route
         if let Some(cfg) = options {
-            if entry.options.is_some() {
-                panic!("Options already set for service '{service}'");
-            }
+            assert!(
+                entry.options.is_none(),
+                "Options already set for service '{service}'"
+            );
             entry.options = Some(cfg);
         }
 
@@ -1225,15 +1202,13 @@ mod tests {
     fn panic_str(res: Result<(), Box<dyn std::any::Any + Send>>) -> String {
         match res {
             Ok(()) => String::new(),
-            Err(e) => {
-                if let Some(s) = e.downcast_ref::<&str>() {
-                    (*s).to_string()
-                } else if let Some(s) = e.downcast_ref::<String>() {
-                    s.clone()
-                } else {
-                    "<non-string panic>".to_string()
-                }
-            }
+            Err(e) => e.downcast_ref::<&str>().map_or_else(
+                || {
+                    e.downcast_ref::<String>()
+                        .map_or_else(|| "<non-string panic>".to_string(), Clone::clone)
+                },
+                |s| (*s).to_string(),
+            ),
         }
     }
 
@@ -1243,13 +1218,11 @@ mod tests {
     {
         let res = catch_unwind(AssertUnwindSafe(f));
         assert!(res.is_err(), "expected panic, but code did not panic");
-        let msg = panic_str(res.map(|_| ()));
+        let msg = panic_str(res);
         for n in needles {
             assert!(
                 msg.contains(n),
-                "expected panic message to contain {:?}, got: {}",
-                n,
-                msg
+                "expected panic message to contain {n:?}, got: {msg}",
             );
         }
     }

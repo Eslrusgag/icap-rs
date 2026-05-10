@@ -91,9 +91,9 @@ impl Method {
     #[inline]
     pub const fn as_str(&self) -> &'static str {
         match self {
-            Method::ReqMod => "REQMOD",
-            Method::RespMod => "RESPMOD",
-            Method::Options => "OPTIONS",
+            Self::ReqMod => "REQMOD",
+            Self::RespMod => "RESPMOD",
+            Self::Options => "OPTIONS",
         }
     }
 }
@@ -112,11 +112,11 @@ impl FromStr for Method {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let t = s.trim();
         if t.eq_ignore_ascii_case("REQMOD") {
-            Ok(Method::ReqMod)
+            Ok(Self::ReqMod)
         } else if t.eq_ignore_ascii_case("RESPMOD") {
-            Ok(Method::RespMod)
+            Ok(Self::RespMod)
         } else if t.eq_ignore_ascii_case("OPTIONS") {
-            Ok(Method::Options)
+            Ok(Self::Options)
         } else {
             Err("Unknown ICAP method string")
         }
@@ -176,7 +176,7 @@ pub struct Remainder<R> {
 }
 
 impl<R> Remainder<R> {
-    pub fn new(reader: R, cont: Option<ContinueHandle>) -> Self {
+    pub const fn new(reader: R, cont: Option<ContinueHandle>) -> Self {
         Self { reader, cont }
     }
     pub async fn continue_if_needed(&mut self) -> IcapResult<()> {
@@ -195,7 +195,7 @@ impl<R> fmt::Debug for Remainder<R> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Remainder")
             .field("cont_present", &self.cont.is_some())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -221,9 +221,9 @@ pub enum Body<R> {
 impl<R> fmt::Debug for Body<R> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Body::Empty => f.write_str("Body::Empty"),
-            Body::Full { .. } => f.write_str("Body::Full"),
-            Body::Preview {
+            Self::Empty => f.write_str("Body::Empty"),
+            Self::Full { .. } => f.write_str("Body::Full"),
+            Self::Preview {
                 bytes,
                 ieof,
                 remainder,
@@ -240,7 +240,7 @@ impl<R> fmt::Debug for Body<R> {
 /// Trait-object body reader used by the server side for streaming.
 pub type BodyRead = Box<dyn AsyncRead + Unpin + Send>;
 
-/// An in-memory, non-blocking reader over bytes (used to feed preview bytes into AsyncRead).
+/// An in-memory, non-blocking reader over bytes (used to feed preview bytes into `AsyncRead`).
 struct CursorReader<T>(std::io::Cursor<T>);
 
 impl<T: AsRef<[u8]> + Unpin> AsyncRead for CursorReader<T> {
@@ -359,20 +359,18 @@ pub(crate) fn serialize_embedded_http(e: &EmbeddedHttp<Vec<u8>>) -> (Vec<u8>, Op
         EmbeddedHttp::Req { head, body } => {
             let head_bytes = serialize_http_request_head(head);
             let body_bytes = match body {
-                Body::Empty => None,
                 Body::Full { reader } if reader.is_empty() => None,
                 Body::Full { reader } => Some(reader.clone()),
-                Body::Preview { .. } => None, // client shouldn't serialize Preview
+                Body::Empty | Body::Preview { .. } => None, // client shouldn't serialize Preview
             };
             (head_bytes, body_bytes)
         }
         EmbeddedHttp::Resp { head, body } => {
             let head_bytes = serialize_http_response_head(head);
             let body_bytes = match body {
-                Body::Empty => None,
                 Body::Full { reader } if reader.is_empty() => None,
                 Body::Full { reader } => Some(reader.clone()),
-                Body::Preview { .. } => None,
+                Body::Empty | Body::Preview { .. } => None,
             };
             (head_bytes, body_bytes)
         }
@@ -424,6 +422,7 @@ fn serialize_http_response_head(head: &HttpResponse<()>) -> Vec<u8> {
 /// This structure carries ICAP method/service and flags that influence how
 /// the request is serialized on the wire (Preview, Allow: 204/206, ieof).
 #[derive(Debug)]
+#[must_use]
 pub struct Request<R = Vec<u8>> {
     /// ICAP method: `"OPTIONS" | "REQMOD" | "RESPMOD"`.
     pub method: Method,
@@ -491,28 +490,28 @@ impl<R> Request<R> {
     }
 
     /// Preview controls.
-    pub fn preview(mut self, n: usize) -> Self {
+    pub const fn preview(mut self, n: usize) -> Self {
         self.preview_size = Some(n);
         self
     }
-    pub fn preview_ieof(mut self) -> Self {
+    pub const fn preview_ieof(mut self) -> Self {
         self.preview_ieof = true;
         self
     }
 
     /// Advertise `Allow: 204` / `Allow: 206`.
-    pub fn allow_204(mut self) -> Self {
+    pub const fn allow_204(mut self) -> Self {
         self.allow_204 = true;
         self
     }
-    pub fn allow_206(mut self) -> Self {
+    pub const fn allow_206(mut self) -> Self {
         self.allow_206 = true;
         self
     }
 
     /// True for `REQMOD`/`RESPMOD`.
     #[inline]
-    pub fn is_mod(&self) -> bool {
+    pub const fn is_mod(&self) -> bool {
         matches!(self.method, Method::ReqMod | Method::RespMod)
     }
 }
@@ -849,10 +848,7 @@ fn next_offset_after(enc: &crate::parser::icap::Encapsulated, start: usize) -> O
         if let Some(o) = v
             && o > start
         {
-            min = Some(match min {
-                Some(m) => m.min(o),
-                None => o,
-            });
+            min = Some(min.map_or(o, |m| m.min(o)));
         }
     };
 
@@ -889,8 +885,7 @@ fn allow_contains_token(headers: &HeaderMap, token: &str) -> bool {
     headers
         .get("Allow")
         .and_then(|v| v.to_str().ok())
-        .map(|s| s.split(',').any(|p| p.trim().eq_ignore_ascii_case(token)))
-        .unwrap_or(false)
+        .is_some_and(|s| s.split(',').any(|p| p.trim().eq_ignore_ascii_case(token)))
 }
 
 #[cfg(test)]
@@ -984,9 +979,8 @@ mod tests {
         let raw = format!(
             "REQMOD icap://icap.example.org/icap/test ICAP/1.0\r\n\
 Host: icap.example.org\r\n\
-Encapsulated: req-hdr=0, req-body={}, null-body={}\r\n\
+Encapsulated: req-hdr=0, req-body={req_body_off}, null-body={null_body_off}\r\n\
 \r\n",
-            req_body_off, null_body_off
         )
         .into_bytes();
 
