@@ -21,9 +21,9 @@ async fn main() -> icap_rs::error::IcapResult<()> {
 
                         if bytes.windows(b"BLOCK".len()).any(|w| w == b"BLOCK") {
                             warn!("blocking request from preview bytes without 100 Continue");
-                            return Ok(PreviewDecision::Respond(
-                                Response::no_content().try_set_istag(ISTAG)?,
-                            ));
+                            return Ok(PreviewDecision::Respond(Response::no_content_with_istag(
+                                ISTAG,
+                            )?));
                         }
 
                         Ok(PreviewDecision::Continue)
@@ -33,13 +33,13 @@ async fn main() -> icap_rs::error::IcapResult<()> {
                             "REQMOD full handler called after preview continuation, body_len={}",
                             reader.len()
                         );
-                        Ok(PreviewDecision::Respond(
-                            Response::no_content().try_set_istag(ISTAG)?,
-                        ))
+                        Ok(PreviewDecision::Respond(Response::no_content_with_istag(
+                            ISTAG,
+                        )?))
                     }
-                    _ => Ok(PreviewDecision::Respond(
-                        Response::no_content().try_set_istag(ISTAG)?,
-                    )),
+                    _ => Ok(PreviewDecision::Respond(Response::no_content_with_istag(
+                        ISTAG,
+                    )?)),
                 }
             },
             Some(
@@ -47,7 +47,7 @@ async fn main() -> icap_rs::error::IcapResult<()> {
                     .with_static_istag(ISTAG)
                     .with_service("Preview decision scanner")
                     .with_preview(1024)
-                    .add_allow("204"),
+                    .allow_204(),
             ),
         )
         .build()

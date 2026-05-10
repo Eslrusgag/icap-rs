@@ -7,7 +7,7 @@ use std::sync::{Arc, RwLock};
 
 use http::{HeaderMap, Response as HttpResponse, StatusCode as HttpStatus, Version};
 use icap_rs::request::{EmbeddedHttp, Request};
-use icap_rs::response::{Response, StatusCode};
+use icap_rs::response::Response;
 use icap_rs::server::Server;
 use icap_rs::server::options::ServiceOptions;
 use icap_rs::{Body, Method};
@@ -36,7 +36,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         })
         .with_service("Request Modifier")
         .with_options_ttl(3600)
-        .add_allow("204")
+        .allow_204()
         .with_preview(1024);
 
     let respmod_opts = ServiceOptions::new()
@@ -46,7 +46,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         })
         .with_service("Response Modifier")
         .with_options_ttl(3600)
-        .add_allow("204")
+        .allow_204()
         .with_preview(2048);
 
     // Blocker: announce BOTH methods in OPTIONS (methods будут проставлены роутером)
@@ -80,13 +80,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         let istag_now = t.read().unwrap().clone();
 
                         if can_return_204(&request.icap_headers) {
-                            return Ok(Response::no_content()
-                                .try_set_istag(&istag_now)?
+                            return Ok(Response::no_content_with_istag(&istag_now)?
                                 .add_header("Server", "icap-rs/0.1.0"));
                         }
 
-                        Ok(Response::no_content()
-                            .try_set_istag(&istag_now)?
+                        Ok(Response::no_content_with_istag(&istag_now)?
                             .add_header("Server", "icap-rs/0.1.0"))
                     }
                 }
@@ -112,8 +110,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         let istag_now = t.read().unwrap().clone();
 
                         if request.preview_size.is_some() && can_return_204(&request.icap_headers) {
-                            return Ok(Response::no_content()
-                                .try_set_istag(&istag_now)?
+                            return Ok(Response::no_content_with_istag(&istag_now)?
                                 .add_header("Server", "icap-rs/0.1.0"));
                         }
 
@@ -137,13 +134,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                 .body(reader.clone())
                                 .map_err(|e| format!("build http::Response: {e}"))?;
 
-                            return Ok(Response::new(StatusCode::OK, "OK")
-                                .try_set_istag(&istag_now)?
+                            return Ok(Response::ok_with_istag(&istag_now)?
                                 .with_http_response(&http_resp)?
                                 .add_header("Server", "icap-rs/0.1.0"));
                         }
-                        Ok(Response::no_content()
-                            .try_set_istag(&istag_now)?
+                        Ok(Response::no_content_with_istag(&istag_now)?
                             .add_header("Server", "icap-rs/0.1.0"))
                     }
                 }
@@ -175,9 +170,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
                         let istag_now = t.read().unwrap().clone();
                         let http = build_block_403_http("Blocked!", &istag_now);
-                        Response::new(StatusCode::OK, "OK")
-                            .try_set_istag(&istag_now)?
-                            .with_http_response(&http)
+                        Response::ok_with_istag(&istag_now)?.with_http_response(&http)
                     }
                 }
             },

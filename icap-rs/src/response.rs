@@ -20,9 +20,7 @@
 //!
 //! // Construct a minimal 204 No Content response.
 //! // Note: 204 MUST NOT have a body and MUST carry `Encapsulated: null-body=0`.
-//! let resp = Response::no_content()
-//!     .try_set_istag("policy-123")
-//!     .unwrap();
+//! let resp = Response::no_content_with_istag("policy-123").unwrap();
 //!
 //! assert!(resp.is_success());
 //! assert_eq!(resp.status_code, StatusCode::NO_CONTENT);
@@ -105,9 +103,45 @@ impl Response {
         }
     }
 
+    /// Shortcut for a `200 OK` response.
+    ///
+    /// Successful ICAP responses require a valid `ISTag` before serialization.
+    /// Use [`Response::ok_with_istag`] when the tag is known at construction time.
+    pub fn ok() -> Self {
+        Self::new(StatusCode::OK, "OK")
+    }
+
+    /// Shortcut for a `200 OK` response with a validated `ISTag`.
+    pub fn ok_with_istag(istag: &str) -> IcapResult<Self> {
+        Self::ok().try_set_istag(istag)
+    }
+
     /// Shortcut for a `204 No Content` response.
     pub fn no_content() -> Self {
         Self::new(StatusCode::NO_CONTENT, "No Content")
+    }
+
+    /// Shortcut for a `204 No Content` response with a validated `ISTag`.
+    ///
+    /// This is the common "no modification needed" response for clients that
+    /// advertised `Allow: 204` or used Preview.
+    pub fn no_content_with_istag(istag: &str) -> IcapResult<Self> {
+        Self::no_content().try_set_istag(istag)
+    }
+
+    /// Shortcut for a `206 Partial Content` response.
+    ///
+    /// Pair this with
+    /// [`Response::with_http_request_head_and_original_body`] or
+    /// [`Response::with_http_response_head_and_original_body`] to emit the
+    /// RFC 3507 `use-original-body` marker.
+    pub fn partial_content() -> Self {
+        Self::new(StatusCode::PARTIAL_CONTENT, "Partial Content")
+    }
+
+    /// Shortcut for a `206 Partial Content` response with a validated `ISTag`.
+    pub fn partial_content_with_istag(istag: &str) -> IcapResult<Self> {
+        Self::partial_content().try_set_istag(istag)
     }
 
     /// Shortcut for a `204 No Content` response with headers.
@@ -190,6 +224,11 @@ impl Response {
     }
 
     /// Serialize into raw ICAP bytes.
+    ///
+    /// This validates ICAP-specific response invariants before writing:
+    /// successful responses require a valid `ISTag`, `204` must use
+    /// `Encapsulated: null-body=0`, and embedded HTTP bodies are framed per RFC
+    /// 3507 with unchunked HTTP heads and chunked encapsulated entity bodies.
     pub fn to_raw(&self) -> IcapResult<Vec<u8>> {
         let require_istag = self.status_code.is_success();
 
@@ -306,6 +345,10 @@ impl Response {
     }
 
     /// Parse an ICAP response from raw bytes.
+    ///
+    /// When the response contains an embedded HTTP message, `Response::body`
+    /// contains the embedded HTTP head followed by the dechunked HTTP entity
+    /// body. ICAP chunk-size metadata is not preserved.
     pub fn from_raw(raw: &[u8]) -> IcapResult<Self> {
         parse_icap_response(raw)
     }
@@ -862,6 +905,31 @@ mod tests {
         let removed = resp.remove_header("Service");
         assert!(removed.is_some());
         assert!(!resp.has_header("Service"));
+    }
+
+    #[test]
+    fn success_shortcuts_set_status_and_istag() {
+        let ok = Response::ok_with_istag("ok-1").expect("valid ISTag");
+        assert_eq!(ok.status_code, StatusCode::OK);
+        assert_eq!(ok.status_text, "OK");
+        assert_eq!(
+            ok.get_header("ISTag").unwrap(),
+            &HeaderValue::from_static("ok-1")
+        );
+
+        let no_content = Response::no_content_with_istag("no-change-1").expect("valid ISTag");
+        assert_eq!(no_content.status_code, StatusCode::NO_CONTENT);
+        assert_eq!(no_content.status_text, "No Content");
+
+        let partial = Response::partial_content_with_istag("partial-1").expect("valid ISTag");
+        assert_eq!(partial.status_code, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(partial.status_text, "Partial Content");
+    }
+
+    #[test]
+    fn success_shortcuts_validate_istag() {
+        let err = Response::ok_with_istag("BAD TAG").expect_err("shortcut must validate ISTag");
+        assert!(matches!(err, Error::InvalidISTag(_)));
     }
 
     #[test]

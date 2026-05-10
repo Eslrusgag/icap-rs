@@ -16,9 +16,7 @@
 //! ## Quick example
 //!
 //! ```rust,no_run
-//! use icap_rs::{Server, Method, Request, Response, StatusCode};
-//! use icap_rs::error::IcapResult;
-//! use icap_rs::server::options::ServiceOptions;
+//! use icap_rs::{IcapResult, Method, Request, Response, Server, ServiceOptions, StatusCode};
 //!
 //! const ISTAG: &str = "scan-1.0";
 //!
@@ -32,14 +30,14 @@
 //!             [Method::ReqMod, Method::RespMod],
 //!             |req: Request| async move {
 //!                 match req.method {
-//!                     Method::ReqMod => Ok(Response::no_content().try_set_istag(ISTAG)?),
-//!                     Method::RespMod => Ok(Response::no_content().try_set_istag(ISTAG)?),
+//!                     Method::ReqMod => Ok(Response::no_content_with_istag(ISTAG)?),
+//!                     Method::RespMod => Ok(Response::no_content_with_istag(ISTAG)?),
 //!                     Method::Options => unreachable!("OPTIONS is handled automatically by the server"),
 //!                 }
 //!             },
 //!             Some(ServiceOptions::new().with_static_istag(ISTAG)
 //!                 .with_service("Scan Service")
-//!                 .add_allow("204")
+//!                 .allow_204()
 //!                 .with_preview(2048))
 //!         )
 //!         // If a client uses `icap://host/`, internally route it to the "scan" service.
@@ -108,7 +106,15 @@ type RequestHandler = Box<
 #[derive(Debug)]
 #[must_use]
 pub enum PreviewDecision {
+    /// Continue the normal Preview flow.
+    ///
+    /// The server sends `ICAP/1.0 100 Continue`, reads the remaining chunked
+    /// body, and invokes the same route again with a full body.
     Continue,
+    /// Send this final ICAP response immediately.
+    ///
+    /// The server does not emit `100 Continue` and does not read the remainder
+    /// of the request body.
     Respond(Response),
 }
 
@@ -164,9 +170,7 @@ struct RouteEntry {
 /// # Example
 ///
 /// ```rust,no_run
-/// use icap_rs::{Server, Method, Request, Response};
-/// use icap_rs::error::IcapResult;
-/// use icap_rs::server::options::ServiceOptions;
+/// use icap_rs::{IcapResult, Method, Request, Response, Server, ServiceOptions};
 ///
 /// const ISTAG: &str = "scan-1.0";
 ///
@@ -178,7 +182,7 @@ struct RouteEntry {
 ///             "scan",
 ///             [Method::ReqMod],
 ///             |_req: Request| async move {
-///                 Ok(Response::no_content().try_set_istag(ISTAG)?)
+///                 Ok(Response::no_content_with_istag(ISTAG)?)
 ///             },
 ///             Some(ServiceOptions::new().with_static_istag(ISTAG).with_preview(1024)),
 ///         )
@@ -572,8 +576,8 @@ impl Server {
                             ServiceOptions::new()
                                 .with_static_istag(&format!("{service_resolved}-default-1.0"))
                                 .with_options_ttl(3600)
-                                .add_allow("204")
-                                .add_allow("206")
+                                .allow_204()
+                                .allow_206()
                         },
                         Clone::clone,
                     );
@@ -603,8 +607,7 @@ impl Server {
                         {
                             out
                         } else {
-                            let mut out =
-                                Response::new(StatusCode::OK, "OK").try_set_istag(&istag_now)?;
+                            let mut out = Response::ok_with_istag(&istag_now)?;
 
                             match (&req.embedded, method) {
                                 (
@@ -750,8 +753,7 @@ impl Server {
         method: Method,
         istag: &str,
     ) -> IcapResult<Option<Response>> {
-        let out =
-            Response::new(StatusCode::PARTIAL_CONTENT, "Partial Content").try_set_istag(istag)?;
+        let out = Response::partial_content_with_istag(istag)?;
 
         let out = match (&req.embedded, method) {
             (
@@ -1030,9 +1032,7 @@ impl ServerBuilder {
     ///
     /// # Example
     /// ```no_run
-    /// use icap_rs::{Server, Method, Request, Response};
-    /// use icap_rs::error::IcapResult;
-    /// use icap_rs::server::options::ServiceOptions;
+    /// use icap_rs::{IcapResult, Method, Request, Response, Server, ServiceOptions};
     ///
     /// const ISTAG: &str = "scan-1.0";
     ///
@@ -1045,12 +1045,12 @@ impl ServerBuilder {
     ///             "test",
     ///             [Method::ReqMod, Method::RespMod],
     ///             |_req: Request| async move {
-    ///                 Ok(Response::no_content().try_set_istag(ISTAG)?)
+    ///                 Ok(Response::no_content_with_istag(ISTAG)?)
     ///             },
     ///             Some(ServiceOptions::new()
     ///                 .with_static_istag(ISTAG)
     ///                 .with_preview(2048)
-    ///                 .add_allow("204")),
+    ///                 .allow_204()),
     ///         )
     ///         .build().await?;
     ///
@@ -1089,9 +1089,7 @@ impl ServerBuilder {
     ///
     /// # Example
     /// ```no_run
-    /// use icap_rs::{Server, Method, Request, Response};
-    /// use icap_rs::error::IcapResult;
-    /// use icap_rs::server::options::ServiceOptions;
+    /// use icap_rs::{IcapResult, Method, Request, Response, Server, ServiceOptions};
     ///
     /// const ISTAG: &str = "scan-1.0";
     ///
@@ -1108,12 +1106,12 @@ impl ServerBuilder {
     ///             "scan",
     ///             [Method::ReqMod, Method::RespMod],
     ///             |_req: Request| async move {
-    ///                 Ok(Response::no_content().try_set_istag(ISTAG)?)
+    ///                 Ok(Response::no_content_with_istag(ISTAG)?)
     ///             },
     ///             Some(ServiceOptions::new()
     ///                 .with_static_istag(ISTAG)
     ///                 .with_preview(2048)
-    ///                 .add_allow("204")),
+    ///                 .allow_204()),
     ///         )
     ///         .build().await?;
     ///

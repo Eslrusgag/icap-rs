@@ -8,7 +8,8 @@ pub mod request;
 pub mod response;
 pub mod server;
 
-pub use client::Client;
+pub use client::{Client, ClientBuilder, ConnectionPolicy};
+pub use error::{Error, IcapResult};
 pub use request::{Body, EmbeddedHttp, Method, Request};
 pub use response::{Response, StatusCode};
 pub use server::{

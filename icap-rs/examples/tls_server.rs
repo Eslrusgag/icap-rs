@@ -24,12 +24,12 @@ async fn main() -> IcapResult<()> {
         .route(
             "scan",
             [Method::ReqMod, Method::RespMod],
-            |_req: Request| async move { Response::no_content().try_set_istag(ISTAG) },
+            |_req: Request| async move { Response::no_content_with_istag(ISTAG) },
             Some(
                 ServiceOptions::new()
                     .with_static_istag(ISTAG)
                     .with_preview(2048)
-                    .add_allow("204"),
+                    .allow_204(),
             ),
         )
         .default_service("scan")

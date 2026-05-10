@@ -43,6 +43,7 @@
 //! assert_eq!(icap_req.method, Method::ReqMod);
 //! assert!(icap_req.allow_204);
 //! assert_eq!(icap_req.preview_size, Some(4));
+//! ```
 
 use crate::ICAP_VERSION;
 use crate::error::{Error, IcapResult};
@@ -206,13 +207,17 @@ impl<R> fmt::Debug for Remainder<R> {
     }
 }
 
-/// Generic HTTP body used inside `EmbeddedHttp<R>`.
+/// Generic HTTP body used inside [`EmbeddedHttp`].
 ///
 /// - `Empty` — no body (e.g., GET without payload, or OPTIONS).
 /// - `Preview` — the first `N` bytes are available in `bytes`, followed by the
 ///   `remainder` stream. `ieof=true` indicates the whole body already fits into
 ///   the preview and no `100 Continue` is needed.
 /// - `Full` — the complete body is available via `reader`.
+///
+/// Regular server routes normally receive `Full` bodies because the server owns
+/// the RFC Preview handshake. Preview-aware routes may see `Preview` before
+/// `100 Continue` is sent.
 pub enum Body<R> {
     Empty,
     Preview {
@@ -428,6 +433,7 @@ fn serialize_http_response_head(head: &HttpResponse<()>) -> Vec<u8> {
 ///
 /// This structure carries ICAP method/service and flags that influence how
 /// the request is serialized on the wire (Preview, Allow: 204/206, ieof).
+/// For `REQMOD` and `RESPMOD`, embedded HTTP is stored in [`EmbeddedHttp`].
 #[derive(Debug)]
 #[must_use]
 pub struct Request<R = Vec<u8>> {
@@ -496,11 +502,15 @@ impl<R> Request<R> {
             .expect("invalid ICAP header name or value")
     }
 
-    /// Preview controls.
+    /// Advertise `Preview: n`.
+    ///
+    /// `Preview: 0` means the client sends an immediate zero-size preview chunk
+    /// and waits for either a final response or `100 Continue`.
     pub const fn preview(mut self, n: usize) -> Self {
         self.preview_size = Some(n);
         self
     }
+    /// Mark a `Preview: 0` request as complete using the `ieof` chunk extension.
     pub const fn preview_ieof(mut self) -> Self {
         self.preview_ieof = true;
         self
@@ -551,6 +561,12 @@ impl Request<Vec<u8>> {
         self
     }
 
+    /// Attach a complete embedded HTTP request.
+    ///
+    /// This is the usual client-side builder for `REQMOD` requests when the
+    /// HTTP entity body is already available in memory. For large bodies, use
+    /// [`Request::with_http_request_head`] together with a streaming client
+    /// method such as [`crate::Client::send_streaming_reader`].
     pub fn with_http_request(mut self, req: HttpRequest<Vec<u8>>) -> Self {
         let (parts, body) = req.into_parts();
         let head = HttpRequest::from_parts(parts, ());
@@ -560,6 +576,13 @@ impl Request<Vec<u8>> {
         });
         self
     }
+
+    /// Attach a complete embedded HTTP response.
+    ///
+    /// This is the usual client-side builder for `RESPMOD` requests when the
+    /// HTTP entity body is already available in memory. For large bodies, use
+    /// [`Request::with_http_response_head`] together with a streaming client
+    /// method such as [`crate::Client::send_streaming_reader`].
     pub fn with_http_response(mut self, resp: HttpResponse<Vec<u8>>) -> Self {
         let (parts, body) = resp.into_parts();
         let head = HttpResponse::from_parts(parts, ());

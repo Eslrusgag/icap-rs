@@ -24,13 +24,13 @@
 //!     })
 //!     .with_service("Response Modifier")
 //!     .with_options_ttl(60)
-//!     .add_allow("204");
+//!     .allow_204();
 //! ```
 
 use std::sync::Arc;
 
 use crate::request::{Method, Request};
-use crate::response::{Response, StatusCode};
+use crate::response::Response;
 use smallvec::SmallVec;
 use std::collections::HashMap;
 
@@ -190,6 +190,22 @@ impl ServiceOptions {
         self
     }
 
+    /// Advertise support for `204 No Content` no-modification responses.
+    ///
+    /// This is equivalent to `add_allow("204")`, but avoids stringly typed
+    /// capability values in normal service configuration.
+    pub fn allow_204(self) -> Self {
+        self.add_allow_once("204")
+    }
+
+    /// Advertise support for `206 Partial Content` no-modification responses.
+    ///
+    /// This is equivalent to `add_allow("206")`, but avoids stringly typed
+    /// capability values in normal service configuration.
+    pub fn allow_206(self) -> Self {
+        self.add_allow_once("206")
+    }
+
     /// Set Preview size (bytes).
     pub const fn with_preview(mut self, preview: u32) -> Self {
         self.preview = Some(preview);
@@ -244,7 +260,7 @@ impl ServiceOptions {
     /// - Standard headers (`Encapsulated`, `Service`, `Max-Connections`, etc.)
     ///
     pub fn build_response_for(&self, req: &Request) -> Response {
-        let mut response = Response::new(StatusCode::OK, "OK");
+        let mut response = Response::ok();
 
         let methods_str = self
             .methods
@@ -347,5 +363,35 @@ impl ServiceOptions {
             return Err("Opt-body-type must be set when opt-body is present".to_string());
         }
         Ok(())
+    }
+
+    fn add_allow_once(mut self, capability: &str) -> Self {
+        if !self.allow.iter().any(|c| c == capability) {
+            self.allow.push(capability.to_string());
+        }
+        self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn typed_allow_helpers_advertise_no_modification_capabilities() {
+        let opts = ServiceOptions::new().allow_204().allow_206();
+
+        assert_eq!(opts.allow, ["204", "206"]);
+    }
+
+    #[test]
+    fn typed_allow_helpers_do_not_duplicate_capabilities() {
+        let opts = ServiceOptions::new()
+            .allow_204()
+            .allow_204()
+            .allow_206()
+            .allow_206();
+
+        assert_eq!(opts.allow, ["204", "206"]);
     }
 }
