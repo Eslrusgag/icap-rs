@@ -18,7 +18,9 @@ mod tls;
 
 use crate::error::{Error, IcapResult};
 use crate::parser::parse_encapsulated_header;
-use crate::parser::{canon_icap_header, read_chunked_to_end, write_chunk, write_chunk_into};
+use crate::parser::{
+    canon_icap_header, dechunk_icap_entity, read_chunked_to_end, write_chunk, write_chunk_into,
+};
 use crate::request::{Request, serialize_embedded_http};
 use crate::response::{Response, parse_icap_response, parse_icap_response_head};
 
@@ -928,8 +930,31 @@ async fn read_until_len<S: AsyncRead + AsyncWrite + Unpin>(
     Ok(())
 }
 
-/// If the ICAP response has an encapsulated body (req-body or res-body),
-/// read it to the end (chunked) and append to `buf`.
+async fn read_until_double_crlf_from<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    buf: &mut Vec<u8>,
+    start: usize,
+) -> IcapResult<usize> {
+    let mut tmp = [0u8; 4096];
+    loop {
+        if start <= buf.len()
+            && let Some(pos) = memchr::memmem::find(&buf[start..], b"\r\n\r\n")
+        {
+            return Ok(start + pos + 4);
+        }
+
+        let n = AsyncReadExt::read(stream, &mut tmp).await?;
+        if n == 0 {
+            return Err(Error::Body(
+                "Unexpected EOF while reading encapsulated HTTP headers".into(),
+            ));
+        }
+        buf.extend_from_slice(&tmp[..n]);
+    }
+}
+
+/// If the ICAP response has an encapsulated body (`req-body`/`res-body`/`opt-body`),
+/// read it to the end on the wire and append it to `buf`.
 async fn read_icap_body_if_any<S>(stream: &mut S, buf: &mut Vec<u8>) -> IcapResult<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -942,31 +967,18 @@ where
         .map_err(|_| Error::http_parse("Invalid headers utf8"))?;
     let enc = parse_encapsulated_header(hdr_text)?;
 
-    let has_enc_body = enc.req_body.is_some() || enc.res_body.is_some() || enc.opt_body.is_some();
-    if has_enc_body {
-        let enc_start_rel = [
-            enc.req_hdr,
-            enc.res_hdr,
-            enc.req_body,
-            enc.res_body,
-            enc.opt_body,
-        ]
-        .into_iter()
-        .flatten()
-        .min()
-        .unwrap_or(0);
-
-        let enc_abs = h_end + enc_start_rel;
-        if buf.len() < enc_abs {
-            read_until_len(stream, buf, enc_abs).await?;
+    if let Some(body_rel) = enc.req_body.or(enc.res_body).or(enc.opt_body) {
+        let body_abs = h_end + body_rel;
+        if buf.len() < body_abs {
+            read_until_len(stream, buf, body_abs).await?;
         }
-        let end = read_chunked_to_end(stream, buf, enc_abs).await?;
-        if end > enc_abs {
-            let mut chunked_slice = &buf[enc_abs..end];
-            let decoded = dechunk_icap_entity(&mut chunked_slice)
-                .map_err(|e| format!("dechunk ICAP entity: {e}"))?;
-            buf.splice(enc_abs..end, decoded);
+        let _ = read_chunked_to_end(stream, buf, body_abs).await?;
+    } else if let Some(hdr_rel) = enc.req_hdr.or(enc.res_hdr) {
+        let hdr_abs = h_end + hdr_rel;
+        if buf.len() < hdr_abs {
+            read_until_len(stream, buf, hdr_abs).await?;
         }
+        let _ = read_until_double_crlf_from(stream, buf, hdr_abs).await?;
     }
 
     Ok(())
@@ -987,47 +999,24 @@ where
 
     read_icap_body_if_any(stream, buf).await?;
     if buf.len() > h_end {
-        AsyncWriteExt::write_all(writer, &buf[h_end..]).await?;
+        let hdr_text = std::str::from_utf8(&buf[..h_end])
+            .map_err(|_| Error::http_parse("Invalid headers utf8"))?;
+        let enc = parse_encapsulated_header(hdr_text)?;
+        if let Some(body_rel) = enc.req_body.or(enc.res_body).or(enc.opt_body) {
+            let body_abs = h_end + body_rel;
+            AsyncWriteExt::write_all(writer, &buf[h_end..body_abs]).await?;
+            let mut chunked_slice = &buf[body_abs..];
+            let decoded = dechunk_icap_entity(&mut chunked_slice)
+                .map_err(|e| format!("dechunk ICAP entity: {e}"))?;
+            AsyncWriteExt::write_all(writer, &decoded).await?;
+        } else {
+            AsyncWriteExt::write_all(writer, &buf[h_end..]).await?;
+        }
         buf.truncate(h_end);
     }
     Ok(())
 }
 
-fn dechunk_icap_entity(data: &mut &[u8]) -> Result<Vec<u8>, String> {
-    let mut out = Vec::with_capacity((*data).len());
-    let mut d = *data;
-
-    loop {
-        let crlf_pos = memchr::memmem::find(d, b"\r\n").ok_or("chunk size line without CRLF")?;
-        let (size_line, rest) = d.split_at(crlf_pos);
-        d = &rest[2..];
-
-        let size_hex = size_line.split(|&b| b == b';').next().unwrap_or(size_line);
-        let size_str = std::str::from_utf8(size_hex).map_err(|_| "chunk size not utf8")?;
-        let size = usize::from_str_radix(size_str.trim(), 16).map_err(|_| "chunk size not hex")?;
-
-        if size == 0 {
-            if d.starts_with(b"\r\n") {
-                d = &d[2..];
-            } else {
-                return Err("missing final CRLF after zero chunk".into());
-            }
-            *data = d;
-            break;
-        }
-
-        if d.len() < size + 2 {
-            return Err("incomplete chunk data".into());
-        }
-        out.extend_from_slice(&d[..size]);
-        if &d[size..size + 2] != b"\r\n" {
-            return Err("missing CRLF after chunk".into());
-        }
-        d = &d[size + 2..];
-    }
-
-    Ok(out)
-}
 fn parse_authority_with_scheme(uri: &str) -> IcapResult<(String, u16, bool)> {
     let s = uri.trim();
     let (tls, rest) = if let Some(r) = s.strip_prefix("icaps://") {
@@ -1388,6 +1377,7 @@ fn build_preview_and_chunks(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::StatusCode;
     use crate::parser::icap::find_double_crlf;
     use http::{Request as HttpReq, Version, header};
     use rstest::{fixture, rstest};
@@ -1699,5 +1689,48 @@ mod tests {
         tokio::spawn(server_write(server, b"ICAP/1.0 200 OK\r\n", true));
         let res = timeout(Duration::from_millis(50), read_icap_headers(&mut client)).await;
         assert!(res.is_err());
+    }
+
+    #[tokio::test]
+    async fn client_reads_rfc_response_with_unchunked_http_head_and_chunked_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut tmp = [0u8; 1024];
+            loop {
+                let n = socket.read(&mut tmp).await.unwrap();
+                assert!(n > 0, "client closed before sending request");
+                request.extend_from_slice(&tmp[..n]);
+                if find_double_crlf(&request).is_some() {
+                    break;
+                }
+            }
+
+            let wire = b"ICAP/1.0 200 OK\r\n\
+                         ISTag: x\r\n\
+                         Encapsulated: res-hdr=0, res-body=38\r\n\
+                         \r\n\
+                         HTTP/1.1 200 OK\r\n\
+                         Content-Length: 5\r\n\
+                         \r\n\
+                         5\r\n\
+                         hello\r\n\
+                         0\r\n\
+                         \r\n";
+            socket.write_all(wire).await.unwrap();
+            socket.flush().await.unwrap();
+        });
+
+        let client = Client::builder().host("127.0.0.1").port(port).build();
+        let response = client.send(&Request::options("svc")).await.unwrap();
+
+        assert_eq!(response.status_code, StatusCode::OK);
+        assert_eq!(
+            response.body,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"
+        );
     }
 }

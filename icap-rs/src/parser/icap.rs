@@ -1,5 +1,6 @@
 use crate::error::{Error, IcapResult};
 //use crate::request::{EmbeddedHttp, Request};
+use crate::parser::write_chunk_into;
 use crate::response::Response;
 use std::borrow::Cow;
 
@@ -165,10 +166,28 @@ pub fn serialize_icap_response(resp: &Response) -> Vec<u8> {
         return out;
     }
 
-    let size_line = format!("{:X}\r\n", resp.body.len());
-    out.extend_from_slice(size_line.as_bytes());
-    out.extend_from_slice(&resp.body);
-    out.extend_from_slice(b"\r\n0\r\n\r\n");
+    let enc = resp
+        .headers
+        .get("Encapsulated")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| parse_encapsulated_value(value).ok());
+
+    if enc.is_some_and(|enc| enc.null_body.is_some()) {
+        return out;
+    }
+
+    let body_start = enc.and_then(|enc| enc.req_body.or(enc.res_body).or(enc.opt_body));
+
+    if let Some(offset) = body_start {
+        let split = offset.min(resp.body.len());
+        out.extend_from_slice(&resp.body[..split]);
+        if split < resp.body.len() {
+            write_chunk_into(&mut out, &resp.body[split..]);
+        }
+        out.extend_from_slice(b"0\r\n\r\n");
+    } else {
+        out.extend_from_slice(&resp.body);
+    }
     out
 }
 

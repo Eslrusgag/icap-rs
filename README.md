@@ -33,6 +33,8 @@ ICAP server implementation inspired by `c-icap`.
 - [x] Embedded HTTP request support
 - [x] Embedded HTTP response support
 - [x] Chunked encapsulated request body handling
+- [x] RFC-compliant ICAP response framing for embedded HTTP
+- [x] RFC-compliant response reader for embedded HTTP
 - [x] Server-side dechunking
 - [x] Preview support
 - [x] `Preview: 0`
@@ -84,10 +86,7 @@ ICAP server implementation inspired by `c-icap`.
 
 ## Partially Implemented / Needs Improvement
 
-- [ ] RFC-compliant ICAP response framing for embedded HTTP
-- [ ] RFC-compliant response reader for embedded HTTP
 - [ ] Strict RFC parser mode
-- [ ] Compatibility parser mode
 - [ ] Preview-aware handler API
 - [ ] Early final response before `100 Continue`
 - [ ] Proper ICAP `400 Bad Request`

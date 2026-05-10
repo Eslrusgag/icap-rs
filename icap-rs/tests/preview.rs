@@ -42,6 +42,38 @@ fn http_content_length(http_head: &[u8]) -> Option<usize> {
     len
 }
 
+fn dechunk_icap_entity(mut data: &[u8]) -> Result<Vec<u8>, String> {
+    let mut out = Vec::with_capacity(data.len());
+    loop {
+        let crlf_pos = data
+            .windows(2)
+            .position(|w| w == b"\r\n")
+            .ok_or_else(|| "chunk size line without CRLF".to_string())?;
+        let size_line = &data[..crlf_pos];
+        data = &data[crlf_pos + 2..];
+
+        let size_hex = size_line.split(|&b| b == b';').next().unwrap_or(size_line);
+        let size_str = std::str::from_utf8(size_hex).map_err(|_| "chunk size not utf8")?;
+        let size = usize::from_str_radix(size_str.trim(), 16).map_err(|_| "chunk size not hex")?;
+
+        if size == 0 {
+            if data.starts_with(b"\r\n") {
+                return Ok(out);
+            }
+            return Err("missing final CRLF after zero chunk".into());
+        }
+
+        if data.len() < size + 2 {
+            return Err("incomplete chunk data".into());
+        }
+        out.extend_from_slice(&data[..size]);
+        if &data[size..size + 2] != b"\r\n" {
+            return Err("missing CRLF after chunk".into());
+        }
+        data = &data[size + 2..];
+    }
+}
+
 async fn start_server(addr: &str) {
     let server = Server::builder()
         .bind(addr)
@@ -344,7 +376,7 @@ async fn preview_non_ieof_full_body_roundtrip() {
     let resp_after_icap = &resp[h1 + 4..];
     let h2 = find_double_crlf(resp_after_icap).expect("http hdr end");
     let http_head_bytes = &resp_after_icap[..h2];
-    let http_body = &resp_after_icap[h2 + 4..];
+    let http_body = dechunk_icap_entity(&resp_after_icap[h2 + 4..]).expect("dechunk HTTP body");
 
     let cl = http_content_length(http_head_bytes).expect("content-length");
     assert!(

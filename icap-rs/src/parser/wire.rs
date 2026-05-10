@@ -29,6 +29,47 @@ pub fn parse_one_chunk(buf: &[u8], from: usize) -> Option<(usize, bool, usize)> 
     None
 }
 
+/// Decode a complete ICAP chunked entity body.
+///
+/// ICAP uses HTTP chunked coding for encapsulated entity bodies only; embedded
+/// HTTP headers before the body offset are not part of this input.
+pub fn dechunk_icap_entity(data: &mut &[u8]) -> Result<Vec<u8>, String> {
+    let mut out = Vec::with_capacity((*data).len());
+    let mut d = *data;
+
+    loop {
+        let crlf_pos = memchr::memmem::find(d, b"\r\n").ok_or("chunk size line without CRLF")?;
+        let (size_line, rest) = d.split_at(crlf_pos);
+        d = &rest[2..];
+
+        let size_hex = size_line.split(|&b| b == b';').next().unwrap_or(size_line);
+        let size_str = std::str::from_utf8(size_hex).map_err(|_| "chunk size not utf8")?;
+        let size = usize::from_str_radix(size_str.trim(), 16).map_err(|_| "chunk size not hex")?;
+
+        if size == 0 {
+            if d.starts_with(b"\r\n") {
+                d = &d[2..];
+            } else {
+                return Err("missing final CRLF after zero chunk".into());
+            }
+            *data = d;
+            break;
+        }
+
+        if d.len() < size + 2 {
+            return Err("incomplete chunk data".into());
+        }
+        out.extend_from_slice(&d[..size]);
+        d = &d[size..];
+        if !d.starts_with(b"\r\n") {
+            return Err("missing CRLF after chunk".into());
+        }
+        d = &d[2..];
+    }
+
+    Ok(out)
+}
+
 /// Drain ICAP chunked body until zero chunk. Returns position after final CRLF.
 pub async fn read_chunked_to_end<S>(
     stream: &mut S,

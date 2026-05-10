@@ -31,7 +31,8 @@
 use crate::ICAP_VERSION;
 use crate::error::{Error, IcapResult};
 use crate::parser::icap::{Encapsulated, find_double_crlf, parse_encapsulated_value};
-use crate::parser::{serialize_http_request, serialize_http_response};
+use crate::parser::wire::parse_one_chunk;
+use crate::parser::{dechunk_icap_entity, serialize_http_request, serialize_http_response};
 use http::{HeaderMap, HeaderName, HeaderValue};
 use memchr::memchr;
 use std::fmt;
@@ -267,6 +268,17 @@ impl Response {
         }
 
         let resp_ref = owned.as_ref().unwrap_or(self);
+        if !resp_ref.body.is_empty()
+            && let Some(enc_val) = resp_ref
+                .headers
+                .get("Encapsulated")
+                .and_then(|v| v.to_str().ok())
+            && parse_encapsulated_value(enc_val).is_ok_and(|enc| enc.null_body.is_some())
+        {
+            return Err(Error::Body(
+                "Encapsulated: null-body must not carry a body".into(),
+            ));
+        }
         Ok(crate::parser::serialize_icap_response(resp_ref))
     }
 
@@ -496,7 +508,7 @@ pub(crate) fn parse_icap_response(raw: &[u8]) -> IcapResult<Response> {
         encapsulated_value,
     } = parse_response_head_parts(raw)?;
 
-    let body = raw[header_end..].to_vec();
+    let mut body = raw[header_end..].to_vec();
     trace!(body_len = body.len(), "parsed body");
     if response.status_code.is_success() {
         let enc_val = encapsulated_value
@@ -522,6 +534,7 @@ pub(crate) fn parse_icap_response(raw: &[u8]) -> IcapResult<Response> {
             }
             StatusCode::OK | StatusCode::PARTIAL_CONTENT => {
                 let enc = parse_encapsulated_value(enc_val)?;
+                dechunk_response_body_if_needed(&enc, &mut body)?;
                 validate_encapsulated_offsets(&enc, body.len())?;
             }
             _ => {}
@@ -545,6 +558,30 @@ fn validate_encapsulated_offsets(enc: &Encapsulated, enc_len: usize) -> IcapResu
             )));
         }
     }
+    Ok(())
+}
+
+fn dechunk_response_body_if_needed(enc: &Encapsulated, body: &mut Vec<u8>) -> IcapResult<()> {
+    let Some(body_start) = enc.req_body.or(enc.res_body).or(enc.opt_body) else {
+        return Ok(());
+    };
+
+    if body_start > body.len() {
+        return Err(Error::Header(format!(
+            "Encapsulated body offset {body_start} out of range (len={})",
+            body.len()
+        )));
+    }
+    if parse_one_chunk(body, body_start).is_none() {
+        return Err(Error::Body(
+            "missing ICAP chunked entity body at Encapsulated body offset".into(),
+        ));
+    }
+
+    let mut chunked = &body[body_start..];
+    let decoded = dechunk_icap_entity(&mut chunked)
+        .map_err(|e| Error::Body(format!("dechunk ICAP entity: {e}")))?;
+    body.splice(body_start.., decoded);
     Ok(())
 }
 
@@ -780,6 +817,70 @@ mod tests {
 
         let line = std::str::from_utf8(&bytes).unwrap().lines().next().unwrap();
         assert_eq!(line, "ICAP/1.0 200 OK");
+    }
+
+    #[test]
+    fn to_raw_chunks_only_embedded_http_entity_body() {
+        let http = http::Response::builder()
+            .status(http::StatusCode::OK)
+            .version(http::Version::HTTP_11)
+            .header("Content-Length", "5")
+            .body(b"hello".to_vec())
+            .unwrap();
+
+        let raw = Response::new(StatusCode::OK, "OK")
+            .try_set_istag("x")
+            .unwrap()
+            .with_http_response(&http)
+            .unwrap()
+            .to_raw()
+            .unwrap();
+
+        let icap_header_end = find_double_crlf(&raw).expect("ICAP header end");
+        assert_eq!(&raw[icap_header_end..icap_header_end + 5], b"HTTP/");
+
+        let text = String::from_utf8_lossy(&raw);
+        assert!(text.contains("Encapsulated: res-hdr=0, res-body="));
+        assert!(text.contains("\r\n5\r\nhello\r\n0\r\n\r\n"));
+    }
+
+    #[test]
+    fn parse_rfc_wire_dechunks_embedded_http_entity_body() {
+        let raw = b"ICAP/1.0 200 OK\r\n\
+                    ISTag: x\r\n\
+                    Encapsulated: res-hdr=0, res-body=38\r\n\
+                    \r\n\
+                    HTTP/1.1 200 OK\r\n\
+                    Content-Length: 5\r\n\
+                    \r\n\
+                    5\r\n\
+                    hello\r\n\
+                    0\r\n\
+                    \r\n";
+
+        let parsed = parse_icap_response(raw).expect("parse RFC wire response");
+        assert_eq!(
+            parsed.body,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"
+        );
+    }
+
+    #[test]
+    fn parse_rejects_legacy_unchunked_entity_body_after_body_offset() {
+        let raw = b"ICAP/1.0 200 OK\r\n\
+                    ISTag: x\r\n\
+                    Encapsulated: res-hdr=0, res-body=38\r\n\
+                    \r\n\
+                    HTTP/1.1 200 OK\r\n\
+                    Content-Length: 5\r\n\
+                    \r\n\
+                    hello";
+
+        let err = parse_icap_response(raw).expect_err("legacy unchunked body must be rejected");
+        assert!(
+            err.to_string().to_lowercase().contains("chunked"),
+            "expected chunked framing error, got: {err}"
+        );
     }
 }
 
