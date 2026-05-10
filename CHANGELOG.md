@@ -19,3 +19,5 @@
 - Server request parsing now returns ICAP `400 Bad Request` for malformed wire requests and `501 Not Implemented` for unknown methods.
 - Request parsing now rejects method-incompatible `Encapsulated` forms, `null-body` mixed with body tokens, and `OPTIONS` without `Encapsulated` unless compatibility mode is explicitly enabled.
 - Added `Allow: 206` no-modification responses using the `use-original-body` partial-content marker.
+- `rs-icap-client` now reconstructs `206 Partial Content` output by appending the original request body suffix from the `use-original-body` offset.
+- Updated the RFC 3507 supported/unsupported implementation plans to reflect the current release scope and remaining specification gaps.
