@@ -11,7 +11,7 @@ pub mod server;
 pub use client::Client;
 pub use request::{Body, EmbeddedHttp, Method, Request};
 pub use response::{Response, StatusCode};
-pub use server::{Server, ServerBuilder, ServiceOptions, TransferBehavior};
+pub use server::{PreviewDecision, Server, ServerBuilder, ServiceOptions, TransferBehavior};
 
 /// Lib version.
 pub const LIB_VERSION: &str = env!("CARGO_PKG_VERSION");

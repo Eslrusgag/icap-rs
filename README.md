@@ -41,6 +41,7 @@ ICAP server implementation inspired by `c-icap`.
 - [x] `Preview: N`
 - [x] `ieof`
 - [x] `100 Continue` preview flow
+- [x] Preview-aware server decision handler before `100 Continue`
 - [x] `204 No Content`
 - [x] `ISTag` validation
 - [x] OPTIONS capability responses
@@ -87,8 +88,6 @@ ICAP server implementation inspired by `c-icap`.
 ## Partially Implemented / Needs Improvement
 
 - [ ] Strict RFC parser mode
-- [ ] Preview-aware handler API
-- [ ] Early final response before `100 Continue`
 - [ ] Proper ICAP `400 Bad Request`
 - [ ] Proper ICAP `405 Method Not Allowed`
 - [ ] Proper ICAP `501 Not Implemented`

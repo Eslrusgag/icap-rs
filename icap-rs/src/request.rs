@@ -7,12 +7,14 @@
 //! - [`Request<R>`]: a single, public ICAP request type used by both **client** and
 //!   **server**, parameterized by the body carrier `R`.
 //! ## Preview (server-side)
-//! The server handles Preview (`Preview: N`) on the wire:
+//! By default, the server handles Preview (`Preview: N`) on the wire:
 //! - reads preview chunks first,
 //! - sends `ICAP/1.0 100 Continue` when preview is non-`ieof`,
 //! - then reads and de-chunks the remainder before invoking handlers.
 //!
-//! As a result, default server handlers receive embedded bodies as `Body::Full`.
+//! As a result, regular server handlers receive embedded bodies as `Body::Full`.
+//! Use `ServerBuilder::route_preview` when a service needs to make an early
+//! decision from preview bytes and return a final response before `100 Continue`.
 //! `Body::Preview` and `Body<BodyRead>::ensure_full()` remain available for custom
 //! integrations that build preview-aware pipelines explicitly.
 //!

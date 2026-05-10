@@ -14,6 +14,7 @@ A Rust implementation of the **ICAP** protocol ([RFC 3507]) providing a client A
   messages, streaming bodies, and optional connection reuse.
 - **Server**: per-service routing, automatic `OPTIONS` responses (with optional **dynamic `ISTag`**),
   duplicate-route detection, Preview handshake (`100 Continue` on non-`ieof` preview),
+  optional preview decision handlers that can return a final response before `100 Continue`,
   strict `Encapsulated` validation, and an RFC-friendly **200 echo** fallback when `Allow: 204` is absent and
   `Preview` is not used.
 

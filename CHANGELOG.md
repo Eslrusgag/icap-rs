@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Added
+
+- Added `ServerBuilder::route_preview` and `PreviewDecision`, allowing services to return a final response after preview bytes and before `100 Continue`.
+
 ### Breaking
 
 - ICAP responses with embedded HTTP now use RFC 3507 framing: `req-hdr`/`res-hdr` bytes are sent unchunked, and ICAP chunked coding starts only at `req-body`/`res-body`/`opt-body`. The previous invalid wire format that chunked `HTTP head + HTTP body` as one block is not supported.

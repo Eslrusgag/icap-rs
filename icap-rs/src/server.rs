@@ -97,6 +97,24 @@ type RequestHandler = Box<
         + Sync,
 >;
 
+/// Decision returned by a preview-aware route handler.
+///
+/// Returning [`PreviewDecision::Respond`] lets a service send a final ICAP
+/// response after seeing only preview bytes, before the server emits
+/// `ICAP/1.0 100 Continue` and before the client uploads the remainder.
+#[derive(Debug)]
+#[must_use]
+pub enum PreviewDecision {
+    Continue,
+    Respond(Response),
+}
+
+type PreviewHandler = Box<
+    dyn Fn(Request) -> std::pin::Pin<Box<dyn Future<Output = IcapResult<PreviewDecision>> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// Route entry for a service: **per-method** handlers + optional OPTIONS config.
 ///
 /// Internal structure stored by the server/router.
@@ -104,6 +122,7 @@ struct RouteEntry {
     /// Map of method → handler. This enables duplicate-method detection and
     /// allows different handlers per method if desired.
     handlers: HashMap<Method, RequestHandler>,
+    preview_handlers: HashMap<Method, PreviewHandler>,
     options: Option<ServiceOptions>,
 }
 
@@ -230,14 +249,14 @@ impl Server {
                     if let Some(acceptor) = tls {
                         match acceptor.accept(socket).await {
                             Ok(stream) => {
-                                if let Err(e) = Self::handle_connection(
+                                if let Err(e) = Box::pin(Self::handle_connection(
                                     stream,
                                     routes,
                                     aliases,
                                     default_service,
                                     advertised_max,
                                     addr,
-                                )
+                                ))
                                 .await
                                 {
                                     error!(client=%addr, error=%e, "error handling TLS connection");
@@ -252,14 +271,14 @@ impl Server {
                 }
 
                 // Plain TCP
-                if let Err(e) = Self::handle_connection(
+                if let Err(e) = Box::pin(Self::handle_connection(
                     socket,
                     routes,
                     aliases,
                     default_service,
                     advertised_max,
                     addr,
-                )
+                ))
                 .await
                 {
                     error!(client=%addr, error=%e, "error handling connection");
@@ -370,6 +389,58 @@ impl Server {
                     if preview_ieof {
                         msg_end = preview_end;
                     } else {
+                        let mut preview_buf = buf.clone();
+                        let preview_len = decoded.len();
+                        preview_buf.splice(body_abs..preview_end, decoded.clone());
+                        let preview_msg_end = body_abs + preview_len;
+                        let preview_req = parse_icap_request(&preview_buf[..preview_msg_end])?;
+                        let preview_method = preview_req.method;
+                        let preview_raw_service = preview_req
+                            .service
+                            .rsplit('/')
+                            .next()
+                            .unwrap_or(&preview_req.service);
+                        let preview_service_resolved = Self::resolve_service(
+                            preview_raw_service,
+                            &aliases,
+                            default_service.as_deref(),
+                        );
+
+                        if let Some(entry) = routes.get(preview_service_resolved.as_ref())
+                            && let Some(preview_handler) =
+                                entry.preview_handlers.get(&preview_method)
+                        {
+                            match preview_handler(preview_req).await? {
+                                PreviewDecision::Continue => {}
+                                PreviewDecision::Respond(resp) => {
+                                    let should_close = !matches!(
+                                        resp.status_code,
+                                        StatusCode::OK | StatusCode::NO_CONTENT
+                                    );
+                                    let resp = if should_close {
+                                        resp.add_header("Connection", "close")
+                                    } else {
+                                        resp
+                                    };
+                                    let bytes = resp.to_raw()?;
+                                    socket.write_all(&bytes).await?;
+                                    trace!(
+                                        client = %addr,
+                                        "Preview final response sent with status {}",
+                                        resp.status_code
+                                    );
+
+                                    if should_close {
+                                        let _ = socket.shutdown().await;
+                                        return Ok(());
+                                    }
+
+                                    buf.drain(..preview_end);
+                                    continue;
+                                }
+                            }
+                        }
+
                         socket.write_all(b"ICAP/1.0 100 Continue\r\n\r\n").await?;
                         socket.flush().await?;
 
@@ -929,6 +1000,7 @@ impl ServerBuilder {
             Entry::Occupied(o) => o.into_mut(),
             Entry::Vacant(v) => v.insert(RouteEntry {
                 handlers: HashMap::new(),
+                preview_handlers: HashMap::new(),
                 options: None,
             }),
         };
@@ -961,6 +1033,55 @@ impl ServerBuilder {
                 "Options already set for service '{service}'"
             );
             entry.options = Some(cfg);
+        }
+
+        self
+    }
+
+    /// Register a preview decision handler for one or more ICAP methods.
+    ///
+    /// The regular route handler is still required and is called when the
+    /// preview handler returns [`PreviewDecision::Continue`]. If it returns
+    /// [`PreviewDecision::Respond`], the server writes that final response
+    /// before sending `100 Continue` and does not read the remaining body.
+    pub fn route_preview<MIt, MItem, F, Fut>(
+        mut self,
+        service: &str,
+        methods: MIt,
+        handler: F,
+    ) -> Self
+    where
+        MIt: IntoIterator<Item = MItem>,
+        MItem: Into<Method>,
+        F: Fn(Request) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = IcapResult<PreviewDecision>> + Send + 'static,
+    {
+        let entry = match self.routes.entry(service.to_owned()) {
+            Entry::Occupied(o) => o.into_mut(),
+            Entry::Vacant(v) => v.insert(RouteEntry {
+                handlers: HashMap::new(),
+                preview_handlers: HashMap::new(),
+                options: None,
+            }),
+        };
+
+        let h_arc = Arc::new(handler);
+
+        for item in methods {
+            let m: Method = item.into();
+            assert_ne!(
+                m,
+                Method::Options,
+                "OPTIONS cannot have a preview handler; it's answered automatically for '{service}'"
+            );
+            assert!(
+                !entry.preview_handlers.contains_key(&m),
+                "Overlapping preview route. Handler for '{m} {service}' already exists"
+            );
+
+            let h_clone = h_arc.clone();
+            let h: PreviewHandler = Box::new(move |req| Box::pin(h_clone(req)));
+            entry.preview_handlers.insert(m, h);
         }
 
         self
@@ -1074,6 +1195,13 @@ fn validate_builder_config(
             return Err(crate::error::Error::service(format!(
                 "Service '{service}' has no handlers"
             )));
+        }
+        for method in entry.preview_handlers.keys() {
+            if !entry.handlers.contains_key(method) {
+                return Err(crate::error::Error::service(format!(
+                    "Preview handler for '{method} {service}' requires a regular route handler"
+                )));
+            }
         }
         if let Some(options) = &entry.options
             && let Err(err) = options.validate()
