@@ -9,7 +9,7 @@ use icap_rs::error::IcapResult;
 use icap_rs::response::{Response as IcapResponse, StatusCode as IcapStatus};
 use icap_rs::{Client, Request};
 use std::{fs, path::PathBuf};
-use tokio::fs::File;
+use tokio::fs::{self as tokio_fs, File};
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, error, info, warn};
 
@@ -492,7 +492,16 @@ async fn main() -> IcapResult<()> {
         )
         .await?;
 
-        output_response(&args, &server_host, &server_ip, server_port, response).await?;
+        output_response(
+            &args,
+            &server_host,
+            &server_ip,
+            server_port,
+            response,
+            file_path_opt.as_ref(),
+            file_bytes.as_deref(),
+        )
+        .await?;
         return Ok(());
     }
 
@@ -504,7 +513,16 @@ async fn main() -> IcapResult<()> {
             return Ok(());
         }
         let response = client.send(&icap_req).await?;
-        output_response(&args, &server_host, &server_ip, server_port, response).await?;
+        output_response(
+            &args,
+            &server_host,
+            &server_ip,
+            server_port,
+            response,
+            None,
+            None,
+        )
+        .await?;
         return Ok(());
     }
 
@@ -517,12 +535,19 @@ async fn output_response(
     server_ip: &str,
     server_port: u16,
     response: IcapResponse,
+    original_body_path: Option<&PathBuf>,
+    original_body_bytes: Option<&[u8]>,
 ) -> IcapResult<()> {
+    let output_body =
+        response_output_body(&response, original_body_path, original_body_bytes).await?;
+
     if args.verbose {
         println!("ICAP server:{server_host}, ip:{server_ip}, port:{server_port}\n");
 
         if matches!(response.status_code, IcapStatus::NO_CONTENT) {
             println!("No modification needed (Allow 204 response)\n");
+        } else if let Some(offset) = response.use_original_body_offset() {
+            println!("Partial content uses original body from offset {offset}\n");
         }
 
         println!("ICAP HEADERS:");
@@ -540,22 +565,59 @@ async fn output_response(
 
         if let Some(output_file) = &args.output {
             let mut file = File::create(output_file).await?;
-            file.write_all(&response.body).await?;
+            file.write_all(&output_body).await?;
             info!("Response body written to file: {}", output_file);
-        } else if !response.body.is_empty() {
-            print!("{}", String::from_utf8_lossy(&response.body));
+        } else if !output_body.is_empty() {
+            print!("{}", String::from_utf8_lossy(&output_body));
         }
     } else {
         println!("ICAP/1.0 {} {}", response.status_code, response.status_text);
         if let Some(output_file) = &args.output {
             let mut file = File::create(output_file).await?;
-            file.write_all(&response.body).await?;
+            file.write_all(&output_body).await?;
             info!("Response body written to file: {}", output_file);
         } else {
-            print!("{}", String::from_utf8_lossy(&response.body));
+            print!("{}", String::from_utf8_lossy(&output_body));
         }
     }
     Ok(())
+}
+
+async fn response_output_body(
+    response: &IcapResponse,
+    original_body_path: Option<&PathBuf>,
+    original_body_bytes: Option<&[u8]>,
+) -> IcapResult<Vec<u8>> {
+    let Some(offset) = response.use_original_body_offset() else {
+        return Ok(response.body.clone());
+    };
+
+    let original_body = if let Some(bytes) = original_body_bytes {
+        bytes.to_vec()
+    } else if let Some(path) = original_body_path {
+        tokio_fs::read(path).await?
+    } else {
+        Vec::new()
+    };
+
+    append_original_body_suffix(response.body.clone(), &original_body, offset)
+}
+
+fn append_original_body_suffix(
+    mut response_body: Vec<u8>,
+    original_body: &[u8],
+    offset: usize,
+) -> IcapResult<Vec<u8>> {
+    if offset > original_body.len() {
+        return Err(format!(
+            "use-original-body offset {offset} exceeds original body length {}",
+            original_body.len()
+        )
+        .into());
+    }
+
+    response_body.extend_from_slice(&original_body[offset..]);
+    Ok(response_body)
 }
 
 fn service_from_uri(uri: &str) -> Option<String> {
@@ -678,4 +740,26 @@ async fn send_with_preview(
     }
 
     client.send(&icap_req).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn appends_original_body_suffix_from_offset() {
+        let body =
+            append_original_body_suffix(b"HTTP/1.1 200 OK\r\n\r\nabc".to_vec(), b"abcdef", 3)
+                .expect("append original suffix");
+
+        assert_eq!(body, b"HTTP/1.1 200 OK\r\n\r\nabcdef");
+    }
+
+    #[test]
+    fn rejects_original_body_offset_past_input() {
+        let err = append_original_body_suffix(Vec::new(), b"abc", 4)
+            .expect_err("offset past original body must fail");
+
+        assert!(err.to_string().contains("exceeds original body length"));
+    }
 }
