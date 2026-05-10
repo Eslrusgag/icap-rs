@@ -65,6 +65,10 @@ path = "examples/client.rs"
 name = "tls_client"
 path = "examples/tls_client.rs"
 
+[[example]]
+name = "preview_decision_server"
+path = "examples/preview_decision_server.rs"
+
 [[bench]]
 name = "protocol_bench"
 harness = false

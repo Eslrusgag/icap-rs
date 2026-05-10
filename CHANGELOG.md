@@ -5,6 +5,7 @@
 ### Added
 
 - Added `ServerBuilder::route_preview` and `PreviewDecision`, allowing services to return a final response after preview bytes and before `100 Continue`.
+- Added `preview_decision_server` example for preview-time final responses.
 
 ### Breaking
 

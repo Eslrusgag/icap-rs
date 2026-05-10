@@ -33,6 +33,12 @@ A Rust implementation of the **ICAP** protocol ([RFC 3507]) providing a client A
 - Keep-Alive: reuse a single idle connection.
 - **ICAPS (TLS)** with `rustls` — see [docs/tls.md](docs/tls.md)
 
+Examples include a preview decision server:
+
+```bash
+cargo run -p icap-rs --example preview_decision_server
+```
+
 ---
 
 ## Client
