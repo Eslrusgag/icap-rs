@@ -21,12 +21,12 @@ use crate::parser::parse_encapsulated_header;
 use crate::parser::{
     canon_icap_header, dechunk_icap_entity, read_chunked_to_end, write_chunk, write_chunk_into,
 };
-use crate::request::{Request, serialize_embedded_http};
-use crate::response::{Response, parse_icap_response, parse_icap_response_head};
+use crate::request::{serialize_embedded_http, Request};
+use crate::response::{parse_icap_response, parse_icap_response_head, Response};
 
-use crate::Method;
 use crate::client::tls::{AnyTlsConnector, TlsBackend, TlsConnector};
 use crate::parser::icap::find_double_crlf;
+use crate::Method;
 
 use http::{HeaderMap, HeaderName, HeaderValue};
 use std::collections::HashSet;
@@ -550,8 +550,10 @@ impl Client {
 
     /// Send a request with streamed request body and stream response body into `writer`.
     ///
-    /// Returned [`Response`] contains status line and headers, while `body` is empty because
-    /// response payload is forwarded directly to `writer`.
+    /// The returned [`Response`] contains the status line and ICAP headers.
+    /// Encapsulated response payload bytes are forwarded directly to `writer`,
+    /// so `Response::body` is empty on success. Use this for large responses
+    /// when buffering the adapted body in memory is undesirable.
     pub async fn send_streaming_reader_into_writer<R, W>(
         &self,
         req: &Request,
@@ -652,6 +654,10 @@ impl Client {
     }
 
     /// Build the exact wire representation of a request, including preview tail when applicable.
+    ///
+    /// Set `streaming=true` when the body will be supplied later through a
+    /// streaming API. This makes the generated wire advertise an encapsulated
+    /// body offset without embedding body bytes in the returned buffer.
     pub fn get_request_wire(&self, req: &Request, streaming: bool) -> IcapResult<Vec<u8>> {
         let built = self.build_icap_request_bytes(
             req,
@@ -1378,11 +1384,11 @@ fn build_preview_and_chunks(
 mod tests {
     use super::*;
     use crate::parser::icap::find_double_crlf;
-    use http::{Request as HttpReq, Version, header};
+    use http::{header, Request as HttpReq, Version};
     use rstest::{fixture, rstest};
     use std::future;
     use tokio::net::{TcpListener, TcpStream};
-    use tokio::time::{Duration, timeout};
+    use tokio::time::{timeout, Duration};
 
     fn bytes_to_string_prefix(v: &[u8], n: usize) -> String {
         String::from_utf8_lossy(&v[..v.len().min(n)]).to_string()

@@ -1,40 +1,37 @@
 # rs-icap-client
 
-A small but capable **ICAP client CLI** (similar to `c-icap-client`) built on top of the `icap-rs` library.
-It speaks `OPTIONS`, `REQMOD`, and `RESPMOD`, supports **Preview** (including `Preview: 0` and `ieof`),
-and can stream large bodies after `100 Continue`. TLS (**ICAPS**) is supported via **rustls**.
+`rs-icap-client` is a command-line ICAP client built on top of the `icap-rs`
+library. It supports `OPTIONS`, `REQMOD`, `RESPMOD`, Preview negotiation,
+streaming uploads, `Allow: 204`, `Allow: 206`, and direct ICAPS through Rustls.
 
----
+The workflow is intentionally close to `c-icap-client`: providing `-f` defaults
+to `RESPMOD`, and providing `--req` selects `REQMOD` unless `--method` is set.
 
-## Features
+## Build
 
-- ICAP methods: `OPTIONS`, `REQMOD`, `RESPMOD`
-- **Preview** negotiation (incl. `Preview: 0` and optional `ieof` fast‑204 path)
-- Streaming bodies from file after `100 Continue`
-- Custom ICAP and embedded HTTP headers
-- Optional connection/read timeout
-- **TLS / ICAPS** via `rustls` (when built with the appropriate cargo features)
-- c-icap compatible workflow: defaults to RESPMOD when `-f` is provided, REQMOD when `--req` is set
-
----
-
-## Install / Build
-
-This binary lives in the `examples` (or a sub-crate) of the repository and uses the `icap-rs` library.
+The CLI enables `tls-rustls` by default:
 
 ```bash
-# Plain (no TLS):
-cargo build --release
-
-# With TLS (rustls):
-cargo build --release --features "tls-rustls"
+cargo build -p rs-icap-client --release
 ```
 
-> **Note on TLS**  
-> `icaps://` requires building with `tls-rustls`.  
-> If you run the tool against an `icaps://…` URI without these features, the program will refuse to run.
+Build without TLS:
 
----
+```bash
+cargo build -p rs-icap-client --release --no-default-features
+```
+
+Build without default features but enable TLS explicitly:
+
+```bash
+cargo build -p rs-icap-client --release --no-default-features --features tls-rustls
+```
+
+Run from the workspace:
+
+```bash
+cargo run -p rs-icap-client -- -u icap://127.0.0.1:1344/respmod -m OPTIONS -v
+```
 
 ## Usage
 
@@ -42,129 +39,159 @@ cargo build --release --features "tls-rustls"
 rs-icap-client [OPTIONS]
 ```
 
-### Core options
+### Connection and Method
 
-- `-u, --uri <URI>` — Full ICAP URI, e.g. `icap://host[:port]/service` or `icaps://host[:port]/service`  
-  *Default:* `icap://127.0.0.1:1344/`
-- `-m, --method <METHOD>` — One of `OPTIONS|REQMOD|RESPMOD` (auto‑selected if omitted)
-- `-f, --filename <FILE>` — Read body from file (defaults workflow to RESPMOD, like c-icap-client)
-- `-o, --output <FILE>` — Save ICAP response body to this file (default: stdout)
-- `-t, --timeout <SECS>` — Client read timeout in seconds (no timeout by default)
+- `-u, --uri <URI>`: full ICAP URI, for example
+  `icap://host[:port]/service` or `icaps://host[:port]/service`.
+  Default: `icap://127.0.0.1:1344/`.
+- `-m, --method <METHOD>`: ICAP method: `OPTIONS`, `REQMOD`, or `RESPMOD`.
+- `-t, --timeout <SECS>`: client read timeout in seconds. By default no read
+  timeout is applied.
+- `-d, --debug-level <LEVEL>`: enable logs, where higher values are more
+  verbose.
 
-### ICAP semantics
+### Payload
 
-- `--req <URL>` — Send **REQMOD** for the given request URL (origin‑form or absolute)
-- `--resp <URL>` — Annotate **RESPMOD** with a source URL (X-Resp-Source header)
-- `-w, --preview-size <N>` — Force explicit Preview size
-- `--ieof` — With `--preview-size 0`, send the `ieof` fast‑204 hint
-- `--nopreview` — Shortcut for `Preview: 0` (no `ieof`); useful with `--stream-io`
-- `--no204` — Do **not** advertise `Allow: 204`
-- `--206` — Advertise `Allow: 206` and accept partial-content responses with `use-original-body`.
-- `--stream-io` — Do not buffer the file; stream chunks after `100 Continue`
+- `-f, --filename <FILE>`: send this file to the ICAP server. If no method is
+  specified, this selects `RESPMOD`.
+- `-o, --output <FILE>`: save the response body to a file. By default the body
+  is written to stdout.
+- `--stream-io`: stream the file body instead of buffering it in memory.
+
+### ICAP Semantics
+
+- `--req <URL>`: send `REQMOD` with the given HTTP request URL.
+- `--resp <URL>`: annotate `RESPMOD` with a source URL.
+- `-w, --preview-size <N>`: force `Preview: N`.
+- `--ieof`: with `--preview-size 0`, send `0; ieof`.
+- `--nopreview`: force `Preview: 0` without `ieof`.
+- `--no204`: do not advertise `Allow: 204` outside preview flow.
+- `--206`: advertise `Allow: 206` and accept partial-content
+  no-modification responses using `use-original-body`.
+- `--noreshdr`: compatibility no-op kept for parity with `c-icap-client`.
 
 ### Headers
 
-- `-x, --xheader "Header: Value"` — Extra ICAP headers (repeatable)
-- `--hx "Header: Value"` — Extra **HTTP request** headers (repeatable)
-- `--rhx "Header: Value"` — Extra **HTTP response** headers (repeatable)
+- `-x, --xheader "Header: Value"`: add an ICAP header. Repeatable.
+- `--hx "Header: Value"`: add an embedded HTTP request header. Repeatable.
+- `--rhx "Header: Value"`: add an embedded HTTP response header. Repeatable.
 
-### TLS (ICAPS) options (rustls)
+### TLS
 
-These are effective only when URI starts with `icaps://` **and** the binary is built with `tls-rustls`.
+These options are effective only for `icaps://` URIs.
 
-- `--tls-backend rustls` — Select rustls (only valid choice for this build)
-- `--tls-ca <PEM_FILE>` — Add a local CA bundle (PEM) to rustls trust store (for self‑signed/testing)
-- `--sni <HOSTNAME>` — Override SNI used during TLS handshake
-- `--insecure` — Compatibility flag. With rustls **0.23** it is ignored.
+- `--tls-backend rustls`: select the Rustls backend.
+- `--tls-ca <PEM_FILE>`: add an extra CA bundle to the Rustls trust store.
+- `--sni <HOSTNAME>`: override SNI and certificate verification name.
+- `--insecure`: compatibility flag. With Rustls 0.23 it is ignored; certificate
+  verification is not disabled.
 
-### Output & debug
+### Output and Debugging
 
-- `-v, --verbose` — Print parsed ICAP response headers and metadata
-- `-p, --print-request` — Print **exact ICAP wire** that would be sent, then exit
-- `-d, --debug-level <1..5>` — Enable logs (1=errors … 5=trace)
----
+- `-v, --verbose`: print parsed ICAP response headers and metadata.
+- `-p, --print-request`: print the generated ICAP request and exit.
 
 ## Examples
 
-### 1) Basic `OPTIONS`
+### OPTIONS
 
 ```bash
-rs-icap-client -u icap://127.0.0.1:1344/options -v -d 3
+cargo run -p rs-icap-client -- \
+  -u icap://127.0.0.1:1344/respmod \
+  -m OPTIONS \
+  -v
 ```
 
-### 2) `REQMOD` with Preview autodetection
+### REQMOD
 
-If you don’t force `--preview-size`, the client first negotiates using `OPTIONS` and then sends REQMOD.
+If `--preview-size` is not provided, the client first probes server
+capabilities with `OPTIONS` and then sends the modifying request.
 
 ```bash
-rs-icap-client -u icap://127.0.0.1:1344/scan \
-  --req http://example.com/
+cargo run -p rs-icap-client -- \
+  -u icap://127.0.0.1:1344/scan \
+  --req http://origin.example/
 ```
 
-### 3) `REQMOD` with explicit `Preview: 0` + `ieof`
+### REQMOD with `Preview: 0` and `ieof`
 
 ```bash
-rs-icap-client -u icap://127.0.0.1:1344/scan \
-  --req http://example.com/ -w 0 --ieof
+cargo run -p rs-icap-client -- \
+  -u icap://127.0.0.1:1344/scan \
+  --req http://origin.example/ \
+  --preview-size 0 \
+  --ieof
 ```
 
-### 4) `RESPMOD` from a file (buffered in memory)
+### RESPMOD from a File
 
 ```bash
-rs-icap-client -u icap://127.0.0.1:1344/respmod \
-  --resp http://example.com/page.html \
-  -f ./page.html -v
+cargo run -p rs-icap-client -- \
+  -u icap://127.0.0.1:1344/respmod \
+  --resp http://origin.example/page.html \
+  -f ./page.html \
+  -v
 ```
 
-### 5) `RESPMOD` streaming a large file (no buffering)
+### Streaming RESPMOD
 
 ```bash
-rs-icap-client -u icap://127.0.0.1:1344/respmod \
-  --resp http://example.com/big.zip \
-  -f ./big.zip --stream-io -w 0
+cargo run -p rs-icap-client -- \
+  -u icap://127.0.0.1:1344/respmod \
+  --resp http://origin.example/big.zip \
+  -f ./big.zip \
+  --stream-io \
+  --preview-size 0
 ```
 
-### 6) Print the exact ICAP request (dry‑run)
+### Advertise `Allow: 206`
 
 ```bash
-rs-icap-client -u icap://127.0.0.1:1344/scan \
-  --req http://example.com/ \
-  -p
+cargo run -p rs-icap-client -- \
+  -u icap://127.0.0.1:1344/respmod \
+  --resp http://origin.example/page.html \
+  -f ./page.html \
+  --206 \
+  -v
 ```
 
-### 7) ICAPS (TLS) with a local CA and custom SNI
-
-First, build with rustls:
+### Print the ICAP Request
 
 ```bash
-cargo build --release --features "tls-rustls"
+cargo run -p rs-icap-client -- \
+  -u icap://127.0.0.1:1344/scan \
+  --req http://origin.example/ \
+  --print-request
 ```
 
-Then run:
+### ICAPS with a Local CA
 
 ```bash
-rs-icap-client -u icaps://localhost:2346/test \
+cargo run -p rs-icap-client -- \
+  -u icaps://localhost:11344/scan \
   --tls-backend rustls \
-  --tls-ca /path/to/ca.crt \
+  --tls-ca test_data/certs/ca.crt \
   --sni localhost \
-  -v -d 4
+  -m OPTIONS \
+  -v
 ```
 
-> If your server uses a self‑signed certificate, add its **CA** via `--tls-ca`.  
-> `--insecure` is ignored with rustls 0.23 and is not recommended for production.
+## Behavior Notes
 
----
+- `icap://` defaults to port `1344`.
+- `icaps://` defaults to port `11344`.
+- Header names are case-insensitive. Printed ICAP headers use canonical names
+  such as `Encapsulated`, `ISTag`, and `Preview`.
+- With `--stream-io` or `Preview: 0`, the client sends the request head and
+  preview marker, waits for `100 Continue`, and then streams the remaining file
+  body.
+- If neither `Allow: 204` nor Preview is used, an RFC-aware server may avoid
+  `204 No Content` and return an encapsulated `200 OK` response instead.
+- `--206` allows a no-modification response to preserve the original body
+  suffix via the `use-original-body` marker.
 
-## Notes & behavior
+## Related Documentation
 
-- When neither `Allow: 204` nor `Preview` is used, some ICAP servers will *not* return `204`.  
-  The companion `icap-rs` server, for example, returns `200` and echoes the embedded HTTP message.
-- With `--stream-io` (or `Preview: 0`), the client sends headers + preview and waits for `100 Continue` before
-  streaming file chunks.
-- Header names are case‑insensitive; when printing, ICAP header names are canonicalized (`Encapsulated`, `ISTag`, etc.).
-
----
-
-## License
-
-Same license as the parent `icap-rs` project (see the repository for details).
+- [`icap-rs` library guide](../icap-rs/README.md)
+- [TLS and ICAPS](../icap-rs/docs/tls.md)
+- [RFC 3507 support matrix](../icap-rs/docs/rfc3507.md)

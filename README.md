@@ -1,129 +1,100 @@
-# ICAP in Rust
+# icap-rs
 
-This repository contains a set of Rust crates for working with the ICAP
-protocol ([RFC 3507](https://datatracker.ietf.org/doc/html/rfc3507)).
+Rust crates for building ICAP/1.0 clients and services, with protocol behavior
+guided by [RFC 3507](https://www.rfc-editor.org/rfc/rfc3507).
+
+The project favors explicit wire-level behavior over hidden compatibility
+magic: malformed ICAP requests should become protocol errors, unsupported RFC
+features should be visible, and compatibility modes should be documented and
+tested.
 
 ## Crates
 
-### `icap-rs`
+| Crate | Status | Purpose |
+| --- | --- | --- |
+| [`icap-rs`](icap-rs/README.md) | Active | Core library with client APIs, server APIs, ICAP request/response types, parsers, serializers, Preview handling, embedded HTTP support, and optional Rustls-based ICAPS. |
+| [`rs-icap-client`](rs-icap-client/README.md) | Active | CLI ICAP client for `OPTIONS`, `REQMOD`, and `RESPMOD`, including Preview, streaming uploads, `Allow: 204`, `Allow: 206`, and ICAPS. |
+| `rs-icap-server` | Placeholder binary | Workspace member reserved for a standalone server binary. The usable server implementation currently lives in the `icap-rs` library API. |
 
-Core ICAP library providing protocol primitives.
+## Supported Protocol Areas
 
-### `rs-icap-client`
+- ICAP/1.0 request and response serialization/parsing.
+- `OPTIONS`, `REQMOD`, and `RESPMOD`.
+- Required `Host` header validation.
+- Case-insensitive ICAP header lookup and canonical wire output.
+- Method-specific `Encapsulated` validation.
+- Embedded HTTP request and response heads/bodies.
+- RFC 3507 response framing: embedded HTTP heads are unchunked; encapsulated
+  entity bodies use ICAP chunked framing.
+- Preview flows, including `Preview: 0`, `ieof`, and `100 Continue`.
+- Server-side preview-aware handlers that may return a final response before
+  `100 Continue`.
+- `204 No Content` guard behavior for requests that do not advertise `Allow:
+  204` and do not use Preview.
+- `206 Partial Content` no-modification responses using the
+  `use-original-body` marker.
+- `ISTag` validation for successful ICAP responses.
+- Keep-alive connection reuse without pipelining.
+- Direct ICAPS (`icaps://`) via Rustls when the `tls-rustls` feature is
+  enabled.
+- TLS listener and mTLS support in the library server API.
 
-Command-line ICAP client inspired by `c-icap-client`.
+See [`icap-rs/docs/rfc3507.md`](icap-rs/docs/rfc3507.md) for the RFC-oriented
+support matrix and known gaps.
 
-### `rs-icap-server`
+## Partial or Explicit Compatibility Behavior
 
-ICAP server implementation inspired by `c-icap`.
+- `OPTIONS` without `Encapsulated` is rejected by the strict request parser.
+  The server can opt into a compatibility request parser for legacy peers.
+- `Transfer-Preview`, `Transfer-Ignore`, and `Transfer-Complete` can be
+  advertised by the server, but the client does not automatically apply the
+  full RFC transfer policy model.
+- Cache-related headers such as `ISTag` and `Options-TTL` can be emitted and
+  parsed, but the client does not implement a complete OPTIONS cache
+  invalidation model.
+- Service routing is currently based on the resolved service path segment, not
+  the full RFC service URI identity model.
+- Chunk extensions used by supported flows are parsed, but structured trailer
+  headers do not have a first-class API.
 
-## Implemented
+## Not Implemented
 
-### Core protocol
+- RFC 3507 `Upgrade` TLS negotiation. Use direct `icaps://` instead.
+- Built-in ICAP proxy/service authentication.
+- Full RFC cache model.
+- Full structured trailer API.
+- Complete external interoperability fixture suite.
 
-- [x] ICAP over TCP
-- [x] ICAP/1.0 parsing and validation
-- [x] `OPTIONS`
-- [x] `REQMOD`
-- [x] `RESPMOD`
-- [x] Required `Host` header
-- [x] Case-insensitive headers
-- [x] Keep-alive connections without pipelining
-- [x] Basic `Encapsulated` parsing and validation
-- [x] Embedded HTTP request support
-- [x] Embedded HTTP response support
-- [x] Chunked encapsulated request body handling
-- [x] RFC-compliant ICAP response framing for embedded HTTP
-- [x] RFC-compliant response reader for embedded HTTP
-- [x] Server-side dechunking
-- [x] Preview support
-- [x] `Preview: 0`
-- [x] `Preview: N`
-- [x] `ieof`
-- [x] `100 Continue` preview flow
-- [x] Preview-aware server decision handler before `100 Continue`
-- [x] `204 No Content`
-- [x] `ISTag` validation
-- [x] OPTIONS capability responses
-- [x] `Max-Connections`
-- [x] Early `503 Service Unavailable`
-- [x] ICAP `400 Bad Request` for malformed requests
-- [x] ICAP `501 Not Implemented` for unknown methods
-- [x] Method-specific `Encapsulated` request validation
-- [x] Strict request parser mode by default
-- [x] TLS / ICAPS support (`icaps://`)
-- [x] TLS listener support
-- [x] mTLS support
+## Quick Start
 
-### Client
+Build the workspace:
 
-- [x] Build and send `OPTIONS`
-- [x] Build and send `REQMOD`
-- [x] Build and send `RESPMOD`
-- [x] Streaming uploads
-- [x] Keep-alive connection reuse
-- [x] Preview negotiation
-- [x] `Allow: 204`
-- [x] `Allow: 206` partial-content response parsing
-- [x] ICAPS client support
+```bash
+cargo build --workspace
+```
 
-### Server
+Run the library example server:
 
-- [x] Async TCP listener
-- [x] `REQMOD` routing
-- [x] `RESPMOD` routing
-- [x] Automatic OPTIONS responses
-- [x] Preview wire-level handshake
-- [x] Embedded HTTP parsing
-- [x] `Allow: 206` no-modification responses with `use-original-body`
-- [x] Connection limiting
-- [x] TLS server support
+```bash
+cargo run -p icap-rs --example server
+```
 
-### Tests
+Send an `OPTIONS` request with the CLI:
 
-- [x] Keep-alive tests
-- [x] Preview tests
-- [x] Max connections tests
-- [x] Early response tests
-- [x] Header parser tests
-- [x] Encapsulated parser tests
+```bash
+cargo run -p rs-icap-client -- -u icap://127.0.0.1:1344/respmod -m OPTIONS -v
+```
 
----
+Build with TLS support:
 
-## Partially Implemented / Needs Improvement
+```bash
+cargo build --workspace --all-features
+```
 
-- [ ] Proper ICAP `405 Method Not Allowed`
-- [ ] Automatic `Transfer-Preview` handling
-- [ ] Automatic `Transfer-Ignore` handling
-- [ ] Automatic `Transfer-Complete` handling
-- [ ] Cache semantics for `ISTag` and `Options-TTL`
-- [ ] Automatic HTTP hop-by-hop header handling
-- [ ] Full service URI semantics
-- [ ] Structured trailer header support
-- [ ] Preview-aware streaming decisions
-- [ ] Better external interoperability support
+## Documentation
 
----
-
-## Not Implemented Yet
-
-- [ ] ICAP `Upgrade` TLS negotiation
-- [ ] Built-in ICAP authentication / authorization
-- [ ] Full RFC cache model
-- [ ] Strict ABNF validation mode
-- [ ] Full wire-level RFC conformance suite
-- [ ] External ICAP interoperability fixture suite
-- [ ] Golden serialization tests
-- [ ] Golden wire-level response tests
-
----
-
-## Project Goals
-
-- [x] Practical ICAP implementation in Rust
-- [x] Async-first architecture
-- [x] Idiomatic Rust APIs
-- [x] Real-world interoperability
-- [ ] Stronger RFC 3507 compliance
-- [ ] Full protocol conformance testing
-- [ ] Production-grade interoperability coverage
+- [`icap-rs` library guide](icap-rs/README.md)
+- [`rs-icap-client` CLI guide](rs-icap-client/README.md)
+- [`TLS and ICAPS`](icap-rs/docs/tls.md)
+- [`RFC 3507 support matrix`](icap-rs/docs/rfc3507.md)
+- [`CHANGELOG.md`](CHANGELOG.md)
