@@ -18,3 +18,4 @@
 - `Client` and `Response::from_raw` now read RFC-compliant embedded HTTP responses as `Response.body = HTTP head + dechunked HTTP body`, without chunk-size metadata.
 - Server request parsing now returns ICAP `400 Bad Request` for malformed wire requests and `501 Not Implemented` for unknown methods.
 - Request parsing now rejects method-incompatible `Encapsulated` forms, `null-body` mixed with body tokens, and `OPTIONS` without `Encapsulated` unless compatibility mode is explicitly enabled.
+- Added `Allow: 206` no-modification responses using the `use-original-body` partial-content marker.

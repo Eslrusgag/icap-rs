@@ -163,6 +163,9 @@ pub fn serialize_icap_response(resp: &Response) -> Vec<u8> {
 
     let mut out = head.into_bytes();
     if resp.body.is_empty() {
+        if let Some(offset) = resp.use_original_body {
+            out.extend_from_slice(format!("0; use-original-body={offset}\r\n\r\n").as_bytes());
+        }
         return out;
     }
 
@@ -184,7 +187,11 @@ pub fn serialize_icap_response(resp: &Response) -> Vec<u8> {
         if split < resp.body.len() {
             write_chunk_into(&mut out, &resp.body[split..]);
         }
-        out.extend_from_slice(b"0\r\n\r\n");
+        if let Some(offset) = resp.use_original_body {
+            out.extend_from_slice(format!("0; use-original-body={offset}\r\n\r\n").as_bytes());
+        } else {
+            out.extend_from_slice(b"0\r\n\r\n");
+        }
     } else {
         out.extend_from_slice(&resp.body);
     }

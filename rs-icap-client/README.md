@@ -59,7 +59,7 @@ rs-icap-client [OPTIONS]
 - `--ieof` — With `--preview-size 0`, send the `ieof` fast‑204 hint
 - `--nopreview` — Shortcut for `Preview: 0` (no `ieof`); useful with `--stream-io`
 - `--no204` — Do **not** advertise `Allow: 204`
-- `--206` — Advertise/accept `Allow: 206`
+- `--206` — Advertise `Allow: 206` and accept partial-content responses with `use-original-body`.
 - `--stream-io` — Do not buffer the file; stream chunks after `100 Continue`
 
 ### Headers

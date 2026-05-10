@@ -477,7 +477,9 @@ impl Server {
                                 PreviewDecision::Respond(resp) => {
                                     let should_close = !matches!(
                                         resp.status_code,
-                                        StatusCode::OK | StatusCode::NO_CONTENT
+                                        StatusCode::OK
+                                            | StatusCode::NO_CONTENT
+                                            | StatusCode::PARTIAL_CONTENT
                                     );
                                     let resp = if should_close {
                                         resp.add_header("Connection", "close")
@@ -571,6 +573,7 @@ impl Server {
                                 .with_static_istag(&format!("{service_resolved}-default-1.0"))
                                 .with_options_ttl(3600)
                                 .add_allow("204")
+                                .add_allow("206")
                         },
                         Clone::clone,
                     );
@@ -584,11 +587,8 @@ impl Server {
                     }
                     cfg.build_response_for(&req)
                 } else {
-                    let allow_204 = req
-                        .icap_headers
-                        .get("Allow")
-                        .and_then(|v| v.to_str().ok())
-                        .is_some_and(|s| s.split(',').any(|t| t.trim() == "204"));
+                    let allow_204 = req.allow_204;
+                    let allow_206 = req.allow_206;
                     let has_preview = req.icap_headers.get("Preview").is_some();
 
                     if !allow_204 && !has_preview {
@@ -597,51 +597,58 @@ impl Server {
                             |opts| opts.istag_for(&req),
                         );
 
-                        let mut out =
-                            Response::new(StatusCode::OK, "OK").try_set_istag(&istag_now)?;
+                        if allow_206
+                            && let Some(out) =
+                                Self::build_206_use_original_body(&req, method, &istag_now)?
+                        {
+                            out
+                        } else {
+                            let mut out =
+                                Response::new(StatusCode::OK, "OK").try_set_istag(&istag_now)?;
 
-                        match (&req.embedded, method) {
-                            (
-                                Some(EmbeddedHttp::Resp {
-                                    head,
-                                    body: Body::Full { reader },
-                                }),
-                                Method::RespMod,
-                            ) => {
-                                let mut builder = http::Response::builder()
-                                    .status(head.status())
-                                    .version(head.version());
-                                if let Some(h) = builder.headers_mut() {
-                                    h.extend(head.headers().clone());
+                            match (&req.embedded, method) {
+                                (
+                                    Some(EmbeddedHttp::Resp {
+                                        head,
+                                        body: Body::Full { reader },
+                                    }),
+                                    Method::RespMod,
+                                ) => {
+                                    let mut builder = http::Response::builder()
+                                        .status(head.status())
+                                        .version(head.version());
+                                    if let Some(h) = builder.headers_mut() {
+                                        h.extend(head.headers().clone());
+                                    }
+                                    let http_resp = builder.body(reader.clone()).map_err(|e| {
+                                        format!("build http::Response from embedded: {e}")
+                                    })?;
+                                    out = out.with_http_response(&http_resp)?;
                                 }
-                                let http_resp = builder.body(reader.clone()).map_err(|e| {
-                                    format!("build http::Response from embedded: {e}")
-                                })?;
-                                out = out.with_http_response(&http_resp)?;
-                            }
-                            (
-                                Some(EmbeddedHttp::Req {
-                                    head,
-                                    body: Body::Full { reader },
-                                }),
-                                Method::ReqMod,
-                            ) => {
-                                let mut builder = http::Request::builder()
-                                    .method(head.method().clone())
-                                    .uri(head.uri().clone())
-                                    .version(head.version());
-                                if let Some(h) = builder.headers_mut() {
-                                    h.extend(head.headers().clone());
+                                (
+                                    Some(EmbeddedHttp::Req {
+                                        head,
+                                        body: Body::Full { reader },
+                                    }),
+                                    Method::ReqMod,
+                                ) => {
+                                    let mut builder = http::Request::builder()
+                                        .method(head.method().clone())
+                                        .uri(head.uri().clone())
+                                        .version(head.version());
+                                    if let Some(h) = builder.headers_mut() {
+                                        h.extend(head.headers().clone());
+                                    }
+                                    let http_req = builder.body(reader.clone()).map_err(|e| {
+                                        format!("build http::Request from embedded: {e}")
+                                    })?;
+                                    out = out.with_http_request(&http_req)?;
                                 }
-                                let http_req = builder.body(reader.clone()).map_err(|e| {
-                                    format!("build http::Request from embedded: {e}")
-                                })?;
-                                out = out.with_http_request(&http_req)?;
+                                _ => {}
                             }
-                            _ => {}
+
+                            out
                         }
-
-                        out
                     } else if let Some(handler_entry) = entry.handlers.get(&method) {
                         match (handler_entry.handler)(req).await? {
                             PreviewDecision::Respond(resp) => resp,
@@ -667,7 +674,10 @@ impl Server {
                 Response::new(StatusCode::NOT_FOUND, "Service Not Found")
             };
 
-            let should_close = !matches!(resp.status_code, StatusCode::OK | StatusCode::NO_CONTENT);
+            let should_close = !matches!(
+                resp.status_code,
+                StatusCode::OK | StatusCode::NO_CONTENT | StatusCode::PARTIAL_CONTENT
+            );
             let resp = if should_close {
                 resp.add_header("Connection", "close")
             } else {
@@ -721,7 +731,9 @@ impl Server {
         advertised_max: Option<usize>,
         req: &Request,
     ) -> Response {
-        let mut cfg = ServiceOptions::new().with_static_istag(service_name);
+        let mut cfg = ServiceOptions::new()
+            .with_static_istag(service_name)
+            .add_allow("206");
 
         cfg.set_methods([Method::RespMod]);
         cfg = cfg.with_service(&format!("ICAP Service {service_name}"));
@@ -731,6 +743,35 @@ impl Server {
         }
 
         cfg.build_response_for(req)
+    }
+
+    fn build_206_use_original_body(
+        req: &Request,
+        method: Method,
+        istag: &str,
+    ) -> IcapResult<Option<Response>> {
+        let out =
+            Response::new(StatusCode::PARTIAL_CONTENT, "Partial Content").try_set_istag(istag)?;
+
+        let out = match (&req.embedded, method) {
+            (
+                Some(EmbeddedHttp::Resp {
+                    head,
+                    body: Body::Full { .. },
+                }),
+                Method::RespMod,
+            ) => out.with_http_response_head_and_original_body(head, 0)?,
+            (
+                Some(EmbeddedHttp::Req {
+                    head,
+                    body: Body::Full { .. },
+                }),
+                Method::ReqMod,
+            ) => out.with_http_request_head_and_original_body(head, 0)?,
+            _ => return Ok(None),
+        };
+
+        Ok(Some(out))
     }
 }
 

@@ -64,7 +64,7 @@ ICAP server implementation inspired by `c-icap`.
 - [x] Keep-alive connection reuse
 - [x] Preview negotiation
 - [x] `Allow: 204`
-- [x] `Allow: 206` flag parsing
+- [x] `Allow: 206` partial-content response parsing
 - [x] ICAPS client support
 
 ### Server
@@ -75,6 +75,7 @@ ICAP server implementation inspired by `c-icap`.
 - [x] Automatic OPTIONS responses
 - [x] Preview wire-level handshake
 - [x] Embedded HTTP parsing
+- [x] `Allow: 206` no-modification responses with `use-original-body`
 - [x] Connection limiting
 - [x] TLS server support
 
@@ -92,7 +93,6 @@ ICAP server implementation inspired by `c-icap`.
 ## Partially Implemented / Needs Improvement
 
 - [ ] Proper ICAP `405 Method Not Allowed`
-- [ ] Full `Allow: 206` semantics
 - [ ] Automatic `Transfer-Preview` handling
 - [ ] Automatic `Transfer-Ignore` handling
 - [ ] Automatic `Transfer-Complete` handling

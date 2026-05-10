@@ -228,6 +228,24 @@ async fn no_allow_header_must_be_200() {
 }
 
 #[tokio::test]
+async fn respmod_allow_206_can_receive_partial_content_with_original_body_marker() {
+    let port = 13529;
+    start_server_on(port).await;
+
+    let client = Client::builder().host("127.0.0.1").port(port).build();
+
+    let req = Request::respmod("respmod")
+        .allow_206()
+        .with_http_response(make_embedded_http("hello"));
+
+    let resp = client.send(&req).await.expect("icap send");
+
+    assert_eq!(resp.status_code, StatusCode::PARTIAL_CONTENT);
+    assert_eq!(resp.use_original_body_offset(), Some(0));
+    assert!(!String::from_utf8_lossy(&resp.body).contains("hello"));
+}
+
+#[tokio::test]
 async fn unknown_method_returns_501_not_implemented() {
     let port = 13522;
     start_server_on(port).await;

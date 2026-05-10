@@ -113,7 +113,7 @@ struct Args {
     #[arg(long, action = clap::ArgAction::SetTrue)]
     no204: bool,
 
-    /// Advertise/accept `Allow: 206`.
+    /// Advertise `Allow: 206` and accept partial-content responses.
     #[arg(long = "206", action = clap::ArgAction::SetTrue)]
     allow_206: bool,
 

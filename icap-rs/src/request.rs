@@ -506,11 +506,15 @@ impl<R> Request<R> {
         self
     }
 
-    /// Advertise `Allow: 204` / `Allow: 206`.
+    /// Advertise `Allow: 204`.
     pub const fn allow_204(mut self) -> Self {
         self.allow_204 = true;
         self
     }
+    /// Advertise `Allow: 206`.
+    ///
+    /// The companion server can answer eligible no-modification flows with
+    /// `206 Partial Content` and `use-original-body`.
     pub const fn allow_206(mut self) -> Self {
         self.allow_206 = true;
         self

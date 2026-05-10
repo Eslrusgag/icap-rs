@@ -32,7 +32,7 @@ use crate::ICAP_VERSION;
 use crate::error::{Error, IcapResult};
 use crate::parser::icap::{Encapsulated, find_double_crlf, parse_encapsulated_value};
 use crate::parser::wire::parse_one_chunk;
-use crate::parser::{dechunk_icap_entity, serialize_http_request, serialize_http_response};
+use crate::parser::{serialize_http_request, serialize_http_response};
 use http::{HeaderMap, HeaderName, HeaderValue};
 use memchr::memchr;
 use std::fmt;
@@ -75,6 +75,8 @@ pub struct Response {
     pub status_text: String,
     /// ICAP headers.
     pub(crate) headers: HeaderMap,
+    /// Offset from the original HTTP body to resume after a 206 partial body.
+    pub(crate) use_original_body: Option<usize>,
     /// Optional body (arbitrary payload, chunked HTTP, etc.).
     pub body: Vec<u8>,
 }
@@ -98,6 +100,7 @@ impl Response {
             status_code,
             status_text: status_text.to_string(),
             headers: HeaderMap::new(),
+            use_original_body: None,
             body: Vec::new(),
         }
     }
@@ -120,6 +123,7 @@ impl Response {
             status_code: StatusCode::NO_CONTENT,
             status_text: "No Content".to_string(),
             headers,
+            use_original_body: None,
             body: Vec::new(),
         })
     }
@@ -279,6 +283,25 @@ impl Response {
                 "Encapsulated: null-body must not carry a body".into(),
             ));
         }
+        if let Some(offset) = resp_ref.use_original_body {
+            if resp_ref.status_code != StatusCode::PARTIAL_CONTENT {
+                return Err(Error::Header(
+                    "use-original-body is only valid on 206 Partial Content".into(),
+                ));
+            }
+            let enc_val = resp_ref
+                .headers
+                .get("Encapsulated")
+                .and_then(|v| v.to_str().ok())
+                .ok_or(Error::MissingHeader("Encapsulated"))?;
+            let enc = parse_encapsulated_value(enc_val)?;
+            if enc.req_body.or(enc.res_body).or(enc.opt_body).is_none() {
+                return Err(Error::Header(
+                    "use-original-body requires an encapsulated body offset".into(),
+                ));
+            }
+            trace!(offset, "serializing 206 use-original-body marker");
+        }
         Ok(crate::parser::serialize_icap_response(resp_ref))
     }
 
@@ -295,6 +318,15 @@ impl Response {
     /// Return a read-only view of all ICAP headers.
     pub const fn headers(&self) -> &HeaderMap {
         &self.headers
+    }
+
+    /// Return the `use-original-body` offset from a parsed or constructed 206 response.
+    ///
+    /// When present, the response carries an ICAP zero-chunk extension telling
+    /// the client to append the original HTTP entity body starting at this byte
+    /// offset after any partial body bytes included in the 206 response.
+    pub const fn use_original_body_offset(&self) -> Option<usize> {
+        self.use_original_body
     }
 
     /// Check whether a header exists.
@@ -331,6 +363,7 @@ impl Response {
         let hv = HeaderValue::from_str(&enc)?;
 
         self.body = bytes;
+        self.use_original_body = None;
         self.headers
             .insert(HeaderName::from_static("encapsulated"), hv);
         Ok(self)
@@ -345,8 +378,70 @@ impl Response {
         let hv = HeaderValue::from_str(&enc)?;
 
         self.body = bytes;
+        self.use_original_body = None;
         self.headers
             .insert(HeaderName::from_static("encapsulated"), hv);
+        Ok(self)
+    }
+
+    /// Attach an embedded HTTP request head and emit a 206 `use-original-body` marker.
+    ///
+    /// The serialized response will contain the HTTP request head, no adapted
+    /// body bytes, and a final ICAP chunk `0; use-original-body=<offset>`.
+    pub fn with_http_request_head_and_original_body(
+        mut self,
+        head: &http::Request<()>,
+        offset: usize,
+    ) -> IcapResult<Self> {
+        let mut builder = http::Request::builder()
+            .method(head.method().clone())
+            .uri(head.uri().clone())
+            .version(head.version());
+        if let Some(headers) = builder.headers_mut() {
+            headers.extend(head.headers().clone());
+        }
+        let http = builder
+            .body(Vec::new())
+            .map_err(|e| Error::Body(format!("build embedded HTTP request head: {e}")))?;
+        let bytes = serialize_http_request(&http);
+        let hdr_end = find_double_crlf(&bytes)
+            .ok_or_else(|| Error::Header("embedded HTTP request missing CRLFCRLF".into()))?;
+        self.body = bytes;
+        self.use_original_body = Some(offset);
+        self.headers.insert(
+            HeaderName::from_static("encapsulated"),
+            HeaderValue::from_str(&format!("req-hdr=0, req-body={hdr_end}"))?,
+        );
+        Ok(self)
+    }
+
+    /// Attach an embedded HTTP response head and emit a 206 `use-original-body` marker.
+    ///
+    /// The serialized response will contain the HTTP response head, no adapted
+    /// body bytes, and a final ICAP chunk `0; use-original-body=<offset>`.
+    pub fn with_http_response_head_and_original_body(
+        mut self,
+        head: &http::Response<()>,
+        offset: usize,
+    ) -> IcapResult<Self> {
+        let mut builder = http::Response::builder()
+            .status(head.status())
+            .version(head.version());
+        if let Some(headers) = builder.headers_mut() {
+            headers.extend(head.headers().clone());
+        }
+        let http = builder
+            .body(Vec::new())
+            .map_err(|e| Error::Body(format!("build embedded HTTP response head: {e}")))?;
+        let bytes = serialize_http_response(&http);
+        let hdr_end = find_double_crlf(&bytes)
+            .ok_or_else(|| Error::Header("embedded HTTP response missing CRLFCRLF".into()))?;
+        self.body = bytes;
+        self.use_original_body = Some(offset);
+        self.headers.insert(
+            HeaderName::from_static("encapsulated"),
+            HeaderValue::from_str(&format!("res-hdr=0, res-body={hdr_end}"))?,
+        );
         Ok(self)
     }
 }
@@ -493,6 +588,7 @@ fn parse_response_head_parts(raw: &[u8]) -> IcapResult<ParsedResponseHead> {
             status_code,
             status_text,
             headers,
+            use_original_body: None,
             body: Vec::new(),
         },
         header_end: hdr_end,
@@ -534,7 +630,14 @@ pub(crate) fn parse_icap_response(raw: &[u8]) -> IcapResult<Response> {
             }
             StatusCode::OK | StatusCode::PARTIAL_CONTENT => {
                 let enc = parse_encapsulated_value(enc_val)?;
-                dechunk_response_body_if_needed(&enc, &mut body)?;
+                response.use_original_body = dechunk_response_body_if_needed(&enc, &mut body)?;
+                if response.use_original_body.is_some()
+                    && response.status_code != StatusCode::PARTIAL_CONTENT
+                {
+                    return Err(Error::Header(
+                        "use-original-body is only valid on 206 Partial Content".into(),
+                    ));
+                }
                 validate_encapsulated_offsets(&enc, body.len())?;
             }
             _ => {}
@@ -561,9 +664,12 @@ fn validate_encapsulated_offsets(enc: &Encapsulated, enc_len: usize) -> IcapResu
     Ok(())
 }
 
-fn dechunk_response_body_if_needed(enc: &Encapsulated, body: &mut Vec<u8>) -> IcapResult<()> {
+fn dechunk_response_body_if_needed(
+    enc: &Encapsulated,
+    body: &mut Vec<u8>,
+) -> IcapResult<Option<usize>> {
     let Some(body_start) = enc.req_body.or(enc.res_body).or(enc.opt_body) else {
-        return Ok(());
+        return Ok(None);
     };
 
     if body_start > body.len() {
@@ -579,10 +685,69 @@ fn dechunk_response_body_if_needed(enc: &Encapsulated, body: &mut Vec<u8>) -> Ic
     }
 
     let mut chunked = &body[body_start..];
-    let decoded = dechunk_icap_entity(&mut chunked)
+    let (decoded, use_original_body) = dechunk_icap_entity_with_use_original_body(&mut chunked)
         .map_err(|e| Error::Body(format!("dechunk ICAP entity: {e}")))?;
     body.splice(body_start.., decoded);
-    Ok(())
+    Ok(use_original_body)
+}
+
+fn dechunk_icap_entity_with_use_original_body(
+    data: &mut &[u8],
+) -> Result<(Vec<u8>, Option<usize>), String> {
+    let mut out = Vec::with_capacity((*data).len());
+    let mut d = *data;
+
+    loop {
+        let crlf_pos = memchr::memmem::find(d, b"\r\n").ok_or("chunk size line without CRLF")?;
+        let (size_line, rest) = d.split_at(crlf_pos);
+        d = &rest[2..];
+
+        let size_hex = memchr(b';', size_line).map_or(size_line, |i| &size_line[..i]);
+        let size_str = core::str::from_utf8(size_hex).map_err(|_| "chunk size not utf8")?;
+        let size = usize::from_str_radix(size_str.trim(), 16).map_err(|_| "chunk size not hex")?;
+
+        if size == 0 {
+            let use_original_body = parse_use_original_body_extension(size_line)?;
+            if d.starts_with(b"\r\n") {
+                d = &d[2..];
+            } else {
+                return Err("missing final CRLF after zero chunk".into());
+            }
+            *data = d;
+            return Ok((out, use_original_body));
+        }
+
+        if d.len() < size + 2 {
+            return Err("incomplete chunk data".into());
+        }
+        out.extend_from_slice(&d[..size]);
+        d = &d[size..];
+        if !d.starts_with(b"\r\n") {
+            return Err("missing CRLF after chunk".into());
+        }
+        d = &d[2..];
+    }
+}
+
+fn parse_use_original_body_extension(size_line: &[u8]) -> Result<Option<usize>, String> {
+    let Some(ext_start) = memchr(b';', size_line) else {
+        return Ok(None);
+    };
+    let ext_text = core::str::from_utf8(&size_line[ext_start + 1..])
+        .map_err(|_| "chunk extension not utf8")?;
+    for ext in ext_text.split(';') {
+        let Some((name, value)) = ext.trim().split_once('=') else {
+            continue;
+        };
+        if name.trim().eq_ignore_ascii_case("use-original-body") {
+            return value
+                .trim()
+                .parse::<usize>()
+                .map(Some)
+                .map_err(|_| "use-original-body offset not decimal".to_string());
+        }
+    }
+    Ok(None)
 }
 
 fn encapsulated_offsets(enc: &Encapsulated) -> impl Iterator<Item = usize> {
@@ -863,6 +1028,65 @@ mod tests {
             parsed.body,
             b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"
         );
+    }
+
+    #[test]
+    fn to_raw_206_serializes_use_original_body_zero_chunk_extension() {
+        let http = http::Response::builder()
+            .status(http::StatusCode::OK)
+            .version(http::Version::HTTP_11)
+            .header("Content-Length", "5")
+            .body(())
+            .unwrap();
+
+        let raw = Response::new(StatusCode::PARTIAL_CONTENT, "Partial Content")
+            .try_set_istag("x")
+            .unwrap()
+            .with_http_response_head_and_original_body(&http, 0)
+            .unwrap()
+            .to_raw()
+            .unwrap();
+        let text = String::from_utf8(raw).unwrap();
+
+        assert!(text.starts_with("ICAP/1.0 206 Partial Content\r\n"));
+        assert!(text.contains("Encapsulated: res-hdr=0, res-body="));
+        assert!(text.ends_with("\r\n0; use-original-body=0\r\n\r\n"));
+    }
+
+    #[test]
+    fn parse_206_extracts_use_original_body_offset() {
+        let raw = b"ICAP/1.0 206 Partial Content\r\n\
+                    ISTag: x\r\n\
+                    Encapsulated: res-hdr=0, res-body=38\r\n\
+                    \r\n\
+                    HTTP/1.1 200 OK\r\n\
+                    Content-Length: 5\r\n\
+                    \r\n\
+                    0; use-original-body=0\r\n\
+                    \r\n";
+
+        let parsed = parse_icap_response(raw).expect("parse 206 partial content");
+
+        assert_eq!(parsed.status_code, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(parsed.use_original_body_offset(), Some(0));
+        assert_eq!(parsed.body, b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n");
+    }
+
+    #[test]
+    fn parse_rejects_use_original_body_on_200() {
+        let raw = b"ICAP/1.0 200 OK\r\n\
+                    ISTag: x\r\n\
+                    Encapsulated: res-hdr=0, res-body=38\r\n\
+                    \r\n\
+                    HTTP/1.1 200 OK\r\n\
+                    Content-Length: 5\r\n\
+                    \r\n\
+                    0; use-original-body=0\r\n\
+                    \r\n";
+
+        let err = parse_icap_response(raw).expect_err("use-original-body requires 206");
+
+        assert!(err.to_string().contains("206 Partial Content"));
     }
 
     #[test]
