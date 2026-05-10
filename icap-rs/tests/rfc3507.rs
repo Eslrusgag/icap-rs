@@ -14,7 +14,7 @@ use icap_rs::server::{PreviewDecision, Server};
 use icap_rs::{Client, Method};
 use std::net::TcpListener as StdTcpListener;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::time::Duration;
 
 const ISTAG: &str = "rfc3507";
@@ -227,6 +227,32 @@ mod section_4_3_messages {
         )
         .await;
         assert_eq!(first_line(&unknown_method), "ICAP/1.0 501 Not Implemented");
+
+        let missing_host = send_raw_icap_request(
+            port,
+            &format!(
+                "REQMOD icap://127.0.0.1:{port}/respmod ICAP/1.0\r\n\
+                 Encapsulated: null-body=0\r\n\
+                 \r\n"
+            ),
+        )
+        .await;
+        assert_eq!(first_line(&missing_host), "ICAP/1.0 400 Bad Request");
+
+        let invalid_encapsulated = send_raw_icap_request(
+            port,
+            &format!(
+                "REQMOD icap://127.0.0.1:{port}/respmod ICAP/1.0\r\n\
+                 Host: 127.0.0.1:{port}\r\n\
+                 Encapsulated: req-hdr=10, req-body=5\r\n\
+                 \r\n"
+            ),
+        )
+        .await;
+        assert_eq!(
+            first_line(&invalid_encapsulated),
+            "ICAP/1.0 400 Bad Request"
+        );
     }
 }
 
@@ -291,6 +317,55 @@ mod section_4_4_encapsulated {
 
         assert_eq!(
             parsed.body,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"
+        );
+    }
+
+    #[tokio::test]
+    async fn supported_client_reads_rfc_response_with_unchunked_http_head_and_chunked_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("local addr").port();
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut request = Vec::new();
+            let mut tmp = [0u8; 1024];
+            loop {
+                let n = socket.read(&mut tmp).await.expect("read request");
+                assert!(n > 0, "client closed before sending request");
+                request.extend_from_slice(&tmp[..n]);
+                if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+
+            socket
+                .write_all(
+                    b"ICAP/1.0 200 OK\r\n\
+                      ISTag: rfc3507\r\n\
+                      Encapsulated: res-hdr=0, res-body=38\r\n\
+                      \r\n\
+                      HTTP/1.1 200 OK\r\n\
+                      Content-Length: 5\r\n\
+                      \r\n\
+                      5\r\n\
+                      hello\r\n\
+                      0\r\n\
+                      \r\n",
+                )
+                .await
+                .expect("write response");
+        });
+
+        let client = Client::builder().host("127.0.0.1").port(port).build();
+        let response = client
+            .send(&Request::options("svc"))
+            .await
+            .expect("send options");
+
+        assert_eq!(response.status_code, StatusCode::OK);
+        assert_eq!(
+            response.body,
             b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"
         );
     }
@@ -386,6 +461,63 @@ mod sections_4_6_and_4_7_responses {
             .expect_err("2xx without ISTag must fail");
 
         assert!(err.to_string().contains("ISTag"));
+    }
+
+    #[test]
+    fn supported_response_parser_rejects_invalid_rfc_shapes() {
+        let wrong_version = Response::from_raw(
+            b"ICAP/2.0 200 OK\r\n\
+              ISTag: rfc3507\r\n\
+              Encapsulated: null-body=0\r\n\
+              \r\n",
+        )
+        .expect_err("ICAP/2.0 must fail");
+        assert!(wrong_version.to_string().contains("ICAP/2.0"));
+
+        let duplicate_encapsulated = Response::from_raw(
+            b"ICAP/1.0 200 OK\r\n\
+              ISTag: rfc3507\r\n\
+              Encapsulated: res-hdr=0, res-body=100\r\n\
+              Encapsulated: req-hdr=0\r\n\
+              \r\n",
+        )
+        .expect_err("duplicate Encapsulated must fail");
+        assert!(
+            duplicate_encapsulated
+                .to_string()
+                .to_lowercase()
+                .contains("encapsulated")
+        );
+
+        let invalid_204 = Response::from_raw(
+            b"ICAP/1.0 204 No Content\r\n\
+              ISTag: rfc3507\r\n\
+              Encapsulated: res-hdr=0\r\n\
+              \r\n",
+        )
+        .expect_err("204 must use null-body");
+        assert!(invalid_204.to_string().contains("null-body=0"));
+    }
+
+    #[test]
+    fn supported_istag_validation_cases() {
+        let valid = Response::from_raw(
+            b"ICAP/1.0 200 OK\r\n\
+              ISTag: ok-Tag.123\r\n\
+              Encapsulated: null-body=0\r\n\
+              \r\n",
+        )
+        .expect("valid ISTag");
+        assert_eq!(valid.get_header("ISTag").expect("ISTag"), "ok-Tag.123");
+
+        let invalid = Response::from_raw(
+            b"ICAP/1.0 200 OK\r\n\
+              ISTag: BAD TAG\r\n\
+              Encapsulated: null-body=0\r\n\
+              \r\n",
+        )
+        .expect_err("invalid ISTag");
+        assert!(invalid.to_string().to_lowercase().contains("istag"));
     }
 }
 
