@@ -21,3 +21,4 @@
 - Added `Allow: 206` no-modification responses using the `use-original-body` partial-content marker.
 - `rs-icap-client` now reconstructs `206 Partial Content` output by appending the original request body suffix from the `use-original-body` offset.
 - Updated the RFC 3507 supported/unsupported implementation plans to reflect the current release scope and remaining specification gaps.
+- Added an RFC 3507 integration conformance matrix covering supported variants and ignored placeholders for unsupported gaps.
