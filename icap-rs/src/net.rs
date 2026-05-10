@@ -89,7 +89,7 @@ mod conn_def {
 
 #[cfg(not(feature = "tls-rustls"))]
 mod conn_def {
-    use super::*;
+    use super::{AsyncRead, AsyncWrite, TcpStream, pin_project};
 
     pin_project! {
         /// Transport connection when no TLS backends are compiled in.
@@ -147,6 +147,7 @@ pub use conn_def::Conn;
 
 impl Conn {
     /// Returns mutable access to the underlying plain TCP stream when transport is non-TLS.
+    #[allow(clippy::unnecessary_wraps)]
     pub const fn plain_mut(&mut self) -> Option<&mut TcpStream> {
         match self {
             Self::Plain { inner } => Some(inner),

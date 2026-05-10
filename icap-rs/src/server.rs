@@ -77,7 +77,7 @@ use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tracing::{error, trace, warn};
 
-use crate::error::IcapResult;
+use crate::error::{Error, IcapResult};
 use crate::parser::icap::find_double_crlf;
 use crate::parser::read_chunked_to_end;
 use crate::request::{Body, Remainder, parse_icap_request};
@@ -389,10 +389,25 @@ impl Server {
                 buf.extend_from_slice(&tmp[..n]);
             };
 
-            let hdr_text = std::str::from_utf8(&buf[..h_end])
-                .map_err(|_| "Invalid ICAP headers utf8")?
-                .to_string();
-            let enc = crate::parser::parse_encapsulated_header(&hdr_text)?;
+            let hdr_text = if let Ok(text) = std::str::from_utf8(&buf[..h_end]) {
+                text.to_string()
+            } else {
+                Self::write_wire_error_response(
+                    &mut socket,
+                    StatusCode::BAD_REQUEST,
+                    "Bad Request",
+                )
+                .await?;
+                return Ok(());
+            };
+            let enc = match crate::parser::parse_encapsulated_header(&hdr_text) {
+                Ok(enc) => enc,
+                Err(err) => {
+                    warn!(client=%addr, error=%err, "malformed ICAP Encapsulated header");
+                    Self::write_wire_parse_error_response(&mut socket, &err).await?;
+                    return Ok(());
+                }
+            };
             let mut msg_end = h_end;
 
             if let Some(body_rel) = enc.req_body.or(enc.res_body) {
@@ -422,7 +437,16 @@ impl Server {
                         let preview_len = decoded.len();
                         preview_buf.splice(body_abs..preview_end, decoded.clone());
                         let preview_msg_end = body_abs + preview_len;
-                        let mut preview_req = parse_icap_request(&preview_buf[..preview_msg_end])?;
+                        let mut preview_req = match parse_icap_request(
+                            &preview_buf[..preview_msg_end],
+                        ) {
+                            Ok(req) => req,
+                            Err(err) => {
+                                warn!(client=%addr, error=%err, "malformed ICAP preview request");
+                                Self::write_wire_parse_error_response(&mut socket, &err).await?;
+                                return Ok(());
+                            }
+                        };
                         let preview_method = preview_req.method;
                         let preview_raw_service = preview_req
                             .service
@@ -510,7 +534,14 @@ impl Server {
             }
 
             // === Parse + route ===
-            let req = parse_icap_request(&buf[..msg_end])?;
+            let req = match parse_icap_request(&buf[..msg_end]) {
+                Ok(req) => req,
+                Err(err) => {
+                    warn!(client=%addr, error=%err, "malformed ICAP request");
+                    Self::write_wire_parse_error_response(&mut socket, &err).await?;
+                    return Ok(());
+                }
+            };
             let method = req.method;
             let raw_service: &str = req.service.rsplit('/').next().unwrap_or(&req.service);
             let service_resolved =
@@ -649,6 +680,32 @@ impl Server {
             }
             buf.drain(..msg_end);
         }
+    }
+
+    async fn write_wire_parse_error_response<S>(socket: &mut S, err: &Error) -> IcapResult<()>
+    where
+        S: AsyncWrite + Unpin,
+    {
+        let (status, reason) = match err {
+            Error::InvalidMethod(_) => (StatusCode::NOT_IMPLEMENTED, "Not Implemented"),
+            _ => (StatusCode::BAD_REQUEST, "Bad Request"),
+        };
+        Self::write_wire_error_response(socket, status, reason).await
+    }
+
+    async fn write_wire_error_response<S>(
+        socket: &mut S,
+        status: StatusCode,
+        reason: &str,
+    ) -> IcapResult<()>
+    where
+        S: AsyncWrite + Unpin,
+    {
+        let resp = Response::new(status, reason).add_header("Connection", "close");
+        let bytes = resp.to_raw()?;
+        socket.write_all(&bytes).await?;
+        let _ = socket.shutdown().await;
+        Ok(())
     }
 
     fn build_default_options_response(

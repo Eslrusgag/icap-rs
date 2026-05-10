@@ -57,6 +57,25 @@ async fn start_reqmod_server_on(port: u16) {
     tokio::time::sleep(Duration::from_millis(60)).await;
 }
 
+async fn send_raw_icap_request(port: u16, request: &str) -> Response {
+    let mut stream = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect");
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write raw ICAP request");
+    stream.shutdown().await.expect("shutdown write side");
+
+    let mut raw = Vec::new();
+    stream
+        .read_to_end(&mut raw)
+        .await
+        .expect("read raw ICAP response");
+
+    Response::from_raw(&raw).expect("parse raw ICAP response")
+}
+
 fn make_embedded_http(body: &str) -> HttpResponse<Vec<u8>> {
     HttpResponse::builder()
         .status(HttpStatus::OK)
@@ -186,4 +205,83 @@ async fn no_allow_header_must_be_200() {
         StatusCode::OK,
         "RFC: MUST be 200 when no Allow: 204 and no Preview"
     );
+}
+
+#[tokio::test]
+async fn unknown_method_returns_501_not_implemented() {
+    let port = 13522;
+    start_server_on(port).await;
+
+    let resp = send_raw_icap_request(
+        port,
+        &format!(
+            "FOO icap://127.0.0.1:{port}/respmod ICAP/1.0\r\n\
+             Host: 127.0.0.1:{port}\r\n\
+             Encapsulated: null-body=0\r\n\
+             \r\n"
+        ),
+    )
+    .await;
+
+    assert_eq!(resp.status_code, StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(resp.get_header("Connection").unwrap(), "close");
+}
+
+#[tokio::test]
+async fn bad_version_returns_400_bad_request() {
+    let port = 13523;
+    start_server_on(port).await;
+
+    let resp = send_raw_icap_request(
+        port,
+        &format!(
+            "REQMOD icap://127.0.0.1:{port}/respmod ICAP/2.0\r\n\
+             Host: 127.0.0.1:{port}\r\n\
+             Encapsulated: null-body=0\r\n\
+             \r\n"
+        ),
+    )
+    .await;
+
+    assert_eq!(resp.status_code, StatusCode::BAD_REQUEST);
+    assert_eq!(resp.get_header("Connection").unwrap(), "close");
+}
+
+#[tokio::test]
+async fn missing_host_returns_400_bad_request() {
+    let port = 13524;
+    start_server_on(port).await;
+
+    let resp = send_raw_icap_request(
+        port,
+        &format!(
+            "REQMOD icap://127.0.0.1:{port}/respmod ICAP/1.0\r\n\
+             Encapsulated: null-body=0\r\n\
+             \r\n"
+        ),
+    )
+    .await;
+
+    assert_eq!(resp.status_code, StatusCode::BAD_REQUEST);
+    assert_eq!(resp.get_header("Connection").unwrap(), "close");
+}
+
+#[tokio::test]
+async fn invalid_encapsulated_returns_400_bad_request() {
+    let port = 13525;
+    start_server_on(port).await;
+
+    let resp = send_raw_icap_request(
+        port,
+        &format!(
+            "REQMOD icap://127.0.0.1:{port}/respmod ICAP/1.0\r\n\
+             Host: 127.0.0.1:{port}\r\n\
+             Encapsulated: req-hdr=10, req-body=5\r\n\
+             \r\n"
+        ),
+    )
+    .await;
+
+    assert_eq!(resp.status_code, StatusCode::BAD_REQUEST);
+    assert_eq!(resp.get_header("Connection").unwrap(), "close");
 }
