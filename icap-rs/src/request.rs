@@ -13,8 +13,9 @@
 //! - then reads and de-chunks the remainder before invoking handlers.
 //!
 //! As a result, regular server handlers receive embedded bodies as `Body::Full`.
-//! Use `ServerBuilder::route_preview` when a service needs to make an early
-//! decision from preview bytes and return a final response before `100 Continue`.
+//! Return `PreviewDecision` from a route handler when a service needs to make
+//! an early decision from preview bytes and return a final response before
+//! `100 Continue`.
 //! `Body::Preview` and `Body<BodyRead>::ensure_full()` remain available for custom
 //! integrations that build preview-aware pipelines explicitly.
 //!

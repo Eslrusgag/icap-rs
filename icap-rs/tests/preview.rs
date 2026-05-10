@@ -494,8 +494,22 @@ async fn preview_handler_can_send_final_response_before_100_continue() {
         .bind(addr)
         .route_reqmod(
             "scan",
-            |_req: Request| async move {
-                panic!("regular handler must not run when preview handler responds")
+            |req: Request| async move {
+                let Some(EmbeddedHttp::Req { body, .. }) = req.embedded else {
+                    panic!("request must carry embedded HTTP bytes");
+                };
+                match body {
+                    Body::Preview { bytes, .. } => {
+                        assert_eq!(bytes.as_ref(), b"abcd");
+                        Ok(PreviewDecision::Respond(
+                            Response::no_content().try_set_istag(ISTAG)?,
+                        ))
+                    }
+                    Body::Full { .. } => {
+                        panic!("full handler path must not run when preview handler responds")
+                    }
+                    Body::Empty => panic!("preview request must not have empty body"),
+                }
             },
             Some(
                 ServiceOptions::new()
@@ -504,19 +518,6 @@ async fn preview_handler_can_send_final_response_before_100_continue() {
                     .add_allow("204"),
             ),
         )
-        .route_preview("scan", [Method::ReqMod], |req: Request| async move {
-            let Some(EmbeddedHttp::Req {
-                body: Body::Full { reader },
-                ..
-            }) = req.embedded
-            else {
-                panic!("preview request must carry embedded HTTP preview bytes");
-            };
-            assert_eq!(reader, b"abcd");
-            Ok(PreviewDecision::Respond(
-                Response::no_content().try_set_istag(ISTAG)?,
-            ))
-        })
         .build()
         .await
         .expect("server build");
@@ -532,6 +533,7 @@ async fn preview_handler_can_send_final_response_before_100_continue() {
     let icap = format!(
         "REQMOD icap://{addr}/scan ICAP/1.0\r\n\
          Host: {addr}\r\n\
+         Allow: 204\r\n\
          Encapsulated: req-hdr=0, req-body={req_body_off}\r\n\
          Preview: 4\r\n\
          \r\n"
@@ -575,5 +577,124 @@ async fn preview_handler_can_send_final_response_before_100_continue() {
     assert!(
         !resp.starts_with(b"ICAP/1.0 100"),
         "preview handler final response must be sent before 100 Continue"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn preview_handler_continue_reads_remainder_and_calls_full_route() {
+    let addr = "127.0.0.1:13444";
+    let server = Server::builder()
+        .bind(addr)
+        .route_reqmod(
+            "scan",
+            |req: Request| async move {
+                let Some(EmbeddedHttp::Req { body, .. }) = req.embedded else {
+                    panic!("request must carry embedded HTTP bytes");
+                };
+                match body {
+                    Body::Preview { bytes, .. } => {
+                        assert_eq!(bytes.as_ref(), b"abcd");
+                        Ok(PreviewDecision::Continue)
+                    }
+                    Body::Full { reader } => {
+                        assert_eq!(reader, b"abcdefghij");
+                        Ok(PreviewDecision::Respond(
+                            Response::no_content().try_set_istag(ISTAG)?,
+                        ))
+                    }
+                    Body::Empty => panic!("preview request must not have empty body"),
+                }
+            },
+            Some(
+                ServiceOptions::new()
+                    .with_static_istag(ISTAG)
+                    .with_preview(2048)
+                    .add_allow("204"),
+            ),
+        )
+        .build()
+        .await
+        .expect("server build");
+
+    tokio::spawn(async move {
+        server.run().await.expect("server run");
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    let http_head = "POST /upload HTTP/1.1\r\nHost: example.com\r\nContent-Length: 10\r\n\r\n";
+    let req_body_off = http_head.len();
+    let icap = format!(
+        "REQMOD icap://{addr}/scan ICAP/1.0\r\n\
+         Host: {addr}\r\n\
+         Allow: 204\r\n\
+         Encapsulated: req-hdr=0, req-body={req_body_off}\r\n\
+         Preview: 4\r\n\
+         \r\n"
+    );
+
+    stream
+        .write_all(icap.as_bytes())
+        .await
+        .expect("write icap head");
+    stream
+        .write_all(http_head.as_bytes())
+        .await
+        .expect("write http head");
+    stream
+        .write_all(b"4\r\nabcd\r\n0\r\n\r\n")
+        .await
+        .expect("write preview");
+    stream.flush().await.expect("flush preview");
+
+    let mut interim = Vec::new();
+    tokio::time::timeout(Duration::from_millis(700), async {
+        let mut tmp = [0u8; 4096];
+        loop {
+            let n = stream.read(&mut tmp).await.expect("read interim response");
+            if n == 0 {
+                break;
+            }
+            interim.extend_from_slice(&tmp[..n]);
+            if find_double_crlf(&interim).is_some() {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("timeout waiting for 100 Continue");
+
+    assert_eq!(
+        icap_status_code(&interim).expect("no interim response code"),
+        100,
+        "server must send 100 Continue after preview handler continues"
+    );
+
+    stream
+        .write_all(b"6\r\nefghij\r\n0\r\n\r\n")
+        .await
+        .expect("write remainder");
+    stream.flush().await.expect("flush remainder");
+
+    let mut final_resp = Vec::new();
+    tokio::time::timeout(Duration::from_millis(1000), async {
+        let mut tmp = [0u8; 4096];
+        loop {
+            let n = stream.read(&mut tmp).await.expect("read final response");
+            if n == 0 {
+                break;
+            }
+            final_resp.extend_from_slice(&tmp[..n]);
+            if find_double_crlf(&final_resp).is_some() {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("timeout waiting for final response");
+
+    assert_eq!(
+        icap_status_code(&final_resp).expect("no final response code"),
+        204
     );
 }

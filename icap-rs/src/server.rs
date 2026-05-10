@@ -80,9 +80,10 @@ use tracing::{error, trace, warn};
 use crate::error::IcapResult;
 use crate::parser::icap::find_double_crlf;
 use crate::parser::read_chunked_to_end;
-use crate::request::{Body, parse_icap_request};
+use crate::request::{Body, Remainder, parse_icap_request};
 pub use crate::server::options::{ServiceOptions, TransferBehavior};
 use crate::{EmbeddedHttp, Method, Request, Response, StatusCode};
+use bytes::Bytes;
 use smallvec::SmallVec;
 #[cfg(feature = "tls-rustls")]
 use tokio_rustls::TlsAcceptor;
@@ -92,7 +93,7 @@ use tokio_rustls::TlsAcceptor;
 /// One handler can serve multiple ICAP methods declared for a service via
 /// [`ServerBuilder::route`].
 type RequestHandler = Box<
-    dyn Fn(Request) -> std::pin::Pin<Box<dyn Future<Output = IcapResult<Response>> + Send>>
+    dyn Fn(Request) -> std::pin::Pin<Box<dyn Future<Output = IcapResult<PreviewDecision>> + Send>>
         + Send
         + Sync,
 >;
@@ -109,11 +110,40 @@ pub enum PreviewDecision {
     Respond(Response),
 }
 
-type PreviewHandler = Box<
-    dyn Fn(Request) -> std::pin::Pin<Box<dyn Future<Output = IcapResult<PreviewDecision>> + Send>>
-        + Send
-        + Sync,
->;
+/// Return type adapter for route handlers.
+///
+/// Handlers returning `IcapResult<Response>` keep the full-body behavior: the
+/// server reads the whole request body before invoking them. Handlers returning
+/// `IcapResult<PreviewDecision>` are preview-aware and may be invoked before
+/// `100 Continue`. If a preview-aware handler returns
+/// [`PreviewDecision::Continue`], the server sends `100 Continue`, reads the
+/// remainder, and invokes the same route again with `Body::Full`.
+pub trait RouteOutput: Send + 'static {
+    const PREVIEW_AWARE: bool;
+
+    fn into_preview_decision(self) -> IcapResult<PreviewDecision>;
+}
+
+impl RouteOutput for IcapResult<Response> {
+    const PREVIEW_AWARE: bool = false;
+
+    fn into_preview_decision(self) -> IcapResult<PreviewDecision> {
+        self.map(PreviewDecision::Respond)
+    }
+}
+
+impl RouteOutput for IcapResult<PreviewDecision> {
+    const PREVIEW_AWARE: bool = true;
+
+    fn into_preview_decision(self) -> IcapResult<PreviewDecision> {
+        self
+    }
+}
+
+struct HandlerEntry {
+    handler: RequestHandler,
+    preview_aware: bool,
+}
 
 /// Route entry for a service: **per-method** handlers + optional OPTIONS config.
 ///
@@ -121,8 +151,7 @@ type PreviewHandler = Box<
 struct RouteEntry {
     /// Map of method → handler. This enables duplicate-method detection and
     /// allows different handlers per method if desired.
-    handlers: HashMap<Method, RequestHandler>,
-    preview_handlers: HashMap<Method, PreviewHandler>,
+    handlers: HashMap<Method, HandlerEntry>,
     options: Option<ServiceOptions>,
 }
 
@@ -393,7 +422,7 @@ impl Server {
                         let preview_len = decoded.len();
                         preview_buf.splice(body_abs..preview_end, decoded.clone());
                         let preview_msg_end = body_abs + preview_len;
-                        let preview_req = parse_icap_request(&preview_buf[..preview_msg_end])?;
+                        let mut preview_req = parse_icap_request(&preview_buf[..preview_msg_end])?;
                         let preview_method = preview_req.method;
                         let preview_raw_service = preview_req
                             .service
@@ -407,10 +436,11 @@ impl Server {
                         );
 
                         if let Some(entry) = routes.get(preview_service_resolved.as_ref())
-                            && let Some(preview_handler) =
-                                entry.preview_handlers.get(&preview_method)
+                            && let Some(handler_entry) = entry.handlers.get(&preview_method)
+                            && handler_entry.preview_aware
                         {
-                            match preview_handler(preview_req).await? {
+                            mark_request_body_as_preview(&mut preview_req, false);
+                            match (handler_entry.handler)(preview_req).await? {
                                 PreviewDecision::Continue => {}
                                 PreviewDecision::Respond(resp) => {
                                     let should_close = !matches!(
@@ -573,8 +603,16 @@ impl Server {
                         }
 
                         out
-                    } else if let Some(h) = entry.handlers.get(&method) {
-                        h(req).await?
+                    } else if let Some(handler_entry) = entry.handlers.get(&method) {
+                        match (handler_entry.handler)(req).await? {
+                            PreviewDecision::Respond(resp) => resp,
+                            PreviewDecision::Continue => {
+                                return Err(
+                                    "Route handler returned Continue after full body was read"
+                                        .into(),
+                                );
+                            }
+                        }
                     } else {
                         Response::new(StatusCode::METHOD_NOT_ALLOWED, "Method Not Allowed")
                     }
@@ -629,6 +667,27 @@ impl Server {
 
         cfg.build_response_for(req)
     }
+}
+
+fn mark_request_body_as_preview(req: &mut Request, ieof: bool) {
+    let Some(embedded) = req.embedded.as_mut() else {
+        return;
+    };
+
+    let body = match embedded {
+        EmbeddedHttp::Req { body, .. } | EmbeddedHttp::Resp { body, .. } => body,
+    };
+
+    let Body::Full { reader } = body else {
+        return;
+    };
+
+    let preview = std::mem::take(reader);
+    *body = Body::Preview {
+        bytes: Bytes::from(preview),
+        ieof,
+        remainder: Remainder::new(Vec::new(), None),
+    };
 }
 
 // Dechunk ICAP entity-body (HTTP chunked framing) in-place-like.
@@ -983,6 +1042,11 @@ impl ServerBuilder {
     /// - Multiple calls to `.route(..)` for the **same service** are allowed as long as methods do not overlap.
     /// - Registering the **same method** for the same service twice will `panic!` with a clear message.
     /// - The same handler can be reused for multiple methods in a single call.
+    /// - Return `IcapResult<PreviewDecision>` from the handler to make the route
+    ///   preview-aware. Such handlers are called with `Body::Preview` after
+    ///   preview bytes arrive and before the server sends `100 Continue`.
+    ///   Returning `PreviewDecision::Continue` resumes the RFC preview flow; the
+    ///   same handler is called again with `Body::Full` after the remainder is read.
     pub fn route<MIt, MItem, F, Fut>(
         mut self,
         service: &str,
@@ -994,13 +1058,13 @@ impl ServerBuilder {
         MIt: IntoIterator<Item = MItem>,
         MItem: Into<Method>,
         F: Fn(Request) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = IcapResult<Response>> + Send + 'static,
+        Fut: Future + Send + 'static,
+        Fut::Output: RouteOutput,
     {
         let entry = match self.routes.entry(service.to_owned()) {
             Entry::Occupied(o) => o.into_mut(),
             Entry::Vacant(v) => v.insert(RouteEntry {
                 handlers: HashMap::new(),
-                preview_handlers: HashMap::new(),
                 options: None,
             }),
         };
@@ -1022,8 +1086,17 @@ impl ServerBuilder {
             );
 
             let h_clone = h_arc.clone();
-            let h: RequestHandler = Box::new(move |req| Box::pin(h_clone(req)));
-            entry.handlers.insert(m, h);
+            let h: RequestHandler = Box::new(move |req| {
+                let h = h_clone.clone();
+                Box::pin(async move { h(req).await.into_preview_decision() })
+            });
+            entry.handlers.insert(
+                m,
+                HandlerEntry {
+                    handler: h,
+                    preview_aware: Fut::Output::PREVIEW_AWARE,
+                },
+            );
         }
 
         // Attach options if provided for this route
@@ -1038,55 +1111,6 @@ impl ServerBuilder {
         self
     }
 
-    /// Register a preview decision handler for one or more ICAP methods.
-    ///
-    /// The regular route handler is still required and is called when the
-    /// preview handler returns [`PreviewDecision::Continue`]. If it returns
-    /// [`PreviewDecision::Respond`], the server writes that final response
-    /// before sending `100 Continue` and does not read the remaining body.
-    pub fn route_preview<MIt, MItem, F, Fut>(
-        mut self,
-        service: &str,
-        methods: MIt,
-        handler: F,
-    ) -> Self
-    where
-        MIt: IntoIterator<Item = MItem>,
-        MItem: Into<Method>,
-        F: Fn(Request) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = IcapResult<PreviewDecision>> + Send + 'static,
-    {
-        let entry = match self.routes.entry(service.to_owned()) {
-            Entry::Occupied(o) => o.into_mut(),
-            Entry::Vacant(v) => v.insert(RouteEntry {
-                handlers: HashMap::new(),
-                preview_handlers: HashMap::new(),
-                options: None,
-            }),
-        };
-
-        let h_arc = Arc::new(handler);
-
-        for item in methods {
-            let m: Method = item.into();
-            assert_ne!(
-                m,
-                Method::Options,
-                "OPTIONS cannot have a preview handler; it's answered automatically for '{service}'"
-            );
-            assert!(
-                !entry.preview_handlers.contains_key(&m),
-                "Overlapping preview route. Handler for '{m} {service}' already exists"
-            );
-
-            let h_clone = h_arc.clone();
-            let h: PreviewHandler = Box::new(move |req| Box::pin(h_clone(req)));
-            entry.preview_handlers.insert(m, h);
-        }
-
-        self
-    }
-
     /// Register a route for `REQMOD` only
     pub fn route_reqmod<F, Fut>(
         self,
@@ -1096,7 +1120,8 @@ impl ServerBuilder {
     ) -> Self
     where
         F: Fn(Request) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = IcapResult<Response>> + Send + 'static,
+        Fut: Future + Send + 'static,
+        Fut::Output: RouteOutput,
     {
         self.route(service, [Method::ReqMod], handler, options)
     }
@@ -1110,7 +1135,8 @@ impl ServerBuilder {
     ) -> Self
     where
         F: Fn(Request) -> Fut + Send + Sync + 'static,
-        Fut: std::future::Future<Output = IcapResult<Response>> + Send + 'static,
+        Fut: Future + Send + 'static,
+        Fut::Output: RouteOutput,
     {
         self.route(service, [Method::RespMod], handler, options)
     }
@@ -1195,13 +1221,6 @@ fn validate_builder_config(
             return Err(crate::error::Error::service(format!(
                 "Service '{service}' has no handlers"
             )));
-        }
-        for method in entry.preview_handlers.keys() {
-            if !entry.handlers.contains_key(method) {
-                return Err(crate::error::Error::service(format!(
-                    "Preview handler for '{method} {service}' requires a regular route handler"
-                )));
-            }
         }
         if let Some(options) = &entry.options
             && let Err(err) = options.validate()

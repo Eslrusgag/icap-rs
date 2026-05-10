@@ -1,5 +1,5 @@
 use icap_rs::server::options::ServiceOptions;
-use icap_rs::{Body, EmbeddedHttp, Method, PreviewDecision, Request, Response, Server};
+use icap_rs::{Body, EmbeddedHttp, PreviewDecision, Request, Response, Server};
 use tracing::{info, warn};
 
 const ISTAG: &str = "preview-decision-1.0";
@@ -15,9 +15,32 @@ async fn main() -> icap_rs::error::IcapResult<()> {
         .route_reqmod(
             "scan",
             |request: Request| async move {
-                let body_len = embedded_body_len(&request);
-                info!("REQMOD full handler called after preview continuation, body_len={body_len}");
-                Response::no_content().try_set_istag(ISTAG)
+                match embedded_body(&request) {
+                    Some(Body::Preview { bytes, .. }) => {
+                        info!("REQMOD preview handler called, preview_len={}", bytes.len());
+
+                        if bytes.windows(b"BLOCK".len()).any(|w| w == b"BLOCK") {
+                            warn!("blocking request from preview bytes without 100 Continue");
+                            return Ok(PreviewDecision::Respond(
+                                Response::no_content().try_set_istag(ISTAG)?,
+                            ));
+                        }
+
+                        Ok(PreviewDecision::Continue)
+                    }
+                    Some(Body::Full { reader }) => {
+                        info!(
+                            "REQMOD full handler called after preview continuation, body_len={}",
+                            reader.len()
+                        );
+                        Ok(PreviewDecision::Respond(
+                            Response::no_content().try_set_istag(ISTAG)?,
+                        ))
+                    }
+                    _ => Ok(PreviewDecision::Respond(
+                        Response::no_content().try_set_istag(ISTAG)?,
+                    )),
+                }
             },
             Some(
                 ServiceOptions::new()
@@ -27,22 +50,6 @@ async fn main() -> icap_rs::error::IcapResult<()> {
                     .add_allow("204"),
             ),
         )
-        .route_preview("scan", [Method::ReqMod], |request: Request| async move {
-            let preview = embedded_body_bytes(&request);
-            info!(
-                "REQMOD preview handler called, preview_len={}",
-                preview.len()
-            );
-
-            if preview.windows(b"BLOCK".len()).any(|w| w == b"BLOCK") {
-                warn!("blocking request from preview bytes without 100 Continue");
-                return Ok(PreviewDecision::Respond(
-                    Response::no_content().try_set_istag(ISTAG)?,
-                ));
-            }
-
-            Ok(PreviewDecision::Continue)
-        })
         .build()
         .await?;
 
@@ -50,22 +57,9 @@ async fn main() -> icap_rs::error::IcapResult<()> {
     server.run().await
 }
 
-fn embedded_body_bytes(request: &Request) -> &[u8] {
+const fn embedded_body(request: &Request) -> Option<&Body<Vec<u8>>> {
     match &request.embedded {
-        Some(
-            EmbeddedHttp::Req {
-                body: Body::Full { reader },
-                ..
-            }
-            | EmbeddedHttp::Resp {
-                body: Body::Full { reader },
-                ..
-            },
-        ) => reader,
-        _ => &[],
+        Some(EmbeddedHttp::Req { body, .. } | EmbeddedHttp::Resp { body, .. }) => Some(body),
+        None => None,
     }
-}
-
-fn embedded_body_len(request: &Request) -> usize {
-    embedded_body_bytes(request).len()
 }
