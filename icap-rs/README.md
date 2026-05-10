@@ -28,6 +28,7 @@ A Rust implementation of the **ICAP** protocol ([RFC 3507]) providing a client A
 - **Preview** negotiation (incl. `Preview: 0` and `ieof` fast path).
 - Chunked uploads, streaming large bodies after `100 Continue`.
 - Strict `Encapsulated` parsing (invalid/duplicate/non-monotonic offsets are rejected).
+- Method-specific `Encapsulated` validation for ICAP requests, while keeping compatibility parsing for `OPTIONS` without `Encapsulated`.
 - RFC 3507 response framing: embedded HTTP headers are serialized unchunked; only encapsulated entity bodies use ICAP chunked framing.
 - Streaming response body directly into an `AsyncWrite` sink (`...into_writer`) to avoid buffering.
 - Keep-Alive: reuse a single idle connection.

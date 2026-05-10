@@ -47,6 +47,9 @@ ICAP server implementation inspired by `c-icap`.
 - [x] OPTIONS capability responses
 - [x] `Max-Connections`
 - [x] Early `503 Service Unavailable`
+- [x] ICAP `400 Bad Request` for malformed requests
+- [x] ICAP `501 Not Implemented` for unknown methods
+- [x] Method-specific `Encapsulated` request validation
 - [x] TLS / ICAPS support (`icaps://`)
 - [x] TLS listener support
 - [x] mTLS support
@@ -88,10 +91,7 @@ ICAP server implementation inspired by `c-icap`.
 ## Partially Implemented / Needs Improvement
 
 - [ ] Strict RFC parser mode
-- [ ] Proper ICAP `400 Bad Request`
 - [ ] Proper ICAP `405 Method Not Allowed`
-- [ ] Proper ICAP `501 Not Implemented`
-- [ ] Full method-specific `Encapsulated` validation
 - [ ] Full `Allow: 206` semantics
 - [ ] Automatic `Transfer-Preview` handling
 - [ ] Automatic `Transfer-Ignore` handling

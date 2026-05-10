@@ -19,6 +19,11 @@
 //! `Body::Preview` and `Body<BodyRead>::ensure_full()` remain available for custom
 //! integrations that build preview-aware pipelines explicitly.
 //!
+//! Compatibility note: request parsing intentionally accepts `OPTIONS` requests
+//! without an `Encapsulated` header. RFC-shaped `REQMOD` and `RESPMOD` requests
+//! still require `Encapsulated`, and method-incompatible encapsulation forms are
+//! rejected.
+//!
 //! ## Example (client: REQMOD with an embedded HTTP request)
 //! ```rust
 //! use http::Request as HttpRequest;
@@ -649,6 +654,7 @@ pub(crate) fn parse_icap_request(data: &[u8]) -> IcapResult<Request<Vec<u8>>> {
         }
         None => crate::parser::icap::Encapsulated::default(),
     };
+    validate_encapsulated_for_method(method, &enc)?;
 
     let http_hdr_off = match method {
         Method::ReqMod => enc.req_hdr,
@@ -833,6 +839,60 @@ fn parse_embedded_http_response_start_line(start: &str) -> IcapResult<(Version, 
     Ok((parse_http_version(version)?, HttpStatus::from_u16(status)?))
 }
 
+fn validate_encapsulated_for_method(
+    method: Method,
+    enc: &crate::parser::icap::Encapsulated,
+) -> IcapResult<()> {
+    if enc.null_body.is_some()
+        && (enc.req_body.is_some() || enc.res_body.is_some() || enc.opt_body.is_some())
+    {
+        return Err(Error::Header(
+            "Encapsulated null-body must not be combined with body tokens".into(),
+        ));
+    }
+
+    match method {
+        Method::ReqMod => {
+            if enc.res_hdr.is_some() || enc.res_body.is_some() || enc.opt_body.is_some() {
+                return Err(Error::Header(
+                    "REQMOD Encapsulated must not contain response or opt-body parts".into(),
+                ));
+            }
+            if enc.req_body.is_some() && enc.req_hdr.is_none() {
+                return Err(Error::Header(
+                    "REQMOD Encapsulated req-body requires req-hdr".into(),
+                ));
+            }
+        }
+        Method::RespMod => {
+            if enc.req_body.is_some() || enc.opt_body.is_some() {
+                return Err(Error::Header(
+                    "RESPMOD Encapsulated must not contain req-body or opt-body parts".into(),
+                ));
+            }
+            if enc.res_body.is_some() && enc.res_hdr.is_none() {
+                return Err(Error::Header(
+                    "RESPMOD Encapsulated res-body requires res-hdr".into(),
+                ));
+            }
+        }
+        Method::Options => {
+            if enc.req_hdr.is_some()
+                || enc.res_hdr.is_some()
+                || enc.req_body.is_some()
+                || enc.res_body.is_some()
+                || enc.opt_body.is_some()
+            {
+                return Err(Error::Header(
+                    "OPTIONS request Encapsulated must be absent or null-body".into(),
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn parse_http_version(version: &str) -> IcapResult<Version> {
     match version {
         "HTTP/0.9" => Ok(Version::HTTP_09),
@@ -971,18 +1031,16 @@ mod tests {
     }
 
     #[test]
-    fn parse_reqmod_body_is_sliced_by_next_offset() {
+    fn parse_reqmod_body_uses_req_body_offset() {
         let http = b"GET / HTTP/1.1\r\nHost: ex\r\n\r\n";
         let body = b"12345678";
-        let tail = b"ZZZZ"; // это будет идти после null-body boundary
 
         let req_body_off = http.len(); // тело сразу после http headers
-        let null_body_off = req_body_off + body.len(); // конец тела
 
         let raw = format!(
             "REQMOD icap://icap.example.org/icap/test ICAP/1.0\r\n\
 Host: icap.example.org\r\n\
-Encapsulated: req-hdr=0, req-body={req_body_off}, null-body={null_body_off}\r\n\
+Encapsulated: req-hdr=0, req-body={req_body_off}\r\n\
 \r\n",
         )
         .into_bytes();
@@ -990,7 +1048,6 @@ Encapsulated: req-hdr=0, req-body={req_body_off}, null-body={null_body_off}\r\n\
         let mut bytes = raw;
         bytes.extend_from_slice(http);
         bytes.extend_from_slice(body);
-        bytes.extend_from_slice(tail);
 
         let r = parse_icap_request(&bytes).expect("parse");
         match r.embedded {
@@ -1181,6 +1238,91 @@ Encapsulated: req-hdr=0, req-body={req_body_off}, null-body={null_body_off}\r\n\
             m.contains("duplicate") && m.contains("encapsulated"),
             "expected duplicate Encapsulated part error, got: {m}"
         );
+    }
+
+    #[test]
+    fn reqmod_rejects_response_oriented_encapsulated_parts() {
+        let raw = icap_bytes(
+            "REQMOD icap://icap.example.org/icap/test ICAP/1.0\r\n\
+             Host: icap.example.org\r\n\
+             Encapsulated: res-hdr=0\r\n\
+             \r\n\
+             HTTP/1.1 200 OK\r\n\
+             Content-Length: 0\r\n\
+             \r\n",
+        );
+        let err = parse_icap_request(&raw).unwrap_err();
+        let m = err.to_string().to_lowercase();
+        assert!(
+            m.contains("reqmod") && m.contains("encapsulated"),
+            "expected REQMOD Encapsulated validation error, got: {m}"
+        );
+    }
+
+    #[test]
+    fn respmod_rejects_request_body_encapsulated_part() {
+        let raw = icap_bytes(
+            "RESPMOD icap://icap.example.org/icap/test ICAP/1.0\r\n\
+             Host: icap.example.org\r\n\
+             Encapsulated: req-hdr=0, req-body=30\r\n\
+             \r\n\
+             GET / HTTP/1.1\r\n\
+             Host: example.com\r\n\
+             \r\n",
+        );
+        let err = parse_icap_request(&raw).unwrap_err();
+        let m = err.to_string().to_lowercase();
+        assert!(
+            m.contains("respmod") && m.contains("encapsulated"),
+            "expected RESPMOD Encapsulated validation error, got: {m}"
+        );
+    }
+
+    #[test]
+    fn null_body_must_not_be_combined_with_body_tokens() {
+        let raw = icap_bytes(
+            "REQMOD icap://icap.example.org/icap/test ICAP/1.0\r\n\
+             Host: icap.example.org\r\n\
+             Encapsulated: req-hdr=0, req-body=30, null-body=34\r\n\
+             \r\n\
+             GET / HTTP/1.1\r\n\
+             Host: example.com\r\n\
+             \r\n\
+             body",
+        );
+        let err = parse_icap_request(&raw).unwrap_err();
+        let m = err.to_string().to_lowercase();
+        assert!(
+            m.contains("null-body") && m.contains("body"),
+            "expected null-body/body validation error, got: {m}"
+        );
+    }
+
+    #[test]
+    fn options_request_rejects_embedded_http_parts() {
+        let raw = icap_bytes(
+            "OPTIONS icap://icap.example.org/icap/test ICAP/1.0\r\n\
+             Host: icap.example.org\r\n\
+             Encapsulated: req-hdr=0\r\n\
+             \r\n",
+        );
+        let err = parse_icap_request(&raw).unwrap_err();
+        let m = err.to_string().to_lowercase();
+        assert!(
+            m.contains("options") && m.contains("encapsulated"),
+            "expected OPTIONS Encapsulated validation error, got: {m}"
+        );
+    }
+
+    #[test]
+    fn options_without_encapsulated_remains_lenient() {
+        let raw = icap_bytes(
+            "OPTIONS icap://icap.example.org/icap/test ICAP/1.0\r\n\
+             Host: icap.example.org\r\n\
+             \r\n",
+        );
+        let r = parse_icap_request(&raw).expect("compatibility mode keeps OPTIONS lenient");
+        assert_eq!(r.method, Method::Options);
     }
 
     #[test]
