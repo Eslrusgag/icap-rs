@@ -50,6 +50,7 @@ ICAP server implementation inspired by `c-icap`.
 - [x] ICAP `400 Bad Request` for malformed requests
 - [x] ICAP `501 Not Implemented` for unknown methods
 - [x] Method-specific `Encapsulated` request validation
+- [x] Strict request parser mode by default
 - [x] TLS / ICAPS support (`icaps://`)
 - [x] TLS listener support
 - [x] mTLS support
@@ -90,7 +91,6 @@ ICAP server implementation inspired by `c-icap`.
 
 ## Partially Implemented / Needs Improvement
 
-- [ ] Strict RFC parser mode
 - [ ] Proper ICAP `405 Method Not Allowed`
 - [ ] Full `Allow: 206` semantics
 - [ ] Automatic `Transfer-Preview` handling

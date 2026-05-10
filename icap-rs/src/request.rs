@@ -19,10 +19,9 @@
 //! `Body::Preview` and `Body<BodyRead>::ensure_full()` remain available for custom
 //! integrations that build preview-aware pipelines explicitly.
 //!
-//! Compatibility note: request parsing intentionally accepts `OPTIONS` requests
-//! without an `Encapsulated` header. RFC-shaped `REQMOD` and `RESPMOD` requests
-//! still require `Encapsulated`, and method-incompatible encapsulation forms are
-//! rejected.
+//! Request parsing requires `Encapsulated` on every ICAP request, including
+//! `OPTIONS`. Servers can opt into legacy compatibility parsing for old peers
+//! that omit `Encapsulated` on `OPTIONS`.
 //!
 //! ## Example (client: REQMOD with an embedded HTTP request)
 //! ```rust
@@ -573,6 +572,20 @@ impl Request<Vec<u8>> {
 /// Note: this parser constructs `Request<Vec<u8>>`, i.e. a fully buffered
 /// embedded HTTP body when present.
 pub(crate) fn parse_icap_request(data: &[u8]) -> IcapResult<Request<Vec<u8>>> {
+    parse_icap_request_with_mode(data, RequestParserMode::Strict)
+}
+
+#[derive(Debug, Default, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum RequestParserMode {
+    Compatibility,
+    #[default]
+    Strict,
+}
+
+pub(crate) fn parse_icap_request_with_mode(
+    data: &[u8],
+    mode: RequestParserMode,
+) -> IcapResult<Request<Vec<u8>>> {
     trace!("parse_icap_request: len={}", data.len());
 
     let hdr_end =
@@ -628,7 +641,8 @@ pub(crate) fn parse_icap_request(data: &[u8]) -> IcapResult<Request<Vec<u8>>> {
         return Err(Error::MissingHeader("Host"));
     }
 
-    if matches!(method, Method::ReqMod | Method::RespMod)
+    if (matches!(method, Method::ReqMod | Method::RespMod)
+        || (mode == RequestParserMode::Strict && method == Method::Options))
         && !icap_headers.contains_key("Encapsulated")
     {
         return Err(Error::MissingHeader("Encapsulated"));
@@ -1168,6 +1182,7 @@ Encapsulated: req-hdr=0, req-body={req_body_off}\r\n\
             "OPTIONS icap://icap.example.org/icap/test ICAP/1.0\r\n\
              Host: icap.example.org\r\n\
              ThisIsBadHeader\r\n\
+             Encapsulated: null-body=0\r\n\
              \r\n",
         );
         let r = parse_icap_request(&raw).expect("parse");
@@ -1315,13 +1330,40 @@ Encapsulated: req-hdr=0, req-body={req_body_off}\r\n\
     }
 
     #[test]
-    fn options_without_encapsulated_remains_lenient() {
+    fn compatibility_mode_accepts_options_without_encapsulated() {
         let raw = icap_bytes(
             "OPTIONS icap://icap.example.org/icap/test ICAP/1.0\r\n\
              Host: icap.example.org\r\n\
              \r\n",
         );
-        let r = parse_icap_request(&raw).expect("compatibility mode keeps OPTIONS lenient");
+        let r = parse_icap_request_with_mode(&raw, RequestParserMode::Compatibility)
+            .expect("compatibility mode keeps OPTIONS lenient");
+        assert_eq!(r.method, Method::Options);
+    }
+
+    #[test]
+    fn default_parser_requires_encapsulated_for_options() {
+        let raw = icap_bytes(
+            "OPTIONS icap://icap.example.org/icap/test ICAP/1.0\r\n\
+             Host: icap.example.org\r\n\
+             \r\n",
+        );
+        let err = parse_icap_request(&raw).unwrap_err();
+        assert!(
+            matches!(err, Error::MissingHeader(h) if h == "Encapsulated"),
+            "expected strict MissingHeader(Encapsulated), got: {err}"
+        );
+    }
+
+    #[test]
+    fn default_parser_accepts_options_with_null_body() {
+        let raw = icap_bytes(
+            "OPTIONS icap://icap.example.org/icap/test ICAP/1.0\r\n\
+             Host: icap.example.org\r\n\
+             Encapsulated: null-body=0\r\n\
+             \r\n",
+        );
+        let r = parse_icap_request(&raw).expect("strict parse");
         assert_eq!(r.method, Method::Options);
     }
 
@@ -1444,10 +1486,11 @@ Encapsulated: req-hdr=0, req-body={req_body_off}\r\n\
     }
 
     #[test]
-    fn parse_minimal_options_without_http() {
+    fn parse_minimal_options_with_null_body() {
         let raw = icap_bytes(
             "OPTIONS icap://icap.example.org/icap/test ICAP/1.0\r\n\
              Host: icap.example.org\r\n\
+             Encapsulated: null-body=0\r\n\
              \r\n",
         );
         let r = parse_icap_request(&raw).expect("parse");

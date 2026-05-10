@@ -80,7 +80,9 @@ use tracing::{error, trace, warn};
 use crate::error::{Error, IcapResult};
 use crate::parser::icap::find_double_crlf;
 use crate::parser::read_chunked_to_end;
-use crate::request::{Body, Remainder, parse_icap_request};
+use crate::request::{
+    Body, Remainder, RequestParserMode, parse_icap_request, parse_icap_request_with_mode,
+};
 pub use crate::server::options::{ServiceOptions, TransferBehavior};
 use crate::{EmbeddedHttp, Method, Request, Response, StatusCode};
 use bytes::Bytes;
@@ -193,6 +195,7 @@ pub struct Server {
     advertised_max_conn: Option<usize>,
     aliases: Arc<HashMap<String, String>>,
     default_service: Option<String>,
+    request_parser_mode: RequestParserMode,
     #[cfg(feature = "tls-rustls")]
     tls: Option<TlsAcceptor>,
 }
@@ -233,6 +236,7 @@ impl Server {
             let aliases = Arc::clone(&self.aliases);
             let default_service = self.default_service.clone();
             let advertised_max = self.advertised_max_conn;
+            let request_parser_mode = self.request_parser_mode;
 
             #[cfg(feature = "tls-rustls")]
             let tls = self.tls.clone();
@@ -284,6 +288,7 @@ impl Server {
                                     aliases,
                                     default_service,
                                     advertised_max,
+                                    request_parser_mode,
                                     addr,
                                 ))
                                 .await
@@ -306,6 +311,7 @@ impl Server {
                     aliases,
                     default_service,
                     advertised_max,
+                    request_parser_mode,
                     addr,
                 ))
                 .await
@@ -352,6 +358,7 @@ impl Server {
         aliases: Arc<HashMap<String, String>>,
         default_service: Option<String>,
         advertised_max_conn: Option<usize>,
+        request_parser_mode: RequestParserMode,
         addr: std::net::SocketAddr,
     ) -> IcapResult<()>
     where
@@ -437,8 +444,9 @@ impl Server {
                         let preview_len = decoded.len();
                         preview_buf.splice(body_abs..preview_end, decoded.clone());
                         let preview_msg_end = body_abs + preview_len;
-                        let mut preview_req = match parse_icap_request(
+                        let mut preview_req = match parse_request_for_mode(
                             &preview_buf[..preview_msg_end],
+                            request_parser_mode,
                         ) {
                             Ok(req) => req,
                             Err(err) => {
@@ -534,7 +542,7 @@ impl Server {
             }
 
             // === Parse + route ===
-            let req = match parse_icap_request(&buf[..msg_end]) {
+            let req = match parse_request_for_mode(&buf[..msg_end], request_parser_mode) {
                 Ok(req) => req,
                 Err(err) => {
                     warn!(client=%addr, error=%err, "malformed ICAP request");
@@ -925,6 +933,13 @@ fn dechunk_icap_entity_with_ieof(data: &mut &[u8]) -> Result<(Vec<u8>, bool), St
     Ok((out, ieof))
 }
 
+fn parse_request_for_mode(data: &[u8], mode: RequestParserMode) -> IcapResult<Request<Vec<u8>>> {
+    match mode {
+        RequestParserMode::Strict => parse_icap_request(data),
+        RequestParserMode::Compatibility => parse_icap_request_with_mode(data, mode),
+    }
+}
+
 #[cfg(feature = "tls-rustls")]
 #[derive(Clone)]
 struct TlsParams {
@@ -949,6 +964,7 @@ pub struct ServerBuilder {
     max_connections_global: Option<usize>,
     aliases: HashMap<String, String>,
     default_service: Option<String>,
+    request_parser_mode: RequestParserMode,
     #[cfg(feature = "tls-rustls")]
     tls: Option<TlsParams>,
 }
@@ -1091,6 +1107,16 @@ impl ServerBuilder {
     /// not explicitly configured on the per-service options.
     pub fn with_max_connections(mut self, n: usize) -> Self {
         self.max_connections_global = Some(n.max(1));
+        self
+    }
+
+    /// Enable legacy compatibility request parsing.
+    ///
+    /// Strict RFC parsing is the default and requires every ICAP request,
+    /// including `OPTIONS`, to carry an `Encapsulated` header. This opt-in mode
+    /// accepts legacy `OPTIONS` requests without `Encapsulated`.
+    pub const fn with_compatibility_request_parser(mut self) -> Self {
+        self.request_parser_mode = RequestParserMode::Compatibility;
         self
     }
 
@@ -1261,6 +1287,7 @@ impl ServerBuilder {
             advertised_max_conn,
             aliases: Arc::new(self.aliases),
             default_service: self.default_service,
+            request_parser_mode: self.request_parser_mode,
 
             #[cfg(feature = "tls-rustls")]
             tls: tls_acceptor,

@@ -48,8 +48,13 @@ async fn read_some_with_timeout(s: &mut TcpStream, ms: u64) -> io::Result<Option
 
 /// Minimal ICAP OPTIONS request.
 fn build_options(port: u16, svc: &str) -> Vec<u8> {
-    format!("OPTIONS icap://127.0.0.1:{port}/{svc} ICAP/1.0\r\nHost: 127.0.0.1\r\n\r\n")
-        .into_bytes()
+    format!(
+        "OPTIONS icap://127.0.0.1:{port}/{svc} ICAP/1.0\r\n\
+         Host: 127.0.0.1\r\n\
+         Encapsulated: null-body=0\r\n\
+         \r\n"
+    )
+    .into_bytes()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -57,6 +57,26 @@ async fn start_reqmod_server_on(port: u16) {
     tokio::time::sleep(Duration::from_millis(60)).await;
 }
 
+async fn start_compatibility_server_on(port: u16) {
+    let respmod_opts = ServiceOptions::new()
+        .with_service("Response Modifier")
+        .with_options_ttl(60);
+
+    let server = Server::builder()
+        .bind(&format!("127.0.0.1:{port}"))
+        .with_compatibility_request_parser()
+        .route_respmod("respmod", always_204_handler, Some(respmod_opts))
+        .build()
+        .await
+        .expect("build compatibility server");
+
+    tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(60)).await;
+}
+
 async fn send_raw_icap_request(port: u16, request: &str) -> Response {
     let mut stream = TcpStream::connect(("127.0.0.1", port))
         .await
@@ -284,4 +304,60 @@ async fn invalid_encapsulated_returns_400_bad_request() {
 
     assert_eq!(resp.status_code, StatusCode::BAD_REQUEST);
     assert_eq!(resp.get_header("Connection").unwrap(), "close");
+}
+
+#[tokio::test]
+async fn server_requires_encapsulated_for_options_by_default() {
+    let port = 13526;
+    start_server_on(port).await;
+
+    let resp = send_raw_icap_request(
+        port,
+        &format!(
+            "OPTIONS icap://127.0.0.1:{port}/respmod ICAP/1.0\r\n\
+             Host: 127.0.0.1:{port}\r\n\
+             \r\n"
+        ),
+    )
+    .await;
+
+    assert_eq!(resp.status_code, StatusCode::BAD_REQUEST);
+    assert_eq!(resp.get_header("Connection").unwrap(), "close");
+}
+
+#[tokio::test]
+async fn server_accepts_options_with_null_body() {
+    let port = 13527;
+    start_server_on(port).await;
+
+    let resp = send_raw_icap_request(
+        port,
+        &format!(
+            "OPTIONS icap://127.0.0.1:{port}/respmod ICAP/1.0\r\n\
+             Host: 127.0.0.1:{port}\r\n\
+             Encapsulated: null-body=0\r\n\
+             \r\n"
+        ),
+    )
+    .await;
+
+    assert_eq!(resp.status_code, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn compatibility_server_accepts_options_without_encapsulated() {
+    let port = 13528;
+    start_compatibility_server_on(port).await;
+
+    let resp = send_raw_icap_request(
+        port,
+        &format!(
+            "OPTIONS icap://127.0.0.1:{port}/respmod ICAP/1.0\r\n\
+             Host: 127.0.0.1:{port}\r\n\
+             \r\n"
+        ),
+    )
+    .await;
+
+    assert_eq!(resp.status_code, StatusCode::OK);
 }
