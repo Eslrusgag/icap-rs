@@ -219,9 +219,8 @@ async fn main() -> IcapResult<()> {
 
 ## Streaming Bodies
 
-The client can stream request bodies from an `AsyncRead` and write response
-payload bytes directly into an `AsyncWrite` sink. This avoids buffering large
-payloads in `Response::body`.
+The client can stream request bodies from an `AsyncRead` using ICAP chunked
+framing. The final ICAP response is parsed into `Response`.
 
 ```rust,no_run
 use http::{Request as HttpRequest, Version};
@@ -247,13 +246,11 @@ async fn main() -> IcapResult<()> {
         .with_http_request_head(http_head);
 
     let source = tokio::io::empty();
-    let mut sink = tokio::io::sink();
-
     let response = client
-        .send_streaming_reader_into_writer(&request, source, &mut sink)
+        .send_streaming_reader(&request, source)
         .await?;
 
-    assert!(response.body.is_empty());
+    println!("ICAP {} {}", response.status_code, response.status_text);
     Ok(())
 }
 ```

@@ -23,7 +23,7 @@ Without `tls-rustls`, using an `icaps://` URI returns an error.
 
 ## Client ICAPS
 
-```rust,no_run
+```rust,ignore
 use icap_rs::{Client, Request};
 
 #[tokio::main]
@@ -74,38 +74,9 @@ verification. `ClientBuilder::insecure_no_verify` and the CLI `--insecure`
 flag are compatibility no-ops and should not be used as a production strategy.
 Install a trusted CA or provide one with `add_root_ca_pem_file`.
 
-## Benchmarking TLS Overhead
-
-The crate includes a Criterion benchmark that runs the same local RESPMOD
-service over plaintext ICAP and direct ICAPS, then compares client round-trip
-cost for a `204 No Content` response:
-
-```bash
-cargo bench -p icap-rs --bench tls_overhead_bench --features tls-rustls
-```
-
-The benchmark uses the test PEM files from `test_data/certs` and reports two
-groups:
-
-- `tls_overhead_keepalive`: one warmed connection is reused. This mostly shows
-  the per-request overhead of encrypted I/O and Rustls framing after the TLS
-  handshake has already happened.
-- `tls_overhead_new_connection`: every request opens a new connection. This
-  includes TCP connect cost for both transports and additionally includes the
-  TLS handshake for ICAPS. The benchmark caps the number of real short-lived
-  connections per Criterion sample to avoid measuring loopback ephemeral-port
-  exhaustion on platforms such as Windows. Treat this group as a coarse
-  handshake-overhead benchmark: it is useful for large plain-vs-TLS differences,
-  but not for judging small regressions.
-
-Use the `plain_icap` and `tls_icaps` entries inside each group as the direct
-comparison pair. Absolute numbers depend on CPU, OS TCP behavior, certificate
-verification cost, and Criterion settings, so the intended signal is the ratio
-between those two entries on the same machine.
-
 ## Server TLS
 
-```rust,no_run
+```rust,ignore
 use icap_rs::{Request, Response, Server};
 use icap_rs::server::options::ServiceOptions;
 
@@ -147,7 +118,7 @@ RSA private keys are supported by the loader.
 Use `with_mtls_from_pem_files` when clients must present certificates signed by
 a configured CA:
 
-```rust,no_run
+```rust,ignore
 use icap_rs::{Request, Response, Server};
 use icap_rs::server::options::ServiceOptions;
 
@@ -180,3 +151,32 @@ async fn main() -> icap_rs::error::IcapResult<()> {
     server.run().await
 }
 ```
+
+## Benchmarking TLS Overhead
+
+The crate includes a Criterion benchmark that runs the same local RESPMOD
+service over plaintext ICAP and direct ICAPS, then compares client round-trip
+cost for a `204 No Content` response:
+
+```bash
+cargo bench -p icap-rs --bench tls_overhead_bench --features tls-rustls
+```
+
+The benchmark uses the test PEM files from `test_data/certs` and reports two
+groups:
+
+- `tls_overhead_keepalive`: one warmed connection is reused. This mostly shows
+  the per-request overhead of encrypted I/O and Rustls framing after the TLS
+  handshake has already happened.
+- `tls_overhead_new_connection`: every request opens a new connection. This
+  includes TCP connect cost for both transports and additionally includes the
+  TLS handshake for ICAPS. The benchmark caps the number of real short-lived
+  connections per Criterion sample to avoid measuring loopback ephemeral-port
+  exhaustion on platforms such as Windows. Treat this group as a coarse
+  handshake-overhead benchmark: it is useful for large plain-vs-TLS differences,
+  but not for judging small regressions.
+
+Use the `plain_icap` and `tls_icaps` entries inside each group as the direct
+comparison pair. Absolute numbers depend on CPU, OS TCP behavior, certificate
+verification cost, and Criterion settings, so the intended signal is the ratio
+between those two entries on the same machine.

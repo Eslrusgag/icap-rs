@@ -1,7 +1,7 @@
 //! ICAP Client implementation in Rust.
 //!
 //! Features:
-//! - Client with builder (`ClientBuilder`).
+//! - Client with builder ([`ClientBuilder`]).
 //! - ICAP requests: OPTIONS, REQMOD, RESPMOD.
 //! - Embedded HTTP requests/responses (serialize on wire).
 //! - ICAP Preview (including `ieof`) and streaming upload.
@@ -14,30 +14,27 @@
 //! - `icaps://` URIs automatically switch to TLS; which backend is used
 //!   depends on enabled features or explicit selection in the builder.
 
+pub mod builder;
 mod tls;
 
 use crate::error::{Error, IcapResult};
 use crate::parser::parse_encapsulated_header;
-use crate::parser::{
-    canon_icap_header, dechunk_icap_entity, read_chunked_to_end, write_chunk, write_chunk_into,
-};
-use crate::request::{serialize_embedded_http, Request};
-use crate::response::{parse_icap_response, parse_icap_response_head, Response};
+use crate::parser::{canon_icap_header, read_chunked_to_end, write_chunk, write_chunk_into};
+use crate::request::{Request, serialize_embedded_http};
+use crate::response::{Response, parse_icap_response};
 
-use crate::client::tls::{AnyTlsConnector, TlsBackend, TlsConnector};
-use crate::parser::icap::find_double_crlf;
 use crate::Method;
+use crate::client::tls::{AnyTlsConnector, TlsConnector};
+use crate::parser::icap::find_double_crlf;
 
-use http::{HeaderMap, HeaderName, HeaderValue};
+use http::HeaderMap;
 use std::collections::HashSet;
 use std::io::Write as _;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-#[cfg(feature = "tls-rustls")]
-use rustls::pki_types::CertificateDer;
-
+use crate::client::builder::{ClientBuilder, ConnectionPolicy};
 use crate::net::Conn;
 use tokio::fs::File as TokioFile;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -49,7 +46,7 @@ use tracing::trace;
 /// High-level ICAP client with connection reuse and Preview negotiation.
 ///
 /// Construct via [`Client::builder()`] and send requests using [`Client::send`]
-/// / [`Client::send_streaming`] / [`Client::send_streaming_reader_into_writer`].
+/// / [`Client::send_streaming`] / [`Client::send_streaming_reader`].
 /// You can also generate the exact wire bytes
 /// without sending using [`Client::get_request`] / [`Client::get_request_wire`].
 #[derive(Debug, Clone)]
@@ -69,283 +66,6 @@ struct ClientRef {
     tls: AnyTlsConnector,
     idle_conn: Mutex<Option<Conn>>,
     sni_hostname: Option<String>,
-}
-
-/// Policy for connection lifetime management.
-///
-/// - [`ConnectionPolicy::Close`] — close the TCP connection after every request.
-/// - [`ConnectionPolicy::KeepAlive`] — keep a single idle connection and reuse it.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum ConnectionPolicy {
-    #[default]
-    Close,
-    KeepAlive,
-}
-
-/// Builder for [`Client`]. Use it to configure host/port, headers, keep-alive,
-/// read timeouts, and other options before creating a client instance.
-///
-/// By default:
-/// - `ConnectionPolicy` is `Close`;
-/// - no host/port are set until you call [`ClientBuilder::host`] / [`ClientBuilder::port`]
-///   or [`ClientBuilder::with_uri`].
-#[derive(Debug)]
-#[must_use]
-pub struct ClientBuilder {
-    host: Option<String>,
-    port: Option<u16>,
-    host_override: Option<String>,
-    default_headers: HeaderMap,
-    connection_policy: ConnectionPolicy,
-    read_timeout: Option<Duration>,
-
-    // TLS (plain by default)
-    tls_backend: Option<TlsBackend>, // None => plain
-    danger_disable_verify: bool,
-    sni_hostname: Option<String>,
-
-    #[cfg(feature = "tls-rustls")]
-    extra_roots: Vec<CertificateDer<'static>>,
-}
-
-impl ClientBuilder {
-    /// Create a new `ClientBuilder` with default settings.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Set ICAP server host (hostname or IP).
-    pub fn host(mut self, host: &str) -> Self {
-        self.host = Some(host.to_string());
-        self
-    }
-
-    /// Set ICAP server TCP port (default 1344 if not set).
-    pub const fn port(mut self, port: u16) -> Self {
-        self.port = Some(port);
-        self
-    }
-
-    /// Override the `Host:` header value sent in ICAP requests.
-    ///
-    /// This does not change the actual remote address used for the TCP connection,
-    /// only the value of the `Host` ICAP header.
-    pub fn host_override(mut self, host: &str) -> Self {
-        self.host_override = Some(host.to_string());
-        self
-    }
-
-    /// Insert a default ICAP header that will be sent with every request.
-    pub fn default_header(mut self, name: &str, value: &str) -> IcapResult<Self> {
-        let n: HeaderName = name.parse()?;
-        let v: HeaderValue = HeaderValue::from_str(value)?;
-        self.default_headers.insert(n, v);
-        Ok(self)
-    }
-
-    /// Tries to set the ICAP `User-Agent` header for all requests created by this client.
-    ///
-    /// A per-request override via `Request::icap_header("User-Agent", "...")`
-    /// takes precedence over the value set here.
-    /// Prefer this fallible variant when the value comes from user input.
-    pub fn try_user_agent(mut self, user_agent: &str) -> IcapResult<Self> {
-        self.default_headers.insert(
-            HeaderName::from_static("user-agent"),
-            HeaderValue::from_str(user_agent)?,
-        );
-        Ok(self)
-    }
-
-    /// Sets the ICAP `User-Agent` header for all requests created by this client.
-    ///
-    /// A per-request override via `Request::icap_header("User-Agent", "...")`
-    /// takes precedence over the value set here.
-    ///
-    /// # Example
-    /// ```
-    /// use icap_rs::Client;
-    /// let client = Client::builder()
-    ///     .host("icap.example")
-    ///     .port(1344)
-    ///     .user_agent("my-app/1.2.3")
-    ///     .build();
-    /// ```
-    ///
-    /// # Panics
-    ///
-    /// Panics if `user_agent` is not a valid HTTP header value. Use
-    /// [`ClientBuilder::try_user_agent`] for untrusted input.
-    pub fn user_agent(self, user_agent: &str) -> Self {
-        self.try_user_agent(user_agent)
-            .expect("invalid User-Agent header value")
-    }
-
-    /// Enable or disable connection reuse (keep-alive).
-    pub const fn keep_alive(mut self, yes: bool) -> Self {
-        self.connection_policy = if yes {
-            ConnectionPolicy::KeepAlive
-        } else {
-            ConnectionPolicy::Close
-        };
-        self
-    }
-
-    /// Set a read timeout for network operations.
-    ///
-    /// If `None`, operations have no explicit read timeout and rely on OS defaults.
-    pub const fn read_timeout(mut self, dur: Option<Duration>) -> Self {
-        self.read_timeout = dur;
-        self
-    }
-
-    /// Configure the builder from an ICAP URI (`icap://...` or `icaps://...`).
-    ///
-    /// This extracts `host` and `port` for use in the TCP connection. The service path,
-    /// if present in the URI, is ignored here and should be set on the request itself.
-    /// `icaps://` enables TLS automatically.
-    pub fn with_uri(mut self, uri: &str) -> IcapResult<Self> {
-        let (host, port, tls) = parse_authority_with_scheme(uri)?;
-        self.host = Some(host);
-        self.port = Some(port);
-        if tls {
-            #[cfg(feature = "tls-rustls")]
-            {
-                self = self.use_rustls();
-            }
-            // #[cfg(all(not(feature = "tls-rustls"), feature = "tls-openssl"))]
-            // {
-            //     self = self.use_openssl();
-            // }
-            //#[cfg(all(not(feature = "tls-rustls"), not(feature = "tls-openssl")))]
-            #[cfg(not(feature = "tls-rustls"))]
-            {
-                return Err(Error::Service(
-                    "`icaps://` requested but crate built without TLS features".into(),
-                ));
-            }
-        }
-        Ok(self)
-    }
-
-    #[cfg(feature = "tls-rustls")]
-    pub const fn use_rustls(mut self) -> Self {
-        self.tls_backend = Some(TlsBackend::Rustls);
-        self
-    }
-
-    // #[cfg(feature = "tls-openssl")]
-    // pub fn use_openssl(mut self) -> Self {
-    //     self.tls_backend = Some(TlsBackend::Openssl);
-    //     self
-    // }
-
-    /// Custom SNI hostname to use for TLS handshakes.
-    pub fn sni_hostname(mut self, s: &str) -> Self {
-        self.sni_hostname = Some(s.into());
-        self
-    }
-
-    /// Compatibility toggle for disabling certificate verification.
-    ///
-    /// With rustls 0.23 this is currently a no-op, kept for API compatibility.
-    pub const fn danger_disable_cert_verify(mut self, yes: bool) -> Self {
-        self.danger_disable_verify = yes;
-        self
-    }
-
-    /// Add root CAs from a PEM file (rustls only).
-    #[cfg(feature = "tls-rustls")]
-    pub fn add_root_ca_pem_file(mut self, path: impl AsRef<std::path::Path>) -> IcapResult<Self> {
-        use std::fs::File;
-        use std::io::BufReader;
-
-        let f = File::open(path.as_ref())?;
-        let mut rdr = BufReader::new(f);
-
-        let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
-            rustls_pemfile::certs(&mut rdr)
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| format!("PEM parse error: {e}"))?;
-
-        self.extra_roots.extend(certs);
-        Ok(self)
-    }
-
-    /// Build a [`Client`], returning an error when required configuration is missing.
-    pub fn try_build(self) -> IcapResult<Client> {
-        let host = self
-            .host
-            .ok_or_else(|| Error::service("ClientBuilder: host is required"))?;
-        let port = self.port.unwrap_or(1344);
-
-        let any_tls = match self.tls_backend {
-            None => AnyTlsConnector::plain(),
-            #[cfg(feature = "tls-rustls")]
-            Some(TlsBackend::Rustls) => {
-                use crate::client::tls::rustls::RustlsConfig;
-                AnyTlsConnector::rustls(RustlsConfig {
-                    danger_disable_verify: self.danger_disable_verify,
-                    extra_roots: self.extra_roots,
-                })
-            } // Some(TlsBackend::Openssl) => {
-            //     #[cfg(feature = "tls-openssl")]
-            //     {
-            //         use crate::client::tls::openssl::OpensslConfig;
-            //         AnyTlsConnector::openssl(OpensslConfig {
-            //             danger_disable_verify: self.danger_disable_verify,
-            //         })
-            //     }
-            //     #[cfg(not(feature = "tls-openssl"))]
-            //     {
-            //         panic!("enable `tls-openssl` feature")
-            //     }
-            // }
-            #[cfg(not(feature = "tls-rustls"))]
-            Some(_) => return Err(Error::service("enable `tls-rustls` feature")),
-        };
-
-        Ok(Client {
-            inner: Arc::new(ClientRef {
-                host,
-                port,
-                host_override: self.host_override,
-                default_headers: self.default_headers,
-                connection_policy: self.connection_policy,
-                read_timeout: self.read_timeout,
-                tls: any_tls,
-                idle_conn: Mutex::new(None),
-                sni_hostname: self.sni_hostname,
-            }),
-        })
-    }
-
-    /// Build a [`Client`].
-    ///
-    /// # Panics
-    ///
-    /// Panics if required configuration is missing. Use
-    /// [`ClientBuilder::try_build`] for fallible construction.
-    pub fn build(self) -> Client {
-        self.try_build().expect("ClientBuilder build failed")
-    }
-}
-
-impl Default for ClientBuilder {
-    fn default() -> Self {
-        Self {
-            host: Some("localhost".to_string()),
-            port: Some(1344),
-            host_override: None,
-            default_headers: HeaderMap::new(),
-            connection_policy: ConnectionPolicy::Close,
-            read_timeout: None,
-            tls_backend: None, // plain by default
-            danger_disable_verify: false,
-            sni_hostname: None,
-            #[cfg(feature = "tls-rustls")]
-            extra_roots: Vec::new(),
-        }
-    }
 }
 
 impl Client {
@@ -502,37 +222,45 @@ impl Client {
             return Ok(resp);
         }
 
-        // force_has_body=true (body will be streamed), preview0_ieof=false
         let built = self.build_icap_request_bytes(req, true, false)?;
         AsyncWriteExt::write_all(&mut stream, &built.bytes).await?;
-        AsyncWriteExt::flush(&mut stream).await?;
 
-        // If Preview: 0, send zero chunk now (optionally ieof)
-        if matches!(req.preview_size, Some(0)) {
-            if req.preview_ieof {
-                AsyncWriteExt::write_all(&mut stream, b"0; ieof\r\n\r\n").await?;
-            } else {
+        match req.preview_size {
+            None => {
+                write_reader_chunks(&mut stream, &mut reader).await?;
                 AsyncWriteExt::write_all(&mut stream, b"0\r\n\r\n").await?;
+                AsyncWriteExt::flush(&mut stream).await?;
+
+                let response_buf = self.read_response_buffer(&mut stream).await?;
+                return self.finalize_response(stream, response_buf).await;
             }
-            AsyncWriteExt::flush(&mut stream).await?;
+            Some(0) => {
+                if req.preview_ieof {
+                    AsyncWriteExt::write_all(&mut stream, b"0; ieof\r\n\r\n").await?;
+                } else {
+                    AsyncWriteExt::write_all(&mut stream, b"0\r\n\r\n").await?;
+                }
+            }
+            Some(preview_size) => {
+                let (preview, eof) = read_preview_bytes(&mut reader, preview_size).await?;
+                if !preview.is_empty() {
+                    write_chunk(&mut stream, &preview).await?;
+                }
+                if eof {
+                    AsyncWriteExt::write_all(&mut stream, b"0; ieof\r\n\r\n").await?;
+                } else {
+                    AsyncWriteExt::write_all(&mut stream, b"0\r\n\r\n").await?;
+                }
+            }
         }
+        AsyncWriteExt::flush(&mut stream).await?;
 
         // Read server decision (100 Continue or final)
         let (code, hdr_buf) =
             Self::with_timeout(self.inner.read_timeout, read_icap_headers(&mut stream)).await?;
 
         if code == 100 {
-            // Stream source as chunked
-            let mut buf = vec![0u8; 64 * 1024];
-            loop {
-                let n = reader.read(&mut buf).await?;
-                if n == 0 {
-                    break;
-                }
-                write_chunk(&mut stream, &buf[..n]).await?;
-            }
-
-            // terminating chunk
+            write_reader_chunks(&mut stream, &mut reader).await?;
             AsyncWriteExt::write_all(&mut stream, b"0\r\n\r\n").await?;
             AsyncWriteExt::flush(&mut stream).await?;
 
@@ -546,111 +274,6 @@ impl Client {
                 .await?;
             self.finalize_response(stream, response_buf).await
         }
-    }
-
-    /// Send a request with streamed request body and stream response body into `writer`.
-    ///
-    /// The returned [`Response`] contains the status line and ICAP headers.
-    /// Encapsulated response payload bytes are forwarded directly to `writer`,
-    /// so `Response::body` is empty on success. Use this for large responses
-    /// when buffering the adapted body in memory is undesirable.
-    pub async fn send_streaming_reader_into_writer<R, W>(
-        &self,
-        req: &Request,
-        mut reader: R,
-        writer: &mut W,
-    ) -> IcapResult<Response>
-    where
-        R: AsyncRead + Unpin + Send,
-        W: AsyncWrite + Unpin + Send,
-    {
-        let mut stream = match self.inner.connection_policy {
-            ConnectionPolicy::KeepAlive => {
-                let idle = self.inner.idle_conn.lock().await.take();
-                if let Some(s) = idle {
-                    s
-                } else {
-                    self.inner.connect().await?
-                }
-            }
-            ConnectionPolicy::Close => self.inner.connect().await?,
-        };
-
-        if let Some(inner) = stream.plain_mut()
-            && let Some(resp) = Self::try_read_early_response_now(inner).await?
-        {
-            return Ok(resp);
-        }
-
-        let built = self.build_icap_request_bytes(req, true, false)?;
-        AsyncWriteExt::write_all(&mut stream, &built.bytes).await?;
-        AsyncWriteExt::flush(&mut stream).await?;
-
-        if matches!(req.preview_size, Some(0)) {
-            if req.preview_ieof {
-                AsyncWriteExt::write_all(&mut stream, b"0; ieof\r\n\r\n").await?;
-            } else {
-                AsyncWriteExt::write_all(&mut stream, b"0\r\n\r\n").await?;
-            }
-            AsyncWriteExt::flush(&mut stream).await?;
-        }
-
-        let (code, hdr_buf) =
-            Self::with_timeout(self.inner.read_timeout, read_icap_headers(&mut stream)).await?;
-
-        let mut response_buf = if code == 100 {
-            let mut buf = vec![0u8; 64 * 1024];
-            loop {
-                let n = reader.read(&mut buf).await?;
-                if n == 0 {
-                    break;
-                }
-                write_chunk(&mut stream, &buf[..n]).await?;
-            }
-            AsyncWriteExt::write_all(&mut stream, b"0\r\n\r\n").await?;
-            AsyncWriteExt::flush(&mut stream).await?;
-
-            let (_code2, final_hdr_buf) =
-                Self::with_timeout(self.inner.read_timeout, read_icap_headers(&mut stream)).await?;
-            final_hdr_buf
-        } else {
-            hdr_buf
-        };
-
-        let head = parse_icap_response_head(&response_buf)?;
-        Self::with_timeout(
-            self.inner.read_timeout,
-            read_icap_body_if_any_into(&mut stream, &mut response_buf, writer),
-        )
-        .await?;
-        AsyncWriteExt::flush(writer).await?;
-
-        let can_reuse = !response_wants_close(&head);
-        maybe_put_back(
-            self.inner.connection_policy,
-            &self.inner.idle_conn,
-            stream,
-            can_reuse,
-        )
-        .await;
-
-        Ok(head)
-    }
-
-    /// Convenience wrapper over [`Client::send_streaming_reader_into_writer`] for file sources.
-    pub async fn send_streaming_into_writer<P, W>(
-        &self,
-        req: &Request,
-        file_path: P,
-        writer: &mut W,
-    ) -> IcapResult<Response>
-    where
-        P: AsRef<Path>,
-        W: AsyncWrite + Unpin + Send,
-    {
-        let file = TokioFile::open(file_path).await?;
-        self.send_streaming_reader_into_writer(req, file, writer)
-            .await
     }
 
     /// Build the exact wire representation of a request, including preview tail when applicable.
@@ -959,6 +582,38 @@ async fn read_until_double_crlf_from<S: AsyncRead + AsyncWrite + Unpin>(
     }
 }
 
+async fn write_reader_chunks<S, R>(stream: &mut S, reader: &mut R) -> IcapResult<()>
+where
+    S: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+{
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = reader.read(&mut buf).await?;
+        if n == 0 {
+            return Ok(());
+        }
+        write_chunk(stream, &buf[..n]).await?;
+    }
+}
+
+async fn read_preview_bytes<R>(reader: &mut R, preview_size: usize) -> IcapResult<(Vec<u8>, bool)>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut preview = vec![0u8; preview_size];
+    let mut filled = 0;
+    while filled < preview_size {
+        let n = reader.read(&mut preview[filled..]).await?;
+        if n == 0 {
+            preview.truncate(filled);
+            return Ok((preview, true));
+        }
+        filled += n;
+    }
+    Ok((preview, false))
+}
+
 /// If the ICAP response has an encapsulated body (`req-body`/`res-body`/`opt-body`),
 /// read it to the end on the wire and append it to `buf`.
 async fn read_icap_body_if_any<S>(stream: &mut S, buf: &mut Vec<u8>) -> IcapResult<()>
@@ -987,39 +642,6 @@ where
         let _ = read_until_double_crlf_from(stream, buf, hdr_abs).await?;
     }
 
-    Ok(())
-}
-
-async fn read_icap_body_if_any_into<S, W>(
-    stream: &mut S,
-    buf: &mut Vec<u8>,
-    writer: &mut W,
-) -> IcapResult<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    let Some(h_end) = find_double_crlf(buf) else {
-        return Err(Error::parse("Corrupted ICAP headers"));
-    };
-
-    read_icap_body_if_any(stream, buf).await?;
-    if buf.len() > h_end {
-        let hdr_text = std::str::from_utf8(&buf[..h_end])
-            .map_err(|_| Error::http_parse("Invalid headers utf8"))?;
-        let enc = parse_encapsulated_header(hdr_text)?;
-        if let Some(body_rel) = enc.req_body.or(enc.res_body).or(enc.opt_body) {
-            let body_abs = h_end + body_rel;
-            AsyncWriteExt::write_all(writer, &buf[h_end..body_abs]).await?;
-            let mut chunked_slice = &buf[body_abs..];
-            let decoded = dechunk_icap_entity(&mut chunked_slice)
-                .map_err(|e| format!("dechunk ICAP entity: {e}"))?;
-            AsyncWriteExt::write_all(writer, &decoded).await?;
-        } else {
-            AsyncWriteExt::write_all(writer, &buf[h_end..]).await?;
-        }
-        buf.truncate(h_end);
-    }
     Ok(())
 }
 
@@ -1054,6 +676,8 @@ fn parse_authority_with_scheme(uri: &str) -> IcapResult<(String, u16, bool)> {
 
 #[cfg(test)]
 fn append_to_allow(headers: &mut HeaderMap, code: &str) {
+    use http::{HeaderName, HeaderValue};
+
     let name = HeaderName::from_static("allow");
     match headers.get_mut(&name) {
         Some(v) => {
@@ -1384,11 +1008,11 @@ fn build_preview_and_chunks(
 mod tests {
     use super::*;
     use crate::parser::icap::find_double_crlf;
-    use http::{header, Request as HttpReq, Version};
+    use http::{Request as HttpReq, Version, header};
     use rstest::{fixture, rstest};
     use std::future;
     use tokio::net::{TcpListener, TcpStream};
-    use tokio::time::{timeout, Duration};
+    use tokio::time::{Duration, timeout};
 
     fn bytes_to_string_prefix(v: &[u8], n: usize) -> String {
         String::from_utf8_lossy(&v[..v.len().min(n)]).to_string()
@@ -1424,6 +1048,51 @@ mod tests {
         let client = TcpStream::connect(addr).await.unwrap();
         let (server, _) = listener.accept().await.unwrap();
         (client, server)
+    }
+
+    async fn read_until_contains(stream: &mut TcpStream, needle: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 1024];
+        loop {
+            if memchr::memmem::find(&buf, needle).is_some() {
+                return buf;
+            }
+            let n = stream.read(&mut tmp).await.unwrap();
+            assert!(n > 0, "connection closed before expected bytes arrived");
+            buf.extend_from_slice(&tmp[..n]);
+        }
+    }
+
+    fn streaming_req(preview: Option<usize>) -> Request {
+        let http = HttpReq::builder()
+            .method("POST")
+            .uri("/scan")
+            .version(Version::HTTP_11)
+            .header(header::HOST, "app")
+            .header(header::CONTENT_LENGTH, "7")
+            .body(())
+            .unwrap();
+
+        let req = Request::reqmod("scan").with_http_request_head(http);
+        if let Some(preview_size) = preview {
+            req.preview(preview_size)
+        } else {
+            req
+        }
+    }
+
+    async fn spawn_raw_icap_server<F, Fut>(handler: F) -> u16
+    where
+        F: FnOnce(TcpStream) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            handler(stream).await;
+        });
+        port
     }
 
     async fn server_write(server: TcpStream, bytes: &[u8], keep_open: bool) {
@@ -1507,6 +1176,252 @@ mod tests {
             (Some(a), Some(b)) => assert_eq!(a, b),
             other => panic!("rest mismatch: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn rfc_streaming_without_preview_sends_body_before_reading_response() {
+        let port = spawn_raw_icap_server(|mut stream| async move {
+            let wire = read_until_contains(&mut stream, b"5\r\nHELLO\r\n0\r\n\r\n").await;
+            let text = String::from_utf8_lossy(&wire);
+            assert!(text.contains("Encapsulated: req-hdr=0, req-body="));
+            assert!(!text.contains("\r\nPreview:"));
+
+            stream
+                .write_all(
+                    b"ICAP/1.0 204 No Content\r\n\
+                      ISTag: \"stream-test\"\r\n\
+                      Encapsulated: null-body=0\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        })
+        .await;
+
+        let client = Client::builder().host("127.0.0.1").port(port).build();
+        let resp = timeout(
+            Duration::from_millis(500),
+            client.send_streaming_reader(&streaming_req(None), &b"HELLO"[..]),
+        )
+        .await
+        .expect("client waited for response before streaming body")
+        .unwrap();
+
+        assert_eq!(resp.status_code, http::StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn rfc_streaming_preview_sends_remainder_after_100_continue() {
+        let port = spawn_raw_icap_server(|mut stream| async move {
+            let preview = read_until_contains(&mut stream, b"4\r\nABCD\r\n0\r\n\r\n").await;
+            let text = String::from_utf8_lossy(&preview);
+            assert!(text.contains("\r\nPreview: 4\r\n"));
+
+            stream
+                .write_all(b"ICAP/1.0 100 Continue\r\n\r\n")
+                .await
+                .unwrap();
+
+            let remainder = read_until_contains(&mut stream, b"3\r\nEFG\r\n0\r\n\r\n").await;
+            assert!(
+                String::from_utf8_lossy(&remainder).contains("3\r\nEFG\r\n0\r\n\r\n"),
+                "missing chunked remainder"
+            );
+
+            stream
+                .write_all(
+                    b"ICAP/1.0 204 No Content\r\n\
+                      ISTag: \"stream-test\"\r\n\
+                      Encapsulated: null-body=0\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        })
+        .await;
+
+        let client = Client::builder().host("127.0.0.1").port(port).build();
+        let resp = client
+            .send_streaming_reader(&streaming_req(Some(4)), &b"ABCDEFG"[..])
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status_code, http::StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn rfc_streaming_preview_marks_ieof_when_reader_ends_inside_preview() {
+        let port = spawn_raw_icap_server(|mut stream| async move {
+            let preview = read_until_contains(&mut stream, b"3\r\nABC\r\n0; ieof\r\n\r\n").await;
+            let text = String::from_utf8_lossy(&preview);
+            assert!(text.contains("\r\nPreview: 8\r\n"));
+
+            stream
+                .write_all(
+                    b"ICAP/1.0 204 No Content\r\n\
+                      ISTag: \"stream-test\"\r\n\
+                      Encapsulated: null-body=0\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        })
+        .await;
+
+        let client = Client::builder().host("127.0.0.1").port(port).build();
+        let resp = client
+            .send_streaming_reader(&streaming_req(Some(8)), &b"ABC"[..])
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status_code, http::StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn rfc_streaming_preview0_sends_body_after_100_continue() {
+        let port = spawn_raw_icap_server(|mut stream| async move {
+            let preview = read_until_contains(&mut stream, b"0\r\n\r\n").await;
+            let text = String::from_utf8_lossy(&preview);
+            assert!(text.contains("\r\nPreview: 0\r\n"));
+            assert!(!text.contains("5\r\nHELLO\r\n"));
+
+            stream
+                .write_all(b"ICAP/1.0 100 Continue\r\n\r\n")
+                .await
+                .unwrap();
+
+            let body = read_until_contains(&mut stream, b"5\r\nHELLO\r\n0\r\n\r\n").await;
+            assert!(
+                String::from_utf8_lossy(&body).contains("5\r\nHELLO\r\n0\r\n\r\n"),
+                "missing full body after 100 Continue"
+            );
+
+            stream
+                .write_all(
+                    b"ICAP/1.0 204 No Content\r\n\
+                      ISTag: \"stream-test\"\r\n\
+                      Encapsulated: null-body=0\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        })
+        .await;
+
+        let client = Client::builder().host("127.0.0.1").port(port).build();
+        let resp = client
+            .send_streaming_reader(&streaming_req(Some(0)), &b"HELLO"[..])
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status_code, http::StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn rfc_streaming_preview0_final_response_skips_body_upload() {
+        let port = spawn_raw_icap_server(|mut stream| async move {
+            let preview = read_until_contains(&mut stream, b"0\r\n\r\n").await;
+            let text = String::from_utf8_lossy(&preview);
+            assert!(text.contains("\r\nPreview: 0\r\n"));
+            assert!(!text.contains("5\r\nHELLO\r\n"));
+
+            stream
+                .write_all(
+                    b"ICAP/1.0 204 No Content\r\n\
+                      ISTag: \"stream-test\"\r\n\
+                      Encapsulated: null-body=0\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        })
+        .await;
+
+        let client = Client::builder().host("127.0.0.1").port(port).build();
+        let resp = client
+            .send_streaming_reader(&streaming_req(Some(0)), &b"HELLO"[..])
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status_code, http::StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn rfc_streaming_preview0_ieof_sends_ieof_and_reads_final_response() {
+        let port = spawn_raw_icap_server(|mut stream| async move {
+            let preview = read_until_contains(&mut stream, b"0; ieof\r\n\r\n").await;
+            let text = String::from_utf8_lossy(&preview);
+            assert!(text.contains("\r\nPreview: 0\r\n"));
+
+            stream
+                .write_all(
+                    b"ICAP/1.0 204 No Content\r\n\
+                      ISTag: \"stream-test\"\r\n\
+                      Encapsulated: null-body=0\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        })
+        .await;
+
+        let client = Client::builder().host("127.0.0.1").port(port).build();
+        let req = streaming_req(Some(0)).preview_ieof();
+        let resp = client
+            .send_streaming_reader(&req, tokio::io::empty())
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status_code, http::StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn rfc_streaming_preview_final_response_skips_remainder_upload() {
+        let port = spawn_raw_icap_server(|mut stream| async move {
+            let preview = read_until_contains(&mut stream, b"4\r\nABCD\r\n0\r\n\r\n").await;
+            let text = String::from_utf8_lossy(&preview);
+            assert!(text.contains("\r\nPreview: 4\r\n"));
+            assert!(!text.contains("3\r\nEFG\r\n"));
+
+            stream
+                .write_all(
+                    b"ICAP/1.0 204 No Content\r\n\
+                      ISTag: \"stream-test\"\r\n\
+                      Encapsulated: null-body=0\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        })
+        .await;
+
+        let client = Client::builder().host("127.0.0.1").port(port).build();
+        let resp = client
+            .send_streaming_reader(&streaming_req(Some(4)), &b"ABCDEFG"[..])
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status_code, http::StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn rfc_streaming_preview_empty_reader_sends_ieof() {
+        let port = spawn_raw_icap_server(|mut stream| async move {
+            let preview = read_until_contains(&mut stream, b"0; ieof\r\n\r\n").await;
+            let text = String::from_utf8_lossy(&preview);
+            assert!(text.contains("\r\nPreview: 8\r\n"));
+
+            stream
+                .write_all(
+                    b"ICAP/1.0 204 No Content\r\n\
+                      ISTag: \"stream-test\"\r\n\
+                      Encapsulated: null-body=0\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        })
+        .await;
+
+        let client = Client::builder().host("127.0.0.1").port(port).build();
+        let resp = client
+            .send_streaming_reader(&streaming_req(Some(8)), tokio::io::empty())
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status_code, http::StatusCode::NO_CONTENT);
     }
 
     #[test]

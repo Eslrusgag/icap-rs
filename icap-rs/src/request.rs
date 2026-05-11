@@ -566,7 +566,6 @@ impl Request<Vec<u8>> {
     /// This is the usual client-side builder for `REQMOD` requests when the
     /// HTTP entity body is already available in memory. For large bodies, use
     /// [`Request::with_http_request_head`] together with a streaming client
-    /// method such as [`crate::Client::send_streaming_reader`].
     pub fn with_http_request(mut self, req: HttpRequest<Vec<u8>>) -> Self {
         let (parts, body) = req.into_parts();
         let head = HttpRequest::from_parts(parts, ());
@@ -582,7 +581,6 @@ impl Request<Vec<u8>> {
     /// This is the usual client-side builder for `RESPMOD` requests when the
     /// HTTP entity body is already available in memory. For large bodies, use
     /// [`Request::with_http_response_head`] together with a streaming client
-    /// method such as [`crate::Client::send_streaming_reader`].
     pub fn with_http_response(mut self, resp: HttpResponse<Vec<u8>>) -> Self {
         let (parts, body) = resp.into_parts();
         let head = HttpResponse::from_parts(parts, ());

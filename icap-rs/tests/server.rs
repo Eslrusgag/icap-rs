@@ -130,6 +130,18 @@ async fn alias_and_default_service_resolve() {
 }
 
 #[tokio::test]
+async fn options_unknown_service_returns_404() {
+    let port = 13522;
+    start_server_on(port).await;
+
+    let client = Client::builder().host("127.0.0.1").port(port).build();
+    let req = Request::options("respmosw");
+    let resp = client.send(&req).await.expect("icap options send");
+
+    assert_eq!(resp.status_code, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn respmod_no_allow_with_preview_may_be_204() {
     let port = 13512;
     start_server_on(port).await;

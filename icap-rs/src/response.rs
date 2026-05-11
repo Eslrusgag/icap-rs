@@ -693,11 +693,6 @@ pub(crate) fn parse_icap_response(raw: &[u8]) -> IcapResult<Response> {
     Ok(response)
 }
 
-pub(crate) fn parse_icap_response_head(raw: &[u8]) -> IcapResult<Response> {
-    trace!(len = raw.len(), "parse_icap_response_head");
-    Ok(parse_response_head_parts(raw)?.response)
-}
-
 fn validate_encapsulated_offsets(enc: &Encapsulated, enc_len: usize) -> IcapResult<()> {
     for off in encapsulated_offsets(enc) {
         if off > enc_len {
