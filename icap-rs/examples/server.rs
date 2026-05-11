@@ -14,7 +14,8 @@ use icap_rs::{Body, Method};
 use tracing::{error, info, warn};
 
 const ISTAG_REQMOD_INIT: &str = "reqmod-1.0";
-const ISTAG_RESPMOD_INIT: &str = "respmod-1.0";
+// Base64-like token with '+' and '/' demonstrates c-icap-compatible ISTag values.
+const ISTAG_RESPMOD_INIT: &str = "QUJD+/8=";
 const ISTAG_BLOCKER_INIT: &str = "blocker-1.0";
 
 #[tokio::main]

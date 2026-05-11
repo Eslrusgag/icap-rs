@@ -283,6 +283,50 @@ fn icap_response() -> IcapResult<Response> {
 }
 ```
 
+## ICAP Header Values
+
+ICAP headers use `http::HeaderValue` validation. ASCII comma-separated values
+such as `X-TEST: test1, test2, test3` are accepted and preserved as one header
+value. The crate only applies list semantics for headers with explicit protocol
+logic, such as `Allow`. Custom header list parsing belongs to caller code
+because comma handling is header-specific.
+
+```rust
+use icap_rs::{IcapResult, Request, Response, StatusCode};
+
+fn parse_comma_list(value: &str) -> Vec<&str> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .collect()
+}
+
+fn comma_separated_header_example() -> IcapResult<()> {
+    let req: Request = Request::reqmod("scan")
+        .try_icap_header("X-TEST", "test1, test2, test3")?;
+
+    let raw_value = req
+        .icap_headers
+        .get("X-TEST")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    assert_eq!(parse_comma_list(raw_value), vec!["test1", "test2", "test3"]);
+
+    let resp = Response::new(StatusCode::NO_CONTENT, "No Content")
+        .try_set_istag("example-1")?
+        .try_add_header("X-TEST", "test1, test2, test3")?;
+
+    let raw_value = resp
+        .get_header("X-TEST")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    assert_eq!(parse_comma_list(raw_value), vec!["test1", "test2", "test3"]);
+
+    Ok(())
+}
+```
+
 ## RFC 3507 Behavior
 
 - `Host` is required on incoming ICAP requests.
@@ -290,7 +334,12 @@ fn icap_response() -> IcapResult<Response> {
   non-monotonic, and method-incompatible forms.
 - `OPTIONS`, `REQMOD`, and `RESPMOD` are supported.
 - `Preview` supports `Preview: 0`, `Preview: N`, `ieof`, and `100 Continue`.
-- Successful ICAP responses require a valid `ISTag`.
+- Successful ICAP responses require a valid `ISTag`. Outgoing responses always
+  serialize it as the RFC 3507 quoted-string form, so
+  `Response::no_content_with_istag("QUJD+/8=")` writes
+  `ISTag: "QUJD+/8="`. Incoming response parsing is intentionally more
+  permissive and accepts unquoted token/base64-like values for compatibility
+  with existing ICAP servers.
 - `204 No Content` is serialized as `Encapsulated: null-body=0` and must not
   carry body bytes.
 - Server handlers that return `204` are guarded: if the request has neither

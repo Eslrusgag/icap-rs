@@ -77,5 +77,10 @@ harness = false
 name = "rps_bench"
 harness = false
 
+[[bench]]
+name = "tls_overhead_bench"
+harness = false
+required-features = ["tls-rustls"]
+
 [lints]
 workspace = true

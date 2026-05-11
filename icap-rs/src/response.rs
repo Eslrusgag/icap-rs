@@ -167,8 +167,7 @@ impl Response {
     /// Setting `ISTag` here is discouraged; prefer [`Response::try_set_istag`].
     pub fn try_add_header(mut self, name: &str, value: &str) -> IcapResult<Self> {
         if name.eq_ignore_ascii_case("ISTag") {
-            validate_istag(value)?;
-            let val = HeaderValue::from_str(value)?;
+            let val = istag_header_value(value)?;
             self.headers.insert(HeaderName::from_static("istag"), val);
             return Ok(self);
         }
@@ -200,13 +199,16 @@ impl Response {
             .expect("invalid response header name or value")
     }
 
-    /// Set `ISTag` header with validation (length ≤32; unquoted must be HTTP token,
-    /// quoted-string is accepted per RFC 3507/2616).
+    /// Set `ISTag` header with validation.
+    ///
+    /// RFC 3507 defines `ISTag` as a quoted-string. For compatibility, this
+    /// method accepts an unquoted token such as `QUJD+/8=`, but stores it as a
+    /// quoted wire value (`"QUJD+/8="`). Response parsing remains more lenient
+    /// and accepts unquoted token/base64-like peer values for interoperability.
     /// Returns `Self` on success; otherwise `Error::InvalidISTag`.
     pub fn try_set_istag(mut self, istag: &str) -> IcapResult<Self> {
-        validate_istag(istag)?;
         let name = HeaderName::from_static("istag");
-        let val = HeaderValue::from_str(istag)?;
+        let val = istag_header_value(istag)?;
         self.headers.insert(name, val);
         Ok(self)
     }
@@ -856,6 +858,15 @@ fn validate_istag(raw: &str) -> IcapResult<()> {
     Ok(())
 }
 
+fn istag_header_value(istag: &str) -> IcapResult<HeaderValue> {
+    validate_istag(istag)?;
+    let trimmed = istag.trim();
+    if trimmed.starts_with('"') {
+        return Ok(HeaderValue::from_str(trimmed)?);
+    }
+    Ok(HeaderValue::from_str(&format!("\"{trimmed}\""))?)
+}
+
 #[inline]
 fn is_http_token_char(c: char) -> bool {
     // Accept '/' and '=' for compatibility with c-icap, which can send
@@ -914,7 +925,7 @@ mod tests {
         assert_eq!(ok.status_text, "OK");
         assert_eq!(
             ok.get_header("ISTag").unwrap(),
-            &HeaderValue::from_static("ok-1")
+            &HeaderValue::from_static("\"ok-1\"")
         );
 
         let no_content = Response::no_content_with_istag("no-change-1").expect("valid ISTag");
@@ -993,7 +1004,28 @@ mod tests {
         let resp = Response::new(StatusCode::OK, "OK").add_header("ISTag", "ok-Tag.123");
         assert_eq!(
             resp.get_header("ISTag").unwrap(),
-            &HeaderValue::from_static("ok-Tag.123")
+            &HeaderValue::from_static("\"ok-Tag.123\"")
+        );
+    }
+
+    #[test]
+    fn try_set_istag_quotes_base64_like_token_for_wire() {
+        let resp = Response::no_content_with_istag("QUJD+/8=").expect("valid base64-like ISTag");
+        assert_eq!(
+            resp.get_header("ISTag").unwrap(),
+            &HeaderValue::from_static("\"QUJD+/8=\"")
+        );
+
+        let raw = String::from_utf8(resp.to_raw().expect("serialize 204")).expect("utf8");
+        assert!(raw.contains("\r\nISTag: \"QUJD+/8=\"\r\n"));
+    }
+
+    #[test]
+    fn try_set_istag_preserves_already_quoted_value() {
+        let resp = Response::no_content_with_istag("\"QUJD+/8=\"").expect("valid quoted ISTag");
+        assert_eq!(
+            resp.get_header("ISTag").unwrap(),
+            &HeaderValue::from_static("\"QUJD+/8=\"")
         );
     }
 

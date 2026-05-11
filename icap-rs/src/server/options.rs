@@ -132,6 +132,10 @@ impl ServiceOptions {
     /// Provide a **dynamic `ISTag` provider** that will be invoked for **each request**
     /// (including `OPTIONS`). The closure should be fast and lock-free if possible.
     ///
+    /// The provider returns the logical tag value. It may return a raw token
+    /// such as `policy-1` or a base64-like value such as `QUJD+/8=`; generated
+    /// ICAP responses quote the value on the wire per RFC 3507.
+    ///
     /// Typical sources include: a version string stored in an `Arc<RwLock<String>>`,
     /// an atomic epoch counter, or a lightweight in-process cache.
     ///
@@ -156,6 +160,9 @@ impl ServiceOptions {
     }
 
     /// Use a **static** `ISTag` for responses.
+    ///
+    /// The value may be passed as a raw token such as `policy-1` or
+    /// `QUJD+/8=`. Generated ICAP responses quote it on the wire per RFC 3507.
     pub fn with_static_istag(mut self, istag: &str) -> Self {
         self.istag = IstagSource::Static(istag.to_string());
         self
@@ -270,9 +277,9 @@ impl ServiceOptions {
             .join(", ");
         response = response.add_header("Methods", &methods_str);
 
-        // ISTag — dynamic per-request
+        // ISTag — dynamic per-request. `Response` quotes raw token values per RFC 3507.
         let istag_now = self.istag_for(req);
-        response = response.add_header("ISTag", &format!("\"{istag_now}\""));
+        response = response.add_header("ISTag", &istag_now);
 
         // Encapsulated
         let encapsulated_value = if self.opt_body.is_some() {
