@@ -271,13 +271,13 @@ impl ClientBuilder {
 impl Default for ClientBuilder {
     fn default() -> Self {
         Self {
-            host: Some("localhost".to_string()),
-            port: Some(1344),
+            host: None,
+            port: None,
             host_override: None,
             default_headers: HeaderMap::new(),
-            connection_policy: ConnectionPolicy::Close,
+            connection_policy: ConnectionPolicy::default(),
             read_timeout: None,
-            tls_backend: None, // plain by default
+            tls_backend: None,
             danger_disable_verify: false,
             sni_hostname: None,
             #[cfg(feature = "tls-rustls")]

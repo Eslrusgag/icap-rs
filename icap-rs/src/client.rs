@@ -18,14 +18,15 @@ pub mod builder;
 mod tls;
 
 use crate::error::{Error, IcapResult};
-use crate::parser::parse_encapsulated_header;
-use crate::parser::{canon_icap_header, read_chunked_to_end, write_chunk, write_chunk_into};
+use crate::protocol::{
+    canon_icap_header, find_double_crlf, parse_encapsulated_header, read_chunked_to_end,
+    write_chunk, write_chunk_into,
+};
 use crate::request::{Request, serialize_embedded_http};
 use crate::response::{ParsedResponse, parse_icap_response};
 
 use crate::Method;
 use crate::client::tls::{AnyTlsConnector, TlsConnector};
-use crate::parser::icap::find_double_crlf;
 
 use http::HeaderMap;
 use std::collections::HashSet;
@@ -1034,7 +1035,7 @@ fn build_preview_and_chunks(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parser::icap::find_double_crlf;
+    use crate::protocol::find_double_crlf;
     use http::{Request as HttpReq, Version, header};
     use rstest::{fixture, rstest};
     use std::future;

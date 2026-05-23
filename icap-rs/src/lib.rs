@@ -3,7 +3,7 @@
 pub mod client;
 pub mod error;
 mod net;
-mod parser;
+mod protocol;
 pub mod request;
 pub mod response;
 pub mod server;

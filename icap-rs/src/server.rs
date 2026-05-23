@@ -71,8 +71,7 @@ use tokio::sync::Semaphore;
 use tracing::{error, trace, warn};
 
 use crate::error::{Error, IcapResult};
-use crate::parser::icap::find_double_crlf;
-use crate::parser::read_chunked_to_end;
+use crate::protocol::{find_double_crlf, parse_encapsulated_header, read_chunked_to_end};
 use crate::request::{
     Body, IncomingRequest, Remainder, RequestParserMode, parse_icap_request,
     parse_icap_request_with_mode,
@@ -409,7 +408,7 @@ impl Server {
                 .await?;
                 return Ok(());
             };
-            let enc = match crate::parser::parse_encapsulated_header(&hdr_text) {
+            let enc = match parse_encapsulated_header(&hdr_text) {
                 Ok(enc) => enc,
                 Err(err) => {
                     warn!(client=%addr, error=%err, "malformed ICAP Encapsulated header");

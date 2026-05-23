@@ -51,7 +51,7 @@
 
 use crate::ICAP_VERSION;
 use crate::error::{Error, IcapResult};
-use crate::parser::icap::find_double_crlf;
+use crate::protocol::find_double_crlf;
 use bytes::Bytes;
 use http::{
     HeaderMap, HeaderName, HeaderValue, Method as HttpMethod, Request as HttpRequest,
@@ -430,7 +430,7 @@ fn serialize_http_request_head(head: &HttpRequest<()>) -> Vec<u8> {
         "{} {} {}\r\n",
         head.method(),
         head.uri(),
-        crate::parser::http_version_str(head.version())
+        crate::protocol::http_version_str(head.version())
     )
     .expect("write request line");
     for (name, value) in head.headers() {
@@ -448,7 +448,7 @@ fn serialize_http_response_head(head: &HttpResponse<()>) -> Vec<u8> {
     write!(
         &mut out,
         "{} {} {}\r\n",
-        crate::parser::http_version_str(head.version()),
+        crate::protocol::http_version_str(head.version()),
         head.status().as_u16(),
         head.status().canonical_reason().unwrap_or("")
     )
@@ -910,9 +910,9 @@ pub(crate) fn parse_icap_request_with_mode(
     let enc = match icap_headers.get("Encapsulated") {
         Some(v) => {
             let raw = v.to_str()?;
-            crate::parser::icap::parse_encapsulated_value(raw)?
+            crate::protocol::parse_encapsulated_value(raw)?
         }
-        None => crate::parser::icap::Encapsulated::default(),
+        None => crate::protocol::Encapsulated::default(),
     };
     validate_encapsulated_for_method(method, &enc)?;
 
@@ -1101,7 +1101,7 @@ fn parse_embedded_http_response_start_line(start: &str) -> IcapResult<(Version, 
 
 fn validate_encapsulated_for_method(
     method: Method,
-    enc: &crate::parser::icap::Encapsulated,
+    enc: &crate::protocol::Encapsulated,
 ) -> IcapResult<()> {
     if enc.null_body.is_some()
         && (enc.req_body.is_some() || enc.res_body.is_some() || enc.opt_body.is_some())
@@ -1164,7 +1164,7 @@ fn parse_http_version(version: &str) -> IcapResult<Version> {
     }
 }
 
-fn next_offset_after(enc: &crate::parser::icap::Encapsulated, start: usize) -> Option<usize> {
+fn next_offset_after(enc: &crate::protocol::Encapsulated, start: usize) -> Option<usize> {
     let mut min: Option<usize> = None;
 
     let mut consider = |v: Option<usize>| {

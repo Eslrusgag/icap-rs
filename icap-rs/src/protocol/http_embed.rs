@@ -1,4 +1,4 @@
-use crate::parser::http_version_str;
+use crate::protocol::http_version_str;
 use http::{Request as HttpRequest, Response as HttpResponse, StatusCode};
 use std::fmt::Write as _;
 

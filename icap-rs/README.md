@@ -30,7 +30,7 @@ async fn main() -> IcapResult<()> {
         .build();
 
     let response = client.send(&Request::options("respmod")).await?;
-    println!("ICAP {} {}", response.status_code, response.status_text);
+    println!("ICAP {} {}", response.status_code(), response.status_text());
     Ok(())
 }
 ```
@@ -250,7 +250,7 @@ async fn main() -> IcapResult<()> {
         .send_streaming_reader(&request, source)
         .await?;
 
-    println!("ICAP {} {}", response.status_code, response.status_text);
+    println!("ICAP {} {}", response.status_code(), response.status_text());
     Ok(())
 }
 ```
