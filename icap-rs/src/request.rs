@@ -51,13 +51,12 @@
 
 use crate::ICAP_VERSION;
 use crate::error::{Error, IcapResult};
-use crate::protocol::find_double_crlf;
-use bytes::Bytes;
-use http::{
-    HeaderMap, HeaderName, HeaderValue, Method as HttpMethod, Request as HttpRequest,
-    Response as HttpResponse, StatusCode as HttpStatus, Version,
+use crate::protocol::{
+    find_double_crlf, parse_header_lines, parse_http_request_start_line,
+    parse_http_response_start_line,
 };
-use memchr::memchr;
+use bytes::Bytes;
+use http::{HeaderMap, HeaderName, HeaderValue, Request as HttpRequest, Response as HttpResponse};
 use memchr::memmem;
 use std::fmt;
 use std::future::Future;
@@ -868,20 +867,7 @@ pub(crate) fn parse_icap_request_with_mode(
         return Err(Error::InvalidVersion(version.to_string()));
     }
 
-    let mut icap_headers = HeaderMap::new();
-    for line in lines {
-        if line.is_empty() {
-            break;
-        }
-        if let Some(colon) = memchr(b':', line.as_bytes()) {
-            let name = &line[..colon];
-            let value = line[colon + 1..].trim();
-            icap_headers.insert(
-                HeaderName::from_bytes(name.as_bytes())?,
-                HeaderValue::from_str(value)?,
-            );
-        }
-    }
+    let icap_headers = parse_header_lines(lines)?;
 
     if !icap_headers.contains_key("Host") {
         return Err(Error::MissingHeader("Host"));
@@ -952,20 +938,7 @@ pub(crate) fn parse_icap_request_with_mode(
         let mut hlines = http_head_str.split("\r\n");
         let _ = hlines.next();
 
-        let mut http_headers = HeaderMap::new();
-        for line in hlines {
-            if line.is_empty() {
-                break;
-            }
-            if let Some(colon) = memchr(b':', line.as_bytes()) {
-                let name = &line[..colon];
-                let value = line[colon + 1..].trim();
-                http_headers.insert(
-                    HeaderName::from_bytes(name.as_bytes())?,
-                    HeaderValue::from_str(value)?,
-                );
-            }
-        }
+        let http_headers = parse_header_lines(hlines)?;
 
         let body_off = match method {
             Method::ReqMod => enc.req_body,
@@ -994,7 +967,7 @@ pub(crate) fn parse_icap_request_with_mode(
         };
 
         if method == Method::RespMod {
-            let (version, status) = parse_embedded_http_response_start_line(start)?;
+            let (version, status) = parse_http_response_start_line(start)?;
 
             let mut builder = HttpResponse::builder().status(status).version(version);
 
@@ -1014,7 +987,7 @@ pub(crate) fn parse_icap_request_with_mode(
                 body: Body::Full { reader: body_bytes },
             })
         } else {
-            let (http_method, uri, version) = parse_embedded_http_request_start_line(start)?;
+            let (http_method, uri, version) = parse_http_request_start_line(start)?;
 
             let mut builder = HttpRequest::builder()
                 .method(http_method)
@@ -1051,52 +1024,6 @@ pub(crate) fn parse_icap_request_with_mode(
         allow_206,
         preview_ieof: false,
     }))
-}
-
-fn parse_embedded_http_request_start_line(start: &str) -> IcapResult<(HttpMethod, &str, Version)> {
-    let mut parts = start.split_whitespace();
-    let method = parts
-        .next()
-        .ok_or_else(|| Error::http_parse("embedded HTTP request line missing method"))?;
-    let uri = parts
-        .next()
-        .ok_or_else(|| Error::http_parse("embedded HTTP request line missing URI"))?;
-    let version = parts
-        .next()
-        .ok_or_else(|| Error::http_parse("embedded HTTP request line missing version"))?;
-
-    if parts.next().is_some() {
-        return Err(Error::http_parse(
-            "embedded HTTP request line has extra fields",
-        ));
-    }
-
-    Ok((
-        HttpMethod::from_str(method)?,
-        uri,
-        parse_http_version(version)?,
-    ))
-}
-
-fn parse_embedded_http_response_start_line(start: &str) -> IcapResult<(Version, HttpStatus)> {
-    let mut parts = start.split_whitespace();
-    let version = parts
-        .next()
-        .ok_or_else(|| Error::http_parse("embedded HTTP status line missing version"))?;
-    if !version.starts_with("HTTP/") {
-        return Err(Error::http_parse(format!(
-            "embedded HTTP status line must start with HTTP/, got {version}"
-        )));
-    }
-
-    let status = parts
-        .next()
-        .ok_or_else(|| Error::http_parse("embedded HTTP status line missing status code"))?;
-    let status = status
-        .parse::<u16>()
-        .map_err(|_| Error::http_parse(format!("invalid embedded HTTP status code: {status}")))?;
-
-    Ok((parse_http_version(version)?, HttpStatus::from_u16(status)?))
 }
 
 fn validate_encapsulated_for_method(
@@ -1151,17 +1078,6 @@ fn validate_encapsulated_for_method(
     }
 
     Ok(())
-}
-
-fn parse_http_version(version: &str) -> IcapResult<Version> {
-    match version {
-        "HTTP/0.9" => Ok(Version::HTTP_09),
-        "HTTP/1.0" => Ok(Version::HTTP_10),
-        "HTTP/1.1" => Ok(Version::HTTP_11),
-        "HTTP/2.0" | "HTTP/2" => Ok(Version::HTTP_2),
-        "HTTP/3.0" | "HTTP/3" => Ok(Version::HTTP_3),
-        _ => Err(Error::InvalidVersion(version.to_string())),
-    }
 }
 
 fn next_offset_after(enc: &crate::protocol::Encapsulated, start: usize) -> Option<usize> {

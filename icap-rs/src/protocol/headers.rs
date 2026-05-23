@@ -1,9 +1,24 @@
+use crate::ICAP_VERSION;
+use crate::error::{Error, IcapResult};
 use crate::protocol::chunked::write_chunk_into;
 use crate::protocol::encapsulated::parse_encapsulated_value;
+use crate::protocol::validate_istag;
 use crate::response::Response;
-use http::Version;
+use http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Version};
 use std::borrow::Cow;
 use std::fmt::Write;
+use std::str::FromStr;
+use tracing::{trace, warn};
+
+#[derive(Debug)]
+pub struct RawIcapResponseHead {
+    pub version: String,
+    pub status_code: StatusCode,
+    pub status_text: String,
+    pub headers: HeaderMap,
+    pub header_end: usize,
+    pub encapsulated_value: Option<String>,
+}
 
 /// Find end of ICAP header block (position after CRLFCRLF).
 #[inline]
@@ -19,6 +34,127 @@ pub const fn http_version_str(v: Version) -> &'static str {
         Version::HTTP_3 => "HTTP/3.0",
         _ => "HTTP/1.1",
     }
+}
+
+pub fn parse_icap_response_head(raw: &[u8]) -> IcapResult<RawIcapResponseHead> {
+    if raw.is_empty() {
+        return Err(Error::parse("Empty response"));
+    }
+
+    let hdr_end =
+        find_double_crlf(raw).ok_or_else(|| Error::parse("ICAP response headers not complete"))?;
+    let head = &raw[..hdr_end];
+    let head_str = std::str::from_utf8(head)?;
+    let mut lines = head_str.split("\r\n");
+
+    let status_line = lines.next().ok_or_else(|| Error::parse("Empty response"))?;
+    let parts: Vec<&str> = status_line.split_whitespace().collect();
+    if parts.len() < 2 {
+        return Err(Error::parse("Invalid status line format"));
+    }
+
+    if parts[0] != ICAP_VERSION {
+        return Err(Error::InvalidVersion(parts[0].to_string()));
+    }
+
+    let version = parts[0].to_string();
+    let status_code = if let Ok(code) = StatusCode::from_str(parts[1]) {
+        code
+    } else {
+        let code_num = parts[1]
+            .parse::<u16>()
+            .map_err(|_| Error::InvalidStatusCode("Invalid status code".into()))?;
+        StatusCode::try_from(code_num).map_err(|_| {
+            Error::InvalidStatusCode(format!("Unknown ICAP status code: {code_num}"))
+        })?
+    };
+
+    let status_text = if parts.len() > 2 {
+        parts[2..].join(" ")
+    } else {
+        String::new()
+    };
+
+    trace!(version = %version, code = %status_code.as_str(), text = %status_text, "parsed status line");
+
+    let mut headers = HeaderMap::new();
+    let mut seen_encapsulated = false;
+    let mut encapsulated_value = None;
+    for line in lines {
+        if line.is_empty() {
+            break;
+        }
+        if let Some(colon) = memchr::memchr(b':', line.as_bytes()) {
+            let name = &line[..colon];
+            let value = line[colon + 1..].trim();
+
+            if name.eq_ignore_ascii_case("Encapsulated") {
+                if seen_encapsulated {
+                    return Err(Error::Header("duplicate Encapsulated header".into()));
+                }
+                seen_encapsulated = true;
+                encapsulated_value = Some(value.to_string());
+            }
+
+            if name.eq_ignore_ascii_case("ISTag") {
+                validate_istag(value)?;
+            }
+
+            headers.insert(
+                HeaderName::from_bytes(name.as_bytes())?,
+                HeaderValue::from_str(value)?,
+            );
+        }
+    }
+
+    if !headers.contains_key("ISTag") {
+        if status_code.is_success() {
+            return Err(Error::MissingHeader("ISTag"));
+        }
+        warn!(code = %status_code, "response without ISTag on non-2xx (accepted for compatibility)");
+    }
+
+    Ok(RawIcapResponseHead {
+        version,
+        status_code,
+        status_text,
+        headers,
+        header_end: hdr_end,
+        encapsulated_value,
+    })
+}
+
+pub fn parse_header_lines<'a, I>(lines: I) -> IcapResult<HeaderMap>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let mut headers = HeaderMap::new();
+    for line in lines {
+        if line.is_empty() {
+            break;
+        }
+        if let Some(colon) = memchr::memchr(b':', line.as_bytes()) {
+            let name = &line[..colon];
+            let value = line[colon + 1..].trim();
+            headers.insert(
+                HeaderName::from_bytes(name.as_bytes())?,
+                HeaderValue::from_str(value)?,
+            );
+        }
+    }
+    Ok(headers)
+}
+
+pub fn parse_preview_header_value(hdr_text: &str) -> Option<usize> {
+    for line in hdr_text.lines() {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.trim().eq_ignore_ascii_case("Preview") {
+            return value.trim().parse::<usize>().ok();
+        }
+    }
+    None
 }
 
 pub fn serialize_icap_response(resp: &Response) -> Vec<u8> {

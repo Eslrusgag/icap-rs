@@ -29,15 +29,14 @@
 use crate::ICAP_VERSION;
 use crate::error::{Error, IcapResult};
 use crate::protocol::{
-    Encapsulated, find_double_crlf, istag_header_value, parse_encapsulated_value, parse_one_chunk,
-    serialize_http_request, serialize_http_response, validate_istag,
+    Encapsulated, dechunk_icap_entity_with_use_original_body, find_double_crlf, istag_header_value,
+    parse_encapsulated_value, parse_icap_response_head, parse_one_chunk, serialize_http_request,
+    serialize_http_response, validate_istag,
 };
 use http::{HeaderMap, HeaderName, HeaderValue};
-use memchr::memchr;
 use std::fmt;
 use std::marker::PhantomData;
-use std::str::FromStr;
-use tracing::{trace, warn};
+use tracing::trace;
 
 /// ICAP status codes.
 ///
@@ -593,105 +592,28 @@ fn compute_enc_for_req_body(body: &[u8]) -> IcapResult<String> {
     }
 }
 
-struct ParsedResponseHead {
-    response: ParsedResponse,
-    header_end: usize,
-    encapsulated_value: Option<String>,
-}
-
 fn parse_response_head_parts(raw: &[u8]) -> IcapResult<ParsedResponseHead> {
-    if raw.is_empty() {
-        return Err(Error::parse("Empty response"));
-    }
-
-    let hdr_end =
-        find_double_crlf(raw).ok_or_else(|| Error::parse("ICAP response headers not complete"))?;
-    let head = &raw[..hdr_end];
-    let head_str = std::str::from_utf8(head)?;
-    let mut lines = head_str.split("\r\n");
-
-    let status_line = lines.next().ok_or_else(|| Error::parse("Empty response"))?;
-    let parts: Vec<&str> = status_line.split_whitespace().collect();
-    if parts.len() < 2 {
-        return Err(Error::parse("Invalid status line format"));
-    }
-
-    if parts[0] != ICAP_VERSION {
-        return Err(Error::InvalidVersion(parts[0].to_string()));
-    }
-
-    let version = parts[0].to_string();
-    let status_code = if let Ok(code) = StatusCode::from_str(parts[1]) {
-        code
-    } else {
-        let code_num = parts[1]
-            .parse::<u16>()
-            .map_err(|_| Error::InvalidStatusCode("Invalid status code".into()))?;
-        StatusCode::try_from(code_num).map_err(|_| {
-            Error::InvalidStatusCode(format!("Unknown ICAP status code: {code_num}"))
-        })?
-    };
-
-    let status_text = if parts.len() > 2 {
-        parts[2..].join(" ")
-    } else {
-        String::new()
-    };
-
-    trace!(version = %version, code = %status_code.as_str(), text = %status_text, "parsed status line");
-
-    let mut headers = HeaderMap::new();
-    let mut seen_encapsulated = false;
-    let mut encapsulated_value = None;
-    for line in lines {
-        if line.is_empty() {
-            break;
-        }
-        if let Some(colon) = memchr(b':', line.as_bytes()) {
-            let name = &line[..colon];
-            let value = line[colon + 1..].trim();
-
-            if name.eq_ignore_ascii_case("Encapsulated") {
-                if seen_encapsulated {
-                    return Err(Error::Header("duplicate Encapsulated header".into()));
-                }
-                seen_encapsulated = true;
-                encapsulated_value = Some(value.to_string());
-            }
-
-            if name.eq_ignore_ascii_case("ISTag") {
-                validate_istag(value)?;
-            }
-
-            headers.insert(
-                HeaderName::from_bytes(name.as_bytes())?,
-                HeaderValue::from_str(value)?,
-            );
-        }
-    }
-
-    let require_istag = status_code.is_success();
-
-    if !headers.contains_key("ISTag") {
-        if require_istag {
-            return Err(Error::MissingHeader("ISTag"));
-        }
-        warn!(code = %status_code, "response without ISTag on non-2xx (accepted for compatibility)");
-    }
+    let head = parse_icap_response_head(raw)?;
 
     Ok(ParsedResponseHead {
         response: Response {
-            version,
-            status_code,
-            status_text,
-            headers,
+            version: head.version,
+            status_code: head.status_code,
+            status_text: head.status_text,
+            headers: head.headers,
             use_original_body: None,
             body: Vec::new(),
             direction: PhantomData,
         },
-        header_end: hdr_end,
-        encapsulated_value,
+        header_end: head.header_end,
+        encapsulated_value: head.encapsulated_value,
     })
+}
+
+struct ParsedResponseHead {
+    response: ParsedResponse,
+    header_end: usize,
+    encapsulated_value: Option<String>,
 }
 
 pub(crate) fn parse_icap_response(raw: &[u8]) -> IcapResult<ParsedResponse> {
@@ -782,65 +704,6 @@ fn dechunk_response_body_if_needed(
         .map_err(|e| Error::Body(format!("dechunk ICAP entity: {e}")))?;
     body.splice(body_start.., decoded);
     Ok(use_original_body)
-}
-
-fn dechunk_icap_entity_with_use_original_body(
-    data: &mut &[u8],
-) -> Result<(Vec<u8>, Option<usize>), String> {
-    let mut out = Vec::with_capacity((*data).len());
-    let mut d = *data;
-
-    loop {
-        let crlf_pos = memchr::memmem::find(d, b"\r\n").ok_or("chunk size line without CRLF")?;
-        let (size_line, rest) = d.split_at(crlf_pos);
-        d = &rest[2..];
-
-        let size_hex = memchr(b';', size_line).map_or(size_line, |i| &size_line[..i]);
-        let size_str = core::str::from_utf8(size_hex).map_err(|_| "chunk size not utf8")?;
-        let size = usize::from_str_radix(size_str.trim(), 16).map_err(|_| "chunk size not hex")?;
-
-        if size == 0 {
-            let use_original_body = parse_use_original_body_extension(size_line)?;
-            if d.starts_with(b"\r\n") {
-                d = &d[2..];
-            } else {
-                return Err("missing final CRLF after zero chunk".into());
-            }
-            *data = d;
-            return Ok((out, use_original_body));
-        }
-
-        if d.len() < size + 2 {
-            return Err("incomplete chunk data".into());
-        }
-        out.extend_from_slice(&d[..size]);
-        d = &d[size..];
-        if !d.starts_with(b"\r\n") {
-            return Err("missing CRLF after chunk".into());
-        }
-        d = &d[2..];
-    }
-}
-
-fn parse_use_original_body_extension(size_line: &[u8]) -> Result<Option<usize>, String> {
-    let Some(ext_start) = memchr(b';', size_line) else {
-        return Ok(None);
-    };
-    let ext_text = core::str::from_utf8(&size_line[ext_start + 1..])
-        .map_err(|_| "chunk extension not utf8")?;
-    for ext in ext_text.split(';') {
-        let Some((name, value)) = ext.trim().split_once('=') else {
-            continue;
-        };
-        if name.trim().eq_ignore_ascii_case("use-original-body") {
-            return value
-                .trim()
-                .parse::<usize>()
-                .map(Some)
-                .map_err(|_| "use-original-body offset not decimal".to_string());
-        }
-    }
-    Ok(None)
 }
 
 fn encapsulated_offsets(enc: &Encapsulated) -> impl Iterator<Item = usize> {

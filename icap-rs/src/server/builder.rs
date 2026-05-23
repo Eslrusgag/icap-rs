@@ -18,7 +18,8 @@ use crate::error::IcapResult;
 use crate::request::{IncomingRequest, RequestParserMode};
 use crate::{Method, ServiceOptions};
 
-use super::{HandlerEntry, RequestHandler, RouteEntry, RouteOutput, Server};
+use super::Server;
+use super::router::{HandlerEntry, RequestHandler, RouteEntry, RouteOutput, resolve_service};
 
 #[cfg(feature = "tls-rustls")]
 #[derive(Clone)]
@@ -392,7 +393,7 @@ fn validate_builder_config(
     }
 
     if let Some(default) = default_service {
-        let resolved = Server::resolve_service(default, aliases, None);
+        let resolved = resolve_service(default, aliases, None);
         if !routes.contains_key(resolved.as_ref()) {
             return Err(crate::error::Error::service(format!(
                 "Default service '{default}' resolves to unknown service '{}'",
@@ -402,7 +403,7 @@ fn validate_builder_config(
     }
 
     for (from, to) in aliases {
-        let resolved = Server::resolve_service(to, aliases, None);
+        let resolved = resolve_service(to, aliases, None);
         if !routes.contains_key(resolved.as_ref()) {
             return Err(crate::error::Error::service(format!(
                 "Alias '{from}' resolves to unknown service '{}'",

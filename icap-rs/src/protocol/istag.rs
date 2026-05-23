@@ -86,3 +86,34 @@ fn is_http_token_char(c: char) -> bool {
                 | '\t'
         )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rstest::rstest;
+
+    #[rstest]
+    #[case("ok-Tag.123".to_string(), true)]
+    #[case("helloo.1755855904-1755855904181".to_string(), true)]
+    #[case("x".to_string(), true)]
+    #[case("A".repeat(32), true)]
+    #[case(r#""5BDEEEA9-12E4-2""#.to_string(), true)]
+    #[case(r#""ABC"#.to_string(), false)]
+    #[case(format!(r#""{}""#, "A".repeat(33)), false)]
+    #[case(r#""ABC_DEF""#.to_string(), true)]
+    #[case(r#""QUJDREUrLw==""#.to_string(), true)]
+    #[case("QUJDREUrLw==".to_string(), true)]
+    #[case("TAG 1".to_string(), false)]
+    #[case("TAG_1".to_string(), true)]
+    #[case("TAG+1".to_string(), true)]
+    #[case("TAG/1".to_string(), true)]
+    #[case("TAG#1".to_string(), true)]
+    #[case("TAG@1".to_string(), false)]
+    fn validate_istag_cases(#[case] value: String, #[case] ok: bool) {
+        assert_eq!(
+            validate_istag(&value).is_ok(),
+            ok,
+            "validate_istag failed for value={value:?}"
+        );
+    }
+}
