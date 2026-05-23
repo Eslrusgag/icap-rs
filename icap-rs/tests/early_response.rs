@@ -7,8 +7,8 @@ use tokio::time::{Instant, sleep, timeout};
 
 use icap_rs::client::Client;
 use icap_rs::error::Error;
-use icap_rs::request::Request;
-use icap_rs::response::{Response, StatusCode};
+use icap_rs::request::{IncomingRequest, Request};
+use icap_rs::response::{ParsedResponse, Response, StatusCode};
 
 fn find_free_port() -> u16 {
     let sock = StdTcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
@@ -24,7 +24,7 @@ async fn spawn_server_with_limit(limit: usize) -> (String, JoinHandle<()>) {
         .with_max_connections(limit)
         .route_reqmod(
             "svc-options",
-            |_: Request| async move {
+            |_: IncomingRequest| async move {
                 Ok(Response::new(StatusCode::OK, "OK")
                     .try_set_istag("x")
                     .unwrap())
@@ -72,11 +72,11 @@ async fn early_503_when_conn_limit_exceeded() {
     let req = Request::options("svc-options");
 
     let deadline = Instant::now() + Duration::from_secs(1);
-    let resp: Response = loop {
+    let resp: ParsedResponse = loop {
         let result = timeout(Duration::from_millis(200), client.send(&req)).await;
         match result {
-            Ok(Ok(resp)) if resp.status_code == StatusCode::SERVICE_UNAVAILABLE => break resp,
-            Ok(Ok(resp)) if resp.status_code == StatusCode::OK && Instant::now() < deadline => {
+            Ok(Ok(resp)) if resp.status_code() == StatusCode::SERVICE_UNAVAILABLE => break resp,
+            Ok(Ok(resp)) if resp.status_code() == StatusCode::OK && Instant::now() < deadline => {
                 sleep(Duration::from_millis(10)).await;
             }
             Ok(Ok(resp)) => break resp,
@@ -102,7 +102,7 @@ async fn early_503_when_conn_limit_exceeded() {
     };
 
     assert_eq!(
-        resp.status_code,
+        resp.status_code(),
         StatusCode::SERVICE_UNAVAILABLE,
         "expected early 503 produced by server accept loop"
     );
@@ -123,12 +123,12 @@ async fn not_found_404_for_unknown_service() {
     let client = make_client("127.0.0.1", sa.port());
 
     let req = Request::reqmod("non-existent-service");
-    let resp: Response = timeout(Duration::from_secs(1), client.send(&req))
+    let resp: ParsedResponse = timeout(Duration::from_secs(1), client.send(&req))
         .await
         .expect("client.send timed out")
         .expect("client.send failed");
 
-    assert_eq!(resp.status_code, StatusCode::NOT_FOUND);
+    assert_eq!(resp.status_code(), StatusCode::NOT_FOUND);
 
     if let Some(v) = resp
         .get_header("Encapsulated")

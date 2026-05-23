@@ -62,6 +62,10 @@ name = "client"
 path = "examples/client.rs"
 
 [[example]]
+name = "streaming_client"
+path = "examples/streaming_client.rs"
+
+[[example]]
 name = "tls_client"
 path = "examples/tls_client.rs"
 

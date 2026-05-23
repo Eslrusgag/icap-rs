@@ -15,12 +15,12 @@
 //! ### Example
 //! ```no_run
 //! # use icap_rs::server::options::ServiceOptions;
-//! # use icap_rs::request::Request;
+//! # use icap_rs::IncomingRequest;
 //! # let state = std::sync::Arc::new(std::sync::Mutex::new(String::from("respmod-1.0")));
 //! let opts = ServiceOptions::new()
 //!     .with_istag_provider({
 //!         let state = state.clone();
-//!         move |_: &Request| state.lock().unwrap().clone()
+//!         move |_: &IncomingRequest| state.lock().unwrap().clone()
 //!     })
 //!     .with_service("Response Modifier")
 //!     .with_options_ttl(60)
@@ -29,7 +29,7 @@
 
 use std::sync::Arc;
 
-use crate::request::{Method, Request};
+use crate::request::{IncomingRequest, Method};
 use crate::response::Response;
 use smallvec::SmallVec;
 use std::collections::HashMap;
@@ -53,13 +53,13 @@ pub enum TransferBehavior {
 #[derive(Clone)]
 pub enum IstagSource {
     Static(String),
-    Dynamic(Arc<dyn Fn(&Request) -> String + Send + Sync>),
+    Dynamic(Arc<dyn Fn(&IncomingRequest) -> String + Send + Sync>),
 }
 
 impl IstagSource {
     /// Resolve the current `ISTag` for the given request.
     #[inline]
-    pub fn current_for(&self, req: &Request) -> String {
+    pub fn current_for(&self, req: &IncomingRequest) -> String {
         match self {
             Self::Static(s) => s.clone(),
             Self::Dynamic(f) => (f)(req),
@@ -143,17 +143,17 @@ impl ServiceOptions {
     /// ```
     /// # use std::sync::{Arc, RwLock};
     /// # use icap_rs::server::options::ServiceOptions;
-    /// # use icap_rs::request::Request;
+    /// # use icap_rs::IncomingRequest;
     /// let tag = Arc::new(RwLock::new(String::from("respmod-1.0")));
     /// let opts = ServiceOptions::new()
     ///     .with_istag_provider({
     ///         let tag = tag.clone();
-    ///         move |_: &Request| tag.read().unwrap().clone()
+    ///         move |_: &IncomingRequest| tag.read().unwrap().clone()
     ///     });
     /// ```
     pub fn with_istag_provider<F>(mut self, f: F) -> Self
     where
-        F: Fn(&Request) -> String + Send + Sync + 'static,
+        F: Fn(&IncomingRequest) -> String + Send + Sync + 'static,
     {
         self.istag = IstagSource::Dynamic(Arc::new(f));
         self
@@ -255,7 +255,7 @@ impl ServiceOptions {
 
     /// Get the `ISTag` for a specific request (static or dynamic).
     #[inline]
-    pub fn istag_for(&self, req: &Request) -> String {
+    pub fn istag_for(&self, req: &IncomingRequest) -> String {
         self.istag.current_for(req)
     }
 
@@ -266,7 +266,7 @@ impl ServiceOptions {
     /// - `ISTag`   — resolved via the static string or dynamic provider
     /// - Standard headers (`Encapsulated`, `Service`, `Max-Connections`, etc.)
     ///
-    pub fn build_response_for(&self, req: &Request) -> Response {
+    pub fn build_response_for(&self, req: &IncomingRequest) -> Response {
         let mut response = Response::ok();
 
         let methods_str = self

@@ -6,7 +6,7 @@ use icap_rs::error::IcapResult;
 #[cfg(feature = "tls-rustls")]
 use icap_rs::server::options::ServiceOptions;
 #[cfg(feature = "tls-rustls")]
-use icap_rs::{Method, Request, Response, Server};
+use icap_rs::{IncomingRequest, Method, Response, Server};
 
 #[cfg(feature = "tls-rustls")]
 const ISTAG: &str = "scan-1.0";
@@ -24,7 +24,7 @@ async fn main() -> IcapResult<()> {
         .route(
             "scan",
             [Method::ReqMod, Method::RespMod],
-            |_req: Request| async move { Response::no_content_with_istag(ISTAG) },
+            |_req: IncomingRequest| async move { Response::no_content_with_istag(ISTAG) },
             Some(
                 ServiceOptions::new()
                     .with_static_istag(ISTAG)

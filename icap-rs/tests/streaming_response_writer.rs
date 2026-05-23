@@ -1,7 +1,7 @@
 use http::{Request as HttpRequest, Response as HttpResponse, Version};
 use icap_rs::error::IcapResult;
 use icap_rs::server::options::ServiceOptions;
-use icap_rs::{Client, Request, Response, Server, StatusCode};
+use icap_rs::{Client, IncomingRequest, Request, Response, Server, StatusCode};
 use tokio::time::Duration;
 
 const ISTAG: &str = "stream-writer-1";
@@ -16,7 +16,7 @@ async fn start_server(port: u16) {
         .bind(&format!("127.0.0.1:{port}"))
         .route_reqmod(
             "scan",
-            |_req: Request| async move {
+            |_req: IncomingRequest| async move {
                 let http_resp = HttpResponse::builder()
                     .status(200)
                     .version(Version::HTTP_11)
@@ -61,15 +61,15 @@ async fn streaming_response_is_buffered_in_response_body() -> IcapResult<()> {
     let req = Request::reqmod("scan")
         .preview(0)
         .preview_ieof()
-        .with_http_request_head(req_head);
+        .with_http_request_head(req_head)?;
 
     let resp = client
         .send_streaming_reader(&req, tokio::io::empty())
         .await?;
 
-    assert_eq!(resp.status_code, StatusCode::OK);
+    assert_eq!(resp.status_code(), StatusCode::OK);
 
-    let text = String::from_utf8_lossy(&resp.body);
+    let text = String::from_utf8_lossy(resp.body());
 
     assert!(
         text.starts_with("HTTP/1.1 200 OK\r\n"),
@@ -90,13 +90,13 @@ async fn streaming_response_is_buffered_in_response_body() -> IcapResult<()> {
     let sep = b"\r\n\r\n";
 
     let body_start = resp
-        .body
+        .body()
         .windows(sep.len())
         .position(|w| w == sep)
         .map(|pos| pos + sep.len())
         .expect("encapsulated HTTP response must contain header/body separator");
 
-    assert_eq!(&resp.body[body_start..], ECHO_BODY.as_bytes());
+    assert_eq!(&resp.body()[body_start..], ECHO_BODY.as_bytes());
 
     Ok(())
 }

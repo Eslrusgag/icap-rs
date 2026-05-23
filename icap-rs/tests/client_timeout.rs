@@ -1,5 +1,5 @@
 use icap_rs::error::{Error, IcapResult};
-use icap_rs::response::StatusCode as IcapStatus;
+use icap_rs::response::{ParsedResponse, StatusCode as IcapStatus};
 use icap_rs::{Client, Request};
 use std::time::Duration;
 use tokio::{
@@ -60,10 +60,7 @@ pub async fn spawn_slow_icap_server(
     (addr, h)
 }
 
-async fn do_options_once(
-    uri: &str,
-    timeout_secs: Option<u64>,
-) -> IcapResult<icap_rs::response::Response> {
+async fn do_options_once(uri: &str, timeout_secs: Option<u64>) -> IcapResult<ParsedResponse> {
     let client = Client::builder()
         .with_uri(uri)?
         .read_timeout(timeout_secs.map(Duration::from_secs))
@@ -105,7 +102,7 @@ async fn no_timeout_allows_fast_server() {
         res.err()
     );
     let resp = res.unwrap();
-    assert!(matches!(resp.status_code, IcapStatus::OK));
+    assert!(matches!(resp.status_code(), IcapStatus::OK));
 }
 
 #[tokio::test]
@@ -120,5 +117,5 @@ async fn small_timeout_but_server_responds_in_time() {
         res.err()
     );
     let resp = res.unwrap();
-    assert!(matches!(resp.status_code, IcapStatus::OK));
+    assert!(matches!(resp.status_code(), IcapStatus::OK));
 }

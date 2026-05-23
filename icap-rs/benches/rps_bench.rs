@@ -1,7 +1,7 @@
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use http::{Response as HttpResponse, StatusCode as HttpStatus, Version};
 use icap_rs::error::IcapResult;
-use icap_rs::request::Request;
+use icap_rs::request::{IncomingRequest, Request};
 use icap_rs::response::{Response, StatusCode};
 use icap_rs::server::Server;
 use icap_rs::{Client, Method};
@@ -58,7 +58,8 @@ impl BenchEnv {
 
         let request = Request::respmod("respmod")
             .allow_204()
-            .with_http_response(sample_http_response());
+            .with_http_response(sample_http_response())
+            .expect("build benchmark request");
 
         let wire_request = client
             .get_request(&request)
@@ -74,7 +75,7 @@ impl BenchEnv {
     }
 }
 
-async fn fast_204_handler(_req: Request) -> IcapResult<Response> {
+async fn fast_204_handler(_req: IncomingRequest) -> IcapResult<Response> {
     Response::new(StatusCode::NO_CONTENT, "No Content")
         .try_set_istag("bench-204")
         .map(|r| r.add_header("Server", "icap-rs/bench"))
@@ -179,7 +180,7 @@ fn bench_client_rps(c: &mut Criterion, env: &Arc<BenchEnv>) {
             b.iter(|| {
                 env.rt.block_on(async {
                     let resp = env.client.send(&env.request).await.expect("client send");
-                    black_box(resp.status_code);
+                    black_box(resp.status_code());
                 });
             });
         },

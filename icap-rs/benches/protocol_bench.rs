@@ -1,6 +1,6 @@
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use http::{Request as HttpRequest, Response as HttpResponse, Version};
-use icap_rs::{Client, Request, Response, StatusCode};
+use icap_rs::{Client, ParsedResponse, Request, Response, StatusCode};
 use std::hint::black_box;
 
 const BODY_SIZES: &[usize] = &[0, 1024, 64 * 1024, 1024 * 1024, 10 * 1024 * 1024];
@@ -60,7 +60,7 @@ fn sample_icap_200_response_with_http(body_size: usize) -> Vec<u8> {
 fn bench_response_parse(c: &mut Criterion) {
     let raw_204 = sample_icap_204_response();
     c.bench_function("response_from_raw_204_null_body", |b| {
-        b.iter(|| Response::from_raw(black_box(&raw_204)).unwrap());
+        b.iter(|| ParsedResponse::from_raw(black_box(&raw_204)).unwrap());
     });
 
     {
@@ -69,7 +69,7 @@ fn bench_response_parse(c: &mut Criterion) {
             let raw = sample_icap_200_response_with_http(body_size);
             group.throughput(Throughput::Bytes(body_size as u64));
             group.bench_with_input(BenchmarkId::from_parameter(body_size), &raw, |b, raw| {
-                b.iter(|| Response::from_raw(black_box(raw)).unwrap());
+                b.iter(|| ParsedResponse::from_raw(black_box(raw)).unwrap());
             });
         }
         group.finish();
@@ -137,7 +137,8 @@ fn bench_request_wire_build(c: &mut Criterion) {
             let req = Request::reqmod("scan")
                 .allow_204()
                 .preview(1024)
-                .with_http_request(http_req);
+                .with_http_request(http_req)
+                .unwrap();
             group.throughput(Throughput::Bytes(body_size as u64));
             group.bench_with_input(BenchmarkId::from_parameter(body_size), &req, |b, req| {
                 b.iter(|| client.get_request(black_box(req)).unwrap());
@@ -152,7 +153,8 @@ fn bench_request_wire_build(c: &mut Criterion) {
             let http_resp = sample_http_response(body_size);
             let req = Request::respmod("scan")
                 .allow_204()
-                .with_http_response(http_resp);
+                .with_http_response(http_resp)
+                .unwrap();
             group.throughput(Throughput::Bytes(body_size as u64));
             group.bench_with_input(BenchmarkId::from_parameter(body_size), &req, |b, req| {
                 b.iter(|| client.get_request(black_box(req)).unwrap());
@@ -175,7 +177,8 @@ fn bench_request_wire_streaming_build(c: &mut Criterion) {
         .unwrap();
     let req = Request::reqmod("scan")
         .preview(0)
-        .with_http_request_head(req_head);
+        .with_http_request_head(req_head)
+        .unwrap();
     c.bench_function("client_get_request_wire_streaming_reqmod_preview_0", |b| {
         b.iter(|| client.get_request_wire(black_box(&req), true).unwrap());
     });
@@ -189,7 +192,8 @@ fn bench_request_wire_streaming_build(c: &mut Criterion) {
     let req = Request::respmod("scan")
         .preview(0)
         .preview_ieof()
-        .with_http_response_head(resp_head);
+        .with_http_response_head(resp_head)
+        .unwrap();
     c.bench_function(
         "client_get_request_wire_streaming_respmod_preview_0_ieof",
         |b| {

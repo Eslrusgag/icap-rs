@@ -46,7 +46,7 @@ If no port is present in an `icaps://` URI, the client uses `11344`. Plain
 Use `ClientBuilder::add_root_ca_pem_file` when testing with a private CA or
 self-signed deployment certificate:
 
-```rust,no_run
+```rust,ignore
 use icap_rs::{Client, Request};
 
 #[tokio::main]

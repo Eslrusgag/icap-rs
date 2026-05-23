@@ -1,6 +1,6 @@
 use http::{HeaderValue, Request as HttpRequest, header};
 use icap_rs::{
-    Body, EmbeddedHttp, Method, PreviewDecision, Request, Response, StatusCode,
+    Body, EmbeddedHttp, IncomingRequest, Method, PreviewDecision, Response, StatusCode,
     server::{Server, options::ServiceOptions},
 };
 use std::{str, time::Duration};
@@ -80,9 +80,9 @@ async fn start_server(addr: &str) {
         .route(
             "scan",
             [Method::ReqMod],
-            |req: Request| async move {
+            |req: IncomingRequest| async move {
                 let mut maybe_len = None::<usize>;
-                if let Some(EmbeddedHttp::Req { head: _, body }) = &req.embedded {
+                if let Some(EmbeddedHttp::Req { head: _, body }) = req.embedded() {
                     match body {
                         Body::Full { reader } => {
                             maybe_len = Some(reader.len());
@@ -92,14 +92,14 @@ async fn start_server(addr: &str) {
                     }
                 }
 
-                let preview_n = req.preview_size.unwrap_or(0);
+                let preview_n = req.preview_size().unwrap_or(0);
                 if let Some(total_len) = maybe_len
                     && total_len <= preview_n
                 {
                     return Response::no_content().try_set_istag(ISTAG);
                 }
 
-                if let Some(EmbeddedHttp::Req { head, body }) = req.embedded
+                if let Some(EmbeddedHttp::Req { head, body }) = req.into_embedded()
                     && let Body::Full { reader } = body
                 {
                     let mut headers = head.headers().clone();
@@ -494,8 +494,8 @@ async fn preview_handler_can_send_final_response_before_100_continue() {
         .bind(addr)
         .route_reqmod(
             "scan",
-            |req: Request| async move {
-                let Some(EmbeddedHttp::Req { body, .. }) = req.embedded else {
+            |req: IncomingRequest| async move {
+                let Some(EmbeddedHttp::Req { body, .. }) = req.into_embedded() else {
                     panic!("request must carry embedded HTTP bytes");
                 };
                 match body {
@@ -587,8 +587,8 @@ async fn preview_handler_continue_reads_remainder_and_calls_full_route() {
         .bind(addr)
         .route_reqmod(
             "scan",
-            |req: Request| async move {
-                let Some(EmbeddedHttp::Req { body, .. }) = req.embedded else {
+            |req: IncomingRequest| async move {
+                let Some(EmbeddedHttp::Req { body, .. }) = req.into_embedded() else {
                     panic!("request must carry embedded HTTP bytes");
                 };
                 match body {

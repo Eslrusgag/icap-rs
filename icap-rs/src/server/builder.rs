@@ -15,8 +15,8 @@ use tokio::sync::Semaphore;
 use tokio_rustls::TlsAcceptor;
 
 use crate::error::IcapResult;
-use crate::request::RequestParserMode;
-use crate::{Method, Request, ServiceOptions};
+use crate::request::{IncomingRequest, RequestParserMode};
+use crate::{Method, ServiceOptions};
 
 use super::{HandlerEntry, RequestHandler, RouteEntry, RouteOutput, Server};
 
@@ -69,7 +69,7 @@ impl ServerBuilder {
     ///
     /// # Example
     /// ```no_run
-    /// use icap_rs::{IcapResult, Method, Request, Response, Server, ServiceOptions};
+    /// use icap_rs::{IcapResult, IncomingRequest, Method, Response, Server, ServiceOptions};
     ///
     /// const ISTAG: &str = "scan-1.0";
     ///
@@ -81,7 +81,7 @@ impl ServerBuilder {
     ///         .route(
     ///             "test",
     ///             [Method::ReqMod, Method::RespMod],
-    ///             |_req: Request| async move {
+    ///             |_req: IncomingRequest| async move {
     ///                 Ok(Response::no_content_with_istag(ISTAG)?)
     ///             },
     ///             Some(ServiceOptions::new()
@@ -126,7 +126,7 @@ impl ServerBuilder {
     ///
     /// # Example
     /// ```no_run
-    /// use icap_rs::{IcapResult, Method, Request, Response, Server, ServiceOptions};
+    /// use icap_rs::{IcapResult, IncomingRequest, Method, Response, Server, ServiceOptions};
     ///
     /// const ISTAG: &str = "scan-1.0";
     ///
@@ -142,7 +142,7 @@ impl ServerBuilder {
     ///         .route(
     ///             "scan",
     ///             [Method::ReqMod, Method::RespMod],
-    ///             |_req: Request| async move {
+    ///             |_req: IncomingRequest| async move {
     ///                 Ok(Response::no_content_with_istag(ISTAG)?)
     ///             },
     ///             Some(ServiceOptions::new()
@@ -216,7 +216,7 @@ impl ServerBuilder {
     where
         MIt: IntoIterator<Item = MItem>,
         MItem: Into<Method>,
-        F: Fn(Request) -> Fut + Send + Sync + 'static,
+        F: Fn(IncomingRequest) -> Fut + Send + Sync + 'static,
         Fut: Future + Send + 'static,
         Fut::Output: RouteOutput,
     {
@@ -278,7 +278,7 @@ impl ServerBuilder {
         options: Option<ServiceOptions>,
     ) -> Self
     where
-        F: Fn(Request) -> Fut + Send + Sync + 'static,
+        F: Fn(IncomingRequest) -> Fut + Send + Sync + 'static,
         Fut: Future + Send + 'static,
         Fut::Output: RouteOutput,
     {
@@ -293,7 +293,7 @@ impl ServerBuilder {
         options: Option<ServiceOptions>,
     ) -> Self
     where
-        F: Fn(Request) -> Fut + Send + Sync + 'static,
+        F: Fn(IncomingRequest) -> Fut + Send + Sync + 'static,
         Fut: Future + Send + 'static,
         Fut::Output: RouteOutput,
     {

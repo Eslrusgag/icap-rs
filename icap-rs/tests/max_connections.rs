@@ -5,7 +5,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{sleep, timeout};
 
-use icap_rs::{Method, Request, Response, ServiceOptions, server::Server};
+use icap_rs::{IncomingRequest, Method, Response, ServiceOptions, server::Server};
 
 const TEST_SERVICE: &str = "scan";
 const TEST_ISTAG: &str = "test-scan-1.0";
@@ -31,7 +31,7 @@ async fn start_server_with_limit(
         .route(
             TEST_SERVICE,
             [Method::ReqMod],
-            |_req: Request| async move { Response::no_content_with_istag(TEST_ISTAG) },
+            |_req: IncomingRequest| async move { Response::no_content_with_istag(TEST_ISTAG) },
             Some(
                 ServiceOptions::new()
                     .with_static_istag(TEST_ISTAG)

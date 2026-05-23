@@ -58,13 +58,13 @@ Encapsulated: null-body=0\r\n\
         .await
         .expect("first request timed out")
         .expect("first request failed");
-    assert_eq!(first.status_code, StatusCode::OK);
+    assert_eq!(first.status_code(), StatusCode::OK);
 
     let second = timeout(Duration::from_secs(1), client.send(&req))
         .await
         .expect("second request timed out")
         .expect("second request failed");
-    assert_eq!(second.status_code, StatusCode::OK);
+    assert_eq!(second.status_code(), StatusCode::OK);
 
     server.await.expect("fake server task failed");
 }

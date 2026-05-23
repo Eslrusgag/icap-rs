@@ -23,7 +23,7 @@
 //! let resp = Response::no_content_with_istag("policy-123").unwrap();
 //!
 //! assert!(resp.is_success());
-//! assert_eq!(resp.status_code, StatusCode::NO_CONTENT);
+//! assert_eq!(resp.status_code(), StatusCode::NO_CONTENT);
 //! ```
 
 use crate::ICAP_VERSION;
@@ -34,6 +34,7 @@ use crate::parser::{serialize_http_request, serialize_http_response};
 use http::{HeaderMap, HeaderName, HeaderValue};
 use memchr::memchr;
 use std::fmt;
+use std::marker::PhantomData;
 use std::str::FromStr;
 use tracing::{trace, warn};
 
@@ -60,37 +61,133 @@ pub type StatusCode = http::StatusCode;
 
 /// Representation of an ICAP response.
 ///
-/// Contains version string, status code and text, ICAP headers,
-/// and an optional body (such as encapsulated HTTP or chunked data).
+/// The type parameter is a direction marker:
+/// - [`Outgoing`] is the default builder shape used by servers.
+/// - [`Parsed`] is returned by response parsing and client receive APIs.
+///
+/// Parsed responses expose read-only metadata and body accessors. Builder
+/// methods such as `add_header`, `with_http_response`, and `to_raw` are only
+/// available on outgoing responses.
 #[derive(Debug, Clone)]
 #[must_use]
-pub struct Response {
-    /// ICAP protocol version (usually `"ICAP/1.0"`).
-    pub version: String,
+pub struct Response<D = Outgoing> {
+    /// ICAP protocol version.
+    pub(crate) version: String,
     /// Response status code.
-    pub status_code: StatusCode,
+    pub(crate) status_code: StatusCode,
     /// Human-readable status text (e.g. `"OK"`, `"No Content"`).
-    pub status_text: String,
+    pub(crate) status_text: String,
     /// ICAP headers.
     pub(crate) headers: HeaderMap,
     /// Offset from the original HTTP body to resume after a 206 partial body.
     pub(crate) use_original_body: Option<usize>,
     /// Optional body (arbitrary payload, chunked HTTP, etc.).
-    pub body: Vec<u8>,
+    pub(crate) body: Vec<u8>,
+    pub(crate) direction: PhantomData<D>,
 }
+
+/// Server-side response builder marker.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum Outgoing {}
+
+/// Parsed/client-received response marker.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum Parsed {}
+
+/// Response shape constructed by servers and serialized onto the wire.
+pub type OutgoingResponse = Response<Outgoing>;
+
+/// Response shape parsed from the wire and returned by client receive APIs.
+pub type ParsedResponse = Response<Parsed>;
 
 #[inline]
 fn ensure_owned_response<'a>(
-    owned: &'a mut Option<Response>,
-    original: &Response,
-) -> &'a mut Response {
+    owned: &'a mut Option<OutgoingResponse>,
+    original: &OutgoingResponse,
+) -> &'a mut OutgoingResponse {
     if owned.is_none() {
         *owned = Some(original.clone());
     }
     owned.as_mut().expect("owned response")
 }
 
-impl Response {
+impl<D> Response<D> {
+    /// Return the ICAP protocol version string.
+    #[inline]
+    pub fn version(&self) -> &str {
+        &self.version
+    }
+
+    /// Return the response status code.
+    #[inline]
+    pub const fn status_code(&self) -> StatusCode {
+        self.status_code
+    }
+
+    /// Return the response reason.
+    #[inline]
+    pub fn status_text(&self) -> &str {
+        &self.status_text
+    }
+
+    /// Return the response body bytes.
+    #[inline]
+    pub fn body(&self) -> &[u8] {
+        &self.body
+    }
+
+    /// Get a header value by name.
+    pub fn get_header(&self, name: &str) -> Option<&HeaderValue> {
+        self.headers.get(name)
+    }
+
+    /// Return a read-only view of all ICAP headers.
+    pub const fn headers(&self) -> &HeaderMap {
+        &self.headers
+    }
+
+    /// Return the `use-original-body` offset from a parsed or constructed 206 response.
+    ///
+    /// When present, the response carries an ICAP zero-chunk extension telling
+    /// the client to append the original HTTP entity body starting at this byte
+    /// offset after any partial body bytes included in the 206 response.
+    pub const fn use_original_body_offset(&self) -> Option<usize> {
+        self.use_original_body
+    }
+
+    /// Check whether a header exists.
+    pub fn has_header(&self, name: &str) -> bool {
+        self.headers.contains_key(name)
+    }
+
+    /// Whether the response indicates success (2XX).
+    pub fn is_success(&self) -> bool {
+        self.status_code.is_success()
+    }
+
+    /// Whether the response indicates a client error (4xx).
+    pub fn is_client_error(&self) -> bool {
+        self.status_code.is_client_error()
+    }
+
+    /// Whether the response indicates a server error (5xx).
+    pub fn is_server_error(&self) -> bool {
+        self.status_code.is_server_error()
+    }
+}
+
+impl ParsedResponse {
+    /// Parse an ICAP response from raw bytes.
+    ///
+    /// When the response contains an embedded HTTP message, [`Response::body`]
+    /// returns the embedded HTTP head followed by the dechunked HTTP entity
+    /// body. ICAP chunk-size metadata is not preserved.
+    pub fn from_raw(raw: &[u8]) -> IcapResult<Self> {
+        parse_icap_response(raw)
+    }
+}
+
+impl Response<Outgoing> {
     /// Create a new ICAP response with the given status code and status text.
     pub fn new(status_code: StatusCode, status_text: &str) -> Self {
         Self {
@@ -100,6 +197,7 @@ impl Response {
             headers: HeaderMap::new(),
             use_original_body: None,
             body: Vec::new(),
+            direction: PhantomData,
         }
     }
 
@@ -159,6 +257,7 @@ impl Response {
             headers,
             use_original_body: None,
             body: Vec::new(),
+            direction: PhantomData,
         })
     }
 
@@ -346,57 +445,9 @@ impl Response {
         Ok(crate::parser::serialize_icap_response(resp_ref))
     }
 
-    /// Parse an ICAP response from raw bytes.
-    ///
-    /// When the response contains an embedded HTTP message, `Response::body`
-    /// contains the embedded HTTP head followed by the dechunked HTTP entity
-    /// body. ICAP chunk-size metadata is not preserved.
-    pub fn from_raw(raw: &[u8]) -> IcapResult<Self> {
-        parse_icap_response(raw)
-    }
-
-    /// Get a header value by name.
-    pub fn get_header(&self, name: &str) -> Option<&HeaderValue> {
-        self.headers.get(name)
-    }
-
-    /// Return a read-only view of all ICAP headers.
-    pub const fn headers(&self) -> &HeaderMap {
-        &self.headers
-    }
-
-    /// Return the `use-original-body` offset from a parsed or constructed 206 response.
-    ///
-    /// When present, the response carries an ICAP zero-chunk extension telling
-    /// the client to append the original HTTP entity body starting at this byte
-    /// offset after any partial body bytes included in the 206 response.
-    pub const fn use_original_body_offset(&self) -> Option<usize> {
-        self.use_original_body
-    }
-
-    /// Check whether a header exists.
-    pub fn has_header(&self, name: &str) -> bool {
-        self.headers.contains_key(name)
-    }
-
     /// Remove a header by name.
     pub fn remove_header(&mut self, name: &str) -> Option<HeaderValue> {
         self.headers.remove(name)
-    }
-
-    /// Whether the response indicates success (2XX).
-    pub fn is_success(&self) -> bool {
-        self.status_code.is_success()
-    }
-
-    /// Whether the response indicates a client error (4xx).
-    pub fn is_client_error(&self) -> bool {
-        self.status_code.is_client_error()
-    }
-
-    /// Whether the response indicates a server error (5xx).
-    pub fn is_server_error(&self) -> bool {
-        self.status_code.is_server_error()
     }
 
     /// Attach an **embedded HTTP request** (for `REQMOD` flows).
@@ -491,7 +542,7 @@ impl Response {
     }
 }
 
-impl fmt::Display for Response {
+impl<D> fmt::Display for Response<D> {
     /// Formats the ICAP response for debugging: status line, headers, and body (if present).
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(
@@ -542,7 +593,7 @@ fn compute_enc_for_req_body(body: &[u8]) -> IcapResult<String> {
 }
 
 struct ParsedResponseHead {
-    response: Response,
+    response: ParsedResponse,
     header_end: usize,
     encapsulated_value: Option<String>,
 }
@@ -635,13 +686,14 @@ fn parse_response_head_parts(raw: &[u8]) -> IcapResult<ParsedResponseHead> {
             headers,
             use_original_body: None,
             body: Vec::new(),
+            direction: PhantomData,
         },
         header_end: hdr_end,
         encapsulated_value,
     })
 }
 
-pub(crate) fn parse_icap_response(raw: &[u8]) -> IcapResult<Response> {
+pub(crate) fn parse_icap_response(raw: &[u8]) -> IcapResult<ParsedResponse> {
     trace!(len = raw.len(), "parse_icap_response");
     let ParsedResponseHead {
         mut response,

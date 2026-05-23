@@ -21,7 +21,7 @@ use crate::error::{Error, IcapResult};
 use crate::parser::parse_encapsulated_header;
 use crate::parser::{canon_icap_header, read_chunked_to_end, write_chunk, write_chunk_into};
 use crate::request::{Request, serialize_embedded_http};
-use crate::response::{Response, parse_icap_response};
+use crate::response::{ParsedResponse, parse_icap_response};
 
 use crate::Method;
 use crate::client::tls::{AnyTlsConnector, TlsConnector};
@@ -87,8 +87,8 @@ impl Client {
     /// This method:
     /// - writes ICAP headers and the embedded HTTP headers/body,
     /// - handles `Preview` and `100 Continue` negotiation when applicable,
-    /// - and returns the parsed ICAP [`Response`].
-    pub async fn send(&self, req: &Request) -> IcapResult<Response> {
+    /// - and returns the parsed ICAP [`ParsedResponse`].
+    pub async fn send(&self, req: &Request) -> IcapResult<ParsedResponse> {
         trace!(
             "client.send: method={}, service={}",
             req.method, req.service
@@ -181,7 +181,7 @@ impl Client {
         &self,
         req: &Request,
         file_path: P,
-    ) -> IcapResult<Response> {
+    ) -> IcapResult<ParsedResponse> {
         let file = TokioFile::open(file_path).await?;
         self.send_streaming_reader(req, file).await
     }
@@ -195,7 +195,7 @@ impl Client {
         &self,
         req: &Request,
         mut reader: R,
-    ) -> IcapResult<Response>
+    ) -> IcapResult<ParsedResponse>
     where
         R: AsyncRead + Unpin + Send,
     {
@@ -288,7 +288,10 @@ impl Client {
             req.preview_ieof,
         )?;
         let mut out = built.bytes;
-        if req.is_mod() && matches!(req.preview_size, Some(0)) {
+        if req.is_mod()
+            && matches!(req.preview_size, Some(0))
+            && !request_has_non_empty_buffered_body(req)
+        {
             if req.preview_ieof {
                 out.extend_from_slice(b"0; ieof\r\n\r\n");
             } else {
@@ -335,7 +338,11 @@ impl Client {
         Ok(response_buf)
     }
 
-    async fn finalize_response(&self, stream: Conn, response_buf: Vec<u8>) -> IcapResult<Response> {
+    async fn finalize_response(
+        &self,
+        stream: Conn,
+        response_buf: Vec<u8>,
+    ) -> IcapResult<ParsedResponse> {
         let resp = parse_icap_response(&response_buf)?;
         let can_reuse = !response_wants_close(&resp);
         maybe_put_back(
@@ -354,6 +361,8 @@ impl Client {
         force_has_body: bool,
         preview0_ieof: bool,
     ) -> IcapResult<BuiltIcap> {
+        req.validate_for_send()?;
+
         trace!(
             "build_icap_request_bytes: method={} service={} preview={:?} allow_204={} allow_206={} force_has_body={} preview0_ieof={}",
             req.method,
@@ -485,7 +494,9 @@ impl Client {
     ///   it finishes reading the body if present (chunked) and returns the parsed response.
     /// - If there are no bytes ready (`WouldBlock`), it returns `Ok(None)` immediately,
     ///   and the caller proceeds with writing the ICAP request.
-    async fn try_read_early_response_now(stream: &mut TcpStream) -> IcapResult<Option<Response>> {
+    async fn try_read_early_response_now(
+        stream: &mut TcpStream,
+    ) -> IcapResult<Option<ParsedResponse>> {
         let mut buf = Vec::new();
         let mut tmp = [0u8; 4096];
 
@@ -507,6 +518,22 @@ impl Client {
                 Err(e) => return Err(e.into()),
             }
         }
+    }
+}
+
+const fn request_has_non_empty_buffered_body(req: &Request) -> bool {
+    match &req.embedded {
+        Some(
+            crate::request::EmbeddedHttp::Req {
+                body: crate::request::Body::Full { reader },
+                ..
+            }
+            | crate::request::EmbeddedHttp::Resp {
+                body: crate::request::Body::Full { reader },
+                ..
+            },
+        ) => !reader.is_empty(),
+        _ => false,
     }
 }
 
@@ -815,7 +842,7 @@ fn write_icap_headers(
     }
 }
 
-fn response_wants_close(resp: &Response) -> bool {
+fn response_wants_close(resp: &ParsedResponse) -> bool {
     let Some(v) = resp.headers().get(http::header::CONNECTION) else {
         return false;
     };
@@ -1073,7 +1100,9 @@ mod tests {
             .body(())
             .unwrap();
 
-        let req = Request::reqmod("scan").with_http_request_head(http);
+        let req = Request::reqmod("scan")
+            .with_http_request_head(http)
+            .unwrap();
         if let Some(preview_size) = preview {
             req.preview(preview_size)
         } else {
@@ -1440,7 +1469,8 @@ mod tests {
             .preview(4)
             .allow_204()
             .icap_header("x-foo", "bar")
-            .with_http_request(http);
+            .with_http_request(http)
+            .unwrap();
 
         let wire = c.get_request_wire(&req, false).unwrap();
         let head = extract_headers_text(&wire);
@@ -1478,7 +1508,8 @@ mod tests {
 
         let mut req = Request::reqmod("icap/test")
             .preview(0)
-            .with_http_request(http);
+            .with_http_request(http)
+            .unwrap();
         if ieof {
             req = req.preview_ieof();
         }
@@ -1493,6 +1524,43 @@ mod tests {
         if streaming {
             assert!(enc.to_ascii_lowercase().contains("req-body="));
         }
+    }
+
+    #[test]
+    fn preview_zero_wire_for_buffered_body_has_single_preview_marker() {
+        let http = HttpReq::builder()
+            .method("POST")
+            .uri("/scan")
+            .header(header::HOST, "x")
+            .body(b"PAYLOAD".to_vec())
+            .unwrap();
+
+        let req = Request::reqmod("icap/test")
+            .preview(0)
+            .with_http_request(http)
+            .unwrap();
+
+        let wire = client().get_request_wire(&req, false).unwrap();
+        let marker_count = wire
+            .windows(b"0\r\n\r\n".len())
+            .filter(|w| *w == b"0\r\n\r\n")
+            .count();
+
+        assert_eq!(marker_count, 1);
+    }
+
+    #[test]
+    fn mismatched_embedded_message_is_rejected_before_serialization() {
+        let http = http::Response::builder()
+            .status(http::StatusCode::OK)
+            .body(Vec::<u8>::new())
+            .unwrap();
+
+        let err = Request::reqmod("icap/test")
+            .with_http_response(http)
+            .expect_err("REQMOD must reject embedded HTTP responses");
+
+        assert!(matches!(err, Error::Serialization(_)));
     }
 
     #[rstest]

@@ -1,7 +1,7 @@
 use http::{Response as HttpResponse, StatusCode as HttpStatus, Version};
 use icap_rs::Client;
 use icap_rs::error::IcapResult;
-use icap_rs::request::Request;
+use icap_rs::request::{IncomingRequest, Request};
 use icap_rs::response::{Response, StatusCode};
 use icap_rs::server::Server;
 use icap_rs::server::options::ServiceOptions;
@@ -9,7 +9,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::Duration;
 
-async fn always_204_handler(_req: Request) -> IcapResult<Response> {
+async fn always_204_handler(_req: IncomingRequest) -> IcapResult<Response> {
     Response::no_content()
         .add_header("Server", "icap-rs/test")
         .try_set_istag("test")
@@ -118,15 +118,17 @@ async fn alias_and_default_service_resolve() {
 
     let req_root = Request::respmod("")
         .allow_204()
-        .with_http_response(make_embedded_http("hello"));
+        .with_http_response(make_embedded_http("hello"))
+        .expect("build respmod request");
     let resp_root = client.send(&req_root).await.expect("icap send root");
-    assert_eq!(resp_root.status_code, StatusCode::NO_CONTENT);
+    assert_eq!(resp_root.status_code(), StatusCode::NO_CONTENT);
 
     let req_alt = Request::respmod("alt")
         .allow_204()
-        .with_http_response(make_embedded_http("hello"));
+        .with_http_response(make_embedded_http("hello"))
+        .expect("build respmod request");
     let resp_alt = client.send(&req_alt).await.expect("icap send alt");
-    assert_eq!(resp_alt.status_code, StatusCode::NO_CONTENT);
+    assert_eq!(resp_alt.status_code(), StatusCode::NO_CONTENT);
 }
 
 #[tokio::test]
@@ -138,7 +140,7 @@ async fn options_unknown_service_returns_404() {
     let req = Request::options("respmosw");
     let resp = client.send(&req).await.expect("icap options send");
 
-    assert_eq!(resp.status_code, StatusCode::NOT_FOUND);
+    assert_eq!(resp.status_code(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
@@ -151,13 +153,14 @@ async fn respmod_no_allow_with_preview_may_be_204() {
     let req = Request::respmod("respmod")
         .preview(0)
         .preview_ieof()
-        .with_http_response(make_embedded_http("hello"));
+        .with_http_response(make_embedded_http("hello"))
+        .expect("build respmod request");
 
     let resp = client.send(&req).await.expect("icap send");
 
     assert!(
-        matches!(resp.status_code, StatusCode::NO_CONTENT | StatusCode::OK),
+        matches!(resp.status_code(), StatusCode::NO_CONTENT | StatusCode::OK),
         "RFC: with Preview and no Allow, 204 is permitted (200 also ok). Got: {:?}",
-        resp.status_code
+        resp.status_code()
     );
 }

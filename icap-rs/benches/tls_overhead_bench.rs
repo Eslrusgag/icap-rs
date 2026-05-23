@@ -1,7 +1,7 @@
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use http::{Response as HttpResponse, StatusCode as HttpStatus, Version};
 use icap_rs::error::IcapResult;
-use icap_rs::request::Request;
+use icap_rs::request::{IncomingRequest, Request};
 use icap_rs::response::{Response, StatusCode};
 use icap_rs::server::Server;
 use icap_rs::{Client, Method};
@@ -50,7 +50,8 @@ impl BenchEnv {
 
         let request = Request::respmod("respmod")
             .allow_204()
-            .with_http_response(sample_http_response());
+            .with_http_response(sample_http_response())
+            .expect("build benchmark request");
 
         let plain_keepalive = Client::builder()
             .host("127.0.0.1")
@@ -122,7 +123,7 @@ async fn spawn_tls_server(addr: &str) {
     });
 }
 
-async fn fast_204_handler(_req: Request) -> IcapResult<Response> {
+async fn fast_204_handler(_req: IncomingRequest) -> IcapResult<Response> {
     Response::new(StatusCode::NO_CONTENT, "No Content")
         .try_set_istag("tls-overhead-bench")
         .map(|r| r.add_header("Server", "icap-rs/bench"))
@@ -178,7 +179,7 @@ fn bench_keepalive(c: &mut Criterion, env: &Arc<BenchEnv>) {
                 b.iter(|| {
                     env.rt.block_on(async {
                         let resp = client.send(&env.request).await.expect("client send");
-                        black_box(resp.status_code);
+                        black_box(resp.status_code());
                     });
                 });
             },
@@ -220,7 +221,7 @@ async fn measure_new_connection_iters(client: &Client, request: &Request, iters:
 
     for _ in 0..measured_iters {
         let resp = client.send(request).await.expect("client send");
-        black_box(resp.status_code);
+        black_box(resp.status_code());
     }
 
     let scaled_nanos = started

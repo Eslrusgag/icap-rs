@@ -11,8 +11,11 @@ pub mod server;
 pub use client::Client;
 pub use client::builder::*;
 pub use error::{Error, IcapResult};
-pub use request::{Body, EmbeddedHttp, Method, Request};
-pub use response::{Response, StatusCode};
+pub use request::{
+    Body, EmbeddedHttp, EmbeddedHttpKind, Incoming, IncomingRequest, Method, Outbound,
+    OutboundRequest, Request,
+};
+pub use response::{Outgoing, OutgoingResponse, Parsed, ParsedResponse, Response, StatusCode};
 pub use server::{
     PreviewDecision, RouteOutput, Server, ServerBuilder, ServiceOptions, TransferBehavior,
 };

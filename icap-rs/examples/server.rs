@@ -6,7 +6,7 @@
 use std::sync::{Arc, RwLock};
 
 use http::{HeaderMap, Response as HttpResponse, StatusCode as HttpStatus, Version};
-use icap_rs::request::{EmbeddedHttp, Request};
+use icap_rs::request::{EmbeddedHttp, IncomingRequest};
 use icap_rs::response::Response;
 use icap_rs::server::Server;
 use icap_rs::server::options::ServiceOptions;
@@ -33,7 +33,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let reqmod_opts = ServiceOptions::new()
         .with_istag_provider({
             let t = Arc::clone(&req_tag);
-            move |_req: &Request| t.read().unwrap().clone()
+            move |_req: &IncomingRequest| t.read().unwrap().clone()
         })
         .with_service("Request Modifier")
         .with_options_ttl(3600)
@@ -43,18 +43,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let respmod_opts = ServiceOptions::new()
         .with_istag_provider({
             let t = Arc::clone(&resp_tag);
-            move |_req: &Request| t.read().unwrap().clone()
+            move |_req: &IncomingRequest| t.read().unwrap().clone()
         })
         .with_service("Response Modifier")
         .with_options_ttl(3600)
         .allow_204()
         .with_preview(2048);
 
-    // Blocker: announce BOTH methods in OPTIONS (methods будут проставлены роутером)
+    // Blocker: announce both methods in OPTIONS; the router injects them.
     let blocker_opts = ServiceOptions::new()
         .with_istag_provider({
             let t = Arc::clone(&block_tag);
-            move |_req: &Request| t.read().unwrap().clone()
+            move |_req: &IncomingRequest| t.read().unwrap().clone()
         })
         .with_service("Request/Response Blocker")
         .with_options_ttl(3600)
@@ -67,12 +67,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             "reqmod",
             {
                 let t = Arc::clone(&req_tag);
-                move |request: Request| {
+                move |request: IncomingRequest| {
                     let t = Arc::clone(&t);
                     async move {
-                        info!("REQMOD called: {}", request.service);
+                        info!("REQMOD called: {}", request.service());
 
-                        if let Some(EmbeddedHttp::Req { head, .. }) = &request.embedded {
+                        if let Some(EmbeddedHttp::Req { head, .. }) = request.embedded() {
                             info!("HTTP {} {}", head.method(), head.uri());
                         } else {
                             warn!("REQMOD without embedded HTTP request");
@@ -80,7 +80,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
                         let istag_now = t.read().unwrap().clone();
 
-                        if can_return_204(&request.icap_headers) {
+                        if can_return_204(request.icap_headers()) {
                             return Ok(Response::no_content_with_istag(&istag_now)?
                                 .add_header("Server", "icap-rs/0.1.0"));
                         }
@@ -97,12 +97,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             "respmod",
             {
                 let t = Arc::clone(&resp_tag);
-                move |request: Request| {
+                move |request: IncomingRequest| {
                     let t = Arc::clone(&t);
                     async move {
-                        info!("RESPMOD called: {}", request.service);
+                        info!("RESPMOD called: {}", request.service());
 
-                        if let Some(EmbeddedHttp::Resp { head, .. }) = &request.embedded {
+                        if let Some(EmbeddedHttp::Resp { head, .. }) = request.embedded() {
                             info!("HTTP status: {}", head.status());
                         } else {
                             warn!("RESPMOD without embedded HTTP response");
@@ -110,7 +110,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
                         let istag_now = t.read().unwrap().clone();
 
-                        if request.preview_size.is_some() && can_return_204(&request.icap_headers) {
+                        if request.preview_size().is_some()
+                            && can_return_204(request.icap_headers())
+                        {
                             return Ok(Response::no_content_with_istag(&istag_now)?
                                 .add_header("Server", "icap-rs/0.1.0"));
                         }
@@ -118,7 +120,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         if let Some(EmbeddedHttp::Resp {
                             head,
                             body: Body::Full { reader },
-                        }) = &request.embedded
+                        }) = request.embedded()
                         {
                             let mut builder = http::Response::builder()
                                 .status(head.status())
@@ -152,17 +154,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             [Method::ReqMod, Method::RespMod],
             {
                 let t = Arc::clone(&block_tag);
-                move |request: Request| {
+                move |request: IncomingRequest| {
                     let t = Arc::clone(&t);
                     async move {
-                        if request.method == Method::ReqMod {
-                            if let Some(EmbeddedHttp::Req { head, .. }) = &request.embedded {
+                        if request.method() == Method::ReqMod {
+                            if let Some(EmbeddedHttp::Req { head, .. }) = request.embedded() {
                                 info!("BLOCKER REQMOD for {} {}", head.method(), head.uri());
                             } else {
                                 warn!("BLOCKER: REQMOD without embedded HTTP request");
                             }
-                        } else if request.method == Method::RespMod {
-                            if let Some(EmbeddedHttp::Resp { head, .. }) = &request.embedded {
+                        } else if request.method() == Method::RespMod {
+                            if let Some(EmbeddedHttp::Resp { head, .. }) = request.embedded() {
                                 info!("BLOCKER RESPMOD, upstream status {}", head.status());
                             } else {
                                 warn!("BLOCKER: RESPMOD without embedded HTTP response");

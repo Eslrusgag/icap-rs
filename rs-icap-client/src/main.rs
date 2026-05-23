@@ -6,7 +6,7 @@ use http::{
     Version,
 };
 use icap_rs::error::IcapResult;
-use icap_rs::response::{Response as IcapResponse, StatusCode as IcapStatus};
+use icap_rs::response::{ParsedResponse as IcapResponse, StatusCode as IcapStatus};
 use icap_rs::{Client, Request};
 use std::{fs, path::PathBuf};
 use tokio::fs::{self as tokio_fs, File};
@@ -305,7 +305,7 @@ async fn main() -> IcapResult<()> {
         debug!("Negotiated caps: {:?}", caps);
     }
 
-    let mut icap_req = Request::new(icap_method.as_str(), &service);
+    let mut icap_req = Request::try_new(icap_method.as_str(), &service)?;
     if !args.no204 {
         icap_req = icap_req.allow_204();
     }
@@ -420,7 +420,7 @@ async fn main() -> IcapResult<()> {
             let http_req = httpb
                 .body(body_vec)
                 .map_err(|e| format!("failed to build HTTP request: {e}"))?;
-            icap_req = icap_req.with_http_request(http_req);
+            icap_req = icap_req.with_http_request(http_req)?;
         } else {
             // Build embedded HTTP response (HTTP/1.0 by default, like c-icap-client)
             let mut httpb = HttpResponse::builder()
@@ -458,7 +458,7 @@ async fn main() -> IcapResult<()> {
             let http_resp = httpb
                 .body(body_vec)
                 .map_err(|e| format!("failed to build HTTP response: {e}"))?;
-            icap_req = icap_req.with_http_response(http_resp);
+            icap_req = icap_req.with_http_response(http_resp)?;
         }
 
         // Dry-run: print the exact wire bytes and exit
@@ -544,7 +544,7 @@ async fn output_response(
     if args.verbose {
         println!("ICAP server:{server_host}, ip:{server_ip}, port:{server_port}\n");
 
-        if matches!(response.status_code, IcapStatus::NO_CONTENT) {
+        if matches!(response.status_code(), IcapStatus::NO_CONTENT) {
             println!("No modification needed (Allow 204 response)\n");
         } else if let Some(offset) = response.use_original_body_offset() {
             println!("Partial content uses original body from offset {offset}\n");
@@ -553,9 +553,9 @@ async fn output_response(
         println!("ICAP HEADERS:");
         println!(
             "\t{} {} {}",
-            response.version,
-            response.status_code.as_str(),
-            response.status_text
+            response.version(),
+            response.status_code().as_str(),
+            response.status_text()
         );
         for (name, value) in response.headers() {
             let v = value.to_str().unwrap_or("<binary>");
@@ -571,7 +571,11 @@ async fn output_response(
             print!("{}", String::from_utf8_lossy(&output_body));
         }
     } else {
-        println!("ICAP/1.0 {} {}", response.status_code, response.status_text);
+        println!(
+            "ICAP/1.0 {} {}",
+            response.status_code(),
+            response.status_text()
+        );
         if let Some(output_file) = &args.output {
             let mut file = File::create(output_file).await?;
             file.write_all(&output_body).await?;
@@ -589,7 +593,7 @@ async fn response_output_body(
     original_body_bytes: Option<&[u8]>,
 ) -> IcapResult<Vec<u8>> {
     let Some(offset) = response.use_original_body_offset() else {
-        return Ok(response.body.clone());
+        return Ok(response.body().to_vec());
     };
 
     let original_body = if let Some(bytes) = original_body_bytes {
@@ -600,7 +604,7 @@ async fn response_output_body(
         Vec::new()
     };
 
-    append_original_body_suffix(response.body.clone(), &original_body, offset)
+    append_original_body_suffix(response.body().to_vec(), &original_body, offset)
 }
 
 fn append_original_body_suffix(

@@ -1,5 +1,5 @@
 use icap_rs::server::options::ServiceOptions;
-use icap_rs::{Body, EmbeddedHttp, PreviewDecision, Request, Response, Server};
+use icap_rs::{Body, EmbeddedHttp, IncomingRequest, PreviewDecision, Response, Server};
 use tracing::{info, warn};
 
 const ISTAG: &str = "preview-decision-1.0";
@@ -14,7 +14,7 @@ async fn main() -> icap_rs::error::IcapResult<()> {
         .bind("127.0.0.1:1344")
         .route_reqmod(
             "scan",
-            |request: Request| async move {
+            |request: IncomingRequest| async move {
                 match embedded_body(&request) {
                     Some(Body::Preview { bytes, .. }) => {
                         info!("REQMOD preview handler called, preview_len={}", bytes.len());
@@ -57,8 +57,8 @@ async fn main() -> icap_rs::error::IcapResult<()> {
     server.run().await
 }
 
-const fn embedded_body(request: &Request) -> Option<&Body<Vec<u8>>> {
-    match &request.embedded {
+const fn embedded_body(request: &IncomingRequest) -> Option<&Body<Vec<u8>>> {
+    match request.embedded() {
         Some(EmbeddedHttp::Req { body, .. } | EmbeddedHttp::Resp { body, .. }) => Some(body),
         None => None,
     }

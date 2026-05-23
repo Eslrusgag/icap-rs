@@ -16,7 +16,7 @@
 //! ## Quick example
 //!
 //! ```rust,no_run
-//! use icap_rs::{IcapResult, Method, Request, Response, Server, ServiceOptions, StatusCode};
+//! use icap_rs::{IcapResult, IncomingRequest, Method, Response, Server, ServiceOptions, StatusCode};
 //!
 //! const ISTAG: &str = "scan-1.0";
 //!
@@ -28,8 +28,8 @@
 //!         .route(
 //!             "scan",
 //!             [Method::ReqMod, Method::RespMod],
-//!             |req: Request| async move {
-//!                 match req.method {
+//!             |req: IncomingRequest| async move {
+//!                 match req.method() {
 //!                     Method::ReqMod => Ok(Response::no_content_with_istag(ISTAG)?),
 //!                     Method::RespMod => Ok(Response::no_content_with_istag(ISTAG)?),
 //!                     Method::Options => unreachable!("OPTIONS is handled automatically by the server"),
@@ -74,10 +74,11 @@ use crate::error::{Error, IcapResult};
 use crate::parser::icap::find_double_crlf;
 use crate::parser::read_chunked_to_end;
 use crate::request::{
-    Body, Remainder, RequestParserMode, parse_icap_request, parse_icap_request_with_mode,
+    Body, IncomingRequest, Remainder, RequestParserMode, parse_icap_request,
+    parse_icap_request_with_mode,
 };
 pub use crate::server::options::{ServiceOptions, TransferBehavior};
-use crate::{EmbeddedHttp, Method, Request, Response, StatusCode};
+use crate::{EmbeddedHttp, Method, Response, StatusCode};
 use bytes::Bytes;
 use smallvec::SmallVec;
 #[cfg(feature = "tls-rustls")]
@@ -88,7 +89,9 @@ use tokio_rustls::TlsAcceptor;
 /// One handler can serve multiple ICAP methods declared for a service via
 /// [`ServerBuilder::route`].
 type RequestHandler = Box<
-    dyn Fn(Request) -> std::pin::Pin<Box<dyn Future<Output = IcapResult<PreviewDecision>> + Send>>
+    dyn Fn(
+            IncomingRequest,
+        ) -> std::pin::Pin<Box<dyn Future<Output = IcapResult<PreviewDecision>> + Send>>
         + Send
         + Sync,
 >;
@@ -165,7 +168,7 @@ struct RouteEntry {
 /// # Example
 ///
 /// ```rust,no_run
-/// use icap_rs::{IcapResult, Method, Request, Response, Server, ServiceOptions};
+/// use icap_rs::{IcapResult, IncomingRequest, Method, Response, Server, ServiceOptions};
 ///
 /// const ISTAG: &str = "scan-1.0";
 ///
@@ -176,7 +179,7 @@ struct RouteEntry {
 ///         .route(
 ///             "scan",
 ///             [Method::ReqMod],
-///             |_req: Request| async move {
+///             |_req: IncomingRequest| async move {
 ///                 Ok(Response::no_content_with_istag(ISTAG)?)
 ///             },
 ///             Some(ServiceOptions::new().with_static_istag(ISTAG).with_preview(1024)),
@@ -719,7 +722,7 @@ impl Server {
     }
 
     fn build_206_use_original_body(
-        req: &Request,
+        req: &IncomingRequest,
         method: Method,
         istag: &str,
     ) -> IcapResult<Option<Response>> {
@@ -747,7 +750,7 @@ impl Server {
     }
 }
 
-fn mark_request_body_as_preview(req: &mut Request, ieof: bool) {
+fn mark_request_body_as_preview(req: &mut IncomingRequest, ieof: bool) {
     let Some(embedded) = req.embedded.as_mut() else {
         return;
     };
@@ -946,7 +949,10 @@ fn dechunk_icap_entity_with_ieof(data: &mut &[u8]) -> Result<(Vec<u8>, bool), St
     Ok((out, ieof))
 }
 
-fn parse_request_for_mode(data: &[u8], mode: RequestParserMode) -> IcapResult<Request<Vec<u8>>> {
+fn parse_request_for_mode(
+    data: &[u8],
+    mode: RequestParserMode,
+) -> IcapResult<IncomingRequest<Vec<u8>>> {
     match mode {
         RequestParserMode::Strict => parse_icap_request(data),
         RequestParserMode::Compatibility => parse_icap_request_with_mode(data, mode),
@@ -959,7 +965,7 @@ mod tests {
     use rstest::rstest;
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
-    async fn handler_ok(_: Request) -> IcapResult<Response> {
+    async fn handler_ok(_: IncomingRequest) -> IcapResult<Response> {
         Ok(Response::new(StatusCode::OK, "OK")
             .add_header("Encapsulated", "null-body=0")
             .add_header("Content-Length", "0"))

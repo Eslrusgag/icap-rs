@@ -34,19 +34,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let req = IcapRequest::reqmod("/scan")
         .icap_header("Allow", "204")
         .preview(1024)
-        .with_http_request(http_req);
+        .with_http_request(http_req)?;
 
     println!("Sending REQMOD to {URI} ...");
 
     match client.send(&req).await {
         Ok(resp) => {
-            println!("ICAP {} {}", resp.status_code.as_u16(), resp.status_text);
+            println!(
+                "ICAP {} {}",
+                resp.status_code().as_u16(),
+                resp.status_text()
+            );
             for (name, value) in resp.headers() {
                 println!("{}: {}", name, value.to_str().unwrap_or_default());
             }
-            if !resp.body.is_empty() {
-                println!("\nBody ({} bytes):", resp.body.len());
-                println!("{}", String::from_utf8_lossy(&resp.body));
+            if !resp.body().is_empty() {
+                println!("\nBody ({} bytes):", resp.body().len());
+                println!("{}", String::from_utf8_lossy(resp.body()));
             }
         }
         Err(e) => {

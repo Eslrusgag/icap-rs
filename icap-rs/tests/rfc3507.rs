@@ -7,8 +7,8 @@
 
 use http::{Request as HttpRequest, Response as HttpResponse, StatusCode as HttpStatus, Version};
 use icap_rs::error::IcapResult;
-use icap_rs::request::Request;
-use icap_rs::response::{Response, StatusCode};
+use icap_rs::request::{IncomingRequest, Request};
+use icap_rs::response::{ParsedResponse, Response, StatusCode};
 use icap_rs::server::options::{ServiceOptions, TransferBehavior};
 use icap_rs::server::{PreviewDecision, Server};
 use icap_rs::{Client, Method};
@@ -19,11 +19,11 @@ use tokio::time::Duration;
 
 const ISTAG: &str = "rfc3507";
 
-async fn no_modification_handler(_req: Request) -> IcapResult<Response> {
+async fn no_modification_handler(_req: IncomingRequest) -> IcapResult<Response> {
     Response::no_content().try_set_istag(ISTAG)
 }
 
-async fn preview_final_handler(_req: Request) -> IcapResult<PreviewDecision> {
+async fn preview_final_handler(_req: IncomingRequest) -> IcapResult<PreviewDecision> {
     Ok(PreviewDecision::Respond(
         Response::no_content().try_set_istag(ISTAG)?,
     ))
@@ -271,7 +271,11 @@ mod section_4_4_encapsulated {
             .body(b"hello".to_vec())
             .expect("http request");
         let wire = client
-            .get_request(&Request::reqmod("scan").with_http_request(http))
+            .get_request(
+                &Request::reqmod("scan")
+                    .with_http_request(http)
+                    .expect("build reqmod request"),
+            )
             .expect("serialize reqmod");
         let icap_header_end = find_double_crlf(&wire);
         let encapsulated = std::str::from_utf8(&wire[..icap_header_end]).expect("icap head");
@@ -300,7 +304,7 @@ mod section_4_4_encapsulated {
 
     #[test]
     fn supported_response_parser_returns_dechunked_encapsulated_area() {
-        let parsed = Response::from_raw(
+        let parsed = ParsedResponse::from_raw(
             b"ICAP/1.0 200 OK\r\n\
               ISTag: rfc3507\r\n\
               Encapsulated: res-hdr=0, res-body=38\r\n\
@@ -316,7 +320,7 @@ mod section_4_4_encapsulated {
         .expect("parse response");
 
         assert_eq!(
-            parsed.body,
+            parsed.body(),
             b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"
         );
     }
@@ -363,9 +367,9 @@ mod section_4_4_encapsulated {
             .await
             .expect("send options");
 
-        assert_eq!(response.status_code, StatusCode::OK);
+        assert_eq!(response.status_code(), StatusCode::OK);
         assert_eq!(
-            response.body,
+            response.body(),
             b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"
         );
     }
@@ -420,20 +424,25 @@ mod sections_4_6_and_4_7_responses {
         let client = Client::builder().host("127.0.0.1").port(port).build();
 
         let no_allow = client
-            .send(&Request::respmod("respmod").with_http_response(embedded_http_response("hello")))
+            .send(
+                &Request::respmod("respmod")
+                    .with_http_response(embedded_http_response("hello"))
+                    .expect("build respmod request"),
+            )
             .await
             .expect("send without allow");
-        assert_eq!(no_allow.status_code, StatusCode::OK);
+        assert_eq!(no_allow.status_code(), StatusCode::OK);
 
         let allow_204 = client
             .send(
                 &Request::respmod("respmod")
                     .allow_204()
-                    .with_http_response(embedded_http_response("hello")),
+                    .with_http_response(embedded_http_response("hello"))
+                    .expect("build respmod request"),
             )
             .await
             .expect("send allow 204");
-        assert_eq!(allow_204.status_code, StatusCode::NO_CONTENT);
+        assert_eq!(allow_204.status_code(), StatusCode::NO_CONTENT);
     }
 
     #[tokio::test]
@@ -445,19 +454,20 @@ mod sections_4_6_and_4_7_responses {
             .send(
                 &Request::respmod("respmod")
                     .allow_206()
-                    .with_http_response(embedded_http_response("hello")),
+                    .with_http_response(embedded_http_response("hello"))
+                    .expect("build respmod request"),
             )
             .await
             .expect("send allow 206");
 
-        assert_eq!(response.status_code, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(response.status_code(), StatusCode::PARTIAL_CONTENT);
         assert_eq!(response.use_original_body_offset(), Some(0));
-        assert!(!String::from_utf8_lossy(&response.body).contains("hello"));
+        assert!(!String::from_utf8_lossy(response.body()).contains("hello"));
     }
 
     #[test]
     fn supported_success_responses_require_istag() {
-        let err = Response::from_raw(b"ICAP/1.0 200 OK\r\nEncapsulated: null-body=0\r\n\r\n")
+        let err = ParsedResponse::from_raw(b"ICAP/1.0 200 OK\r\nEncapsulated: null-body=0\r\n\r\n")
             .expect_err("2xx without ISTag must fail");
 
         assert!(err.to_string().contains("ISTag"));
@@ -465,7 +475,7 @@ mod sections_4_6_and_4_7_responses {
 
     #[test]
     fn supported_response_parser_rejects_invalid_rfc_shapes() {
-        let wrong_version = Response::from_raw(
+        let wrong_version = ParsedResponse::from_raw(
             b"ICAP/2.0 200 OK\r\n\
               ISTag: rfc3507\r\n\
               Encapsulated: null-body=0\r\n\
@@ -474,7 +484,7 @@ mod sections_4_6_and_4_7_responses {
         .expect_err("ICAP/2.0 must fail");
         assert!(wrong_version.to_string().contains("ICAP/2.0"));
 
-        let duplicate_encapsulated = Response::from_raw(
+        let duplicate_encapsulated = ParsedResponse::from_raw(
             b"ICAP/1.0 200 OK\r\n\
               ISTag: rfc3507\r\n\
               Encapsulated: res-hdr=0, res-body=100\r\n\
@@ -489,7 +499,7 @@ mod sections_4_6_and_4_7_responses {
                 .contains("encapsulated")
         );
 
-        let invalid_204 = Response::from_raw(
+        let invalid_204 = ParsedResponse::from_raw(
             b"ICAP/1.0 204 No Content\r\n\
               ISTag: rfc3507\r\n\
               Encapsulated: res-hdr=0\r\n\
@@ -501,7 +511,7 @@ mod sections_4_6_and_4_7_responses {
 
     #[test]
     fn supported_istag_validation_cases() {
-        let valid = Response::from_raw(
+        let valid = ParsedResponse::from_raw(
             b"ICAP/1.0 200 OK\r\n\
               ISTag: ok-Tag.123\r\n\
               Encapsulated: null-body=0\r\n\
@@ -510,7 +520,7 @@ mod sections_4_6_and_4_7_responses {
         .expect("valid ISTag");
         assert_eq!(valid.get_header("ISTag").expect("ISTag"), "ok-Tag.123");
 
-        let invalid = Response::from_raw(
+        let invalid = ParsedResponse::from_raw(
             b"ICAP/1.0 200 OK\r\n\
               ISTag: BAD TAG\r\n\
               Encapsulated: null-body=0\r\n\
@@ -533,7 +543,7 @@ mod section_4_10_options {
             .await
             .expect("send options");
 
-        assert_eq!(response.status_code, StatusCode::OK);
+        assert_eq!(response.status_code(), StatusCode::OK);
         assert_eq!(
             response.get_header("Methods").expect("Methods"),
             "REQMOD, RESPMOD"

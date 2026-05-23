@@ -51,7 +51,7 @@ fn main() -> IcapResult<()> {
 ## Quick Start: Server
 
 ```rust,no_run
-use icap_rs::{IcapResult, Request, Response, Server, ServiceOptions};
+use icap_rs::{IcapResult, IncomingRequest, Response, Server, ServiceOptions};
 
 const ISTAG: &str = "example-1.0";
 
@@ -67,7 +67,7 @@ async fn main() -> IcapResult<()> {
         .bind("127.0.0.1:1344")
         .route_respmod(
             "respmod",
-            |_request: Request| async move {
+            |_request: IncomingRequest| async move {
                 Response::no_content_with_istag(ISTAG)
             },
             Some(options),
@@ -92,9 +92,9 @@ Client requests can set `Preview: N` and optionally send `ieof` for
 
 ```rust,no_run
 use http::{Request as HttpRequest, Version};
-use icap_rs::Request;
+use icap_rs::{IcapResult, Request};
 
-fn build_request() -> Request {
+fn build_request() -> IcapResult<Request> {
     let http_head = HttpRequest::builder()
         .method("POST")
         .uri("http://origin.example/upload")
@@ -118,7 +118,7 @@ the server can call it after preview bytes arrive and before sending
 `ICAP/1.0 100 Continue`.
 
 ```rust,no_run
-use icap_rs::{IcapResult, PreviewDecision, Request, Response, Server, ServiceOptions};
+use icap_rs::{IcapResult, IncomingRequest, PreviewDecision, Response, Server, ServiceOptions};
 
 const ISTAG: &str = "preview-1.0";
 
@@ -128,7 +128,7 @@ async fn main() -> IcapResult<()> {
         .bind("127.0.0.1:1344")
         .route_reqmod(
             "scan",
-            |_request: Request| async move {
+            |_request: IncomingRequest| async move {
                 Ok(PreviewDecision::Respond(
                     Response::no_content_with_istag(ISTAG)?,
                 ))
@@ -162,7 +162,7 @@ original body:
 
 ```rust,no_run
 use http::Request as HttpRequest;
-use icap_rs::{Body, EmbeddedHttp, IcapResult, Request, Response, Server, ServiceOptions};
+use icap_rs::{Body, EmbeddedHttp, IcapResult, IncomingRequest, Response, Server, ServiceOptions};
 
 const ISTAG: &str = "reqmod-edit-1.0";
 
@@ -177,11 +177,11 @@ async fn main() -> IcapResult<()> {
         .bind("127.0.0.1:1344")
         .route_reqmod(
             "reqmod",
-            |request: Request| async move {
+            |request: IncomingRequest| async move {
                 let Some(EmbeddedHttp::Req {
                     head,
                     body: Body::Full { reader },
-                }) = request.embedded
+                }) = request.into_embedded()
                 else {
                     return Response::no_content_with_istag(ISTAG);
                 };
@@ -243,7 +243,7 @@ async fn main() -> IcapResult<()> {
 
     let request = Request::reqmod("scan")
         .preview(0)
-        .with_http_request_head(http_head);
+        .with_http_request_head(http_head)?;
 
     let source = tokio::io::empty();
     let response = client
@@ -304,7 +304,7 @@ fn comma_separated_header_example() -> IcapResult<()> {
         .try_icap_header("X-TEST", "test1, test2, test3")?;
 
     let raw_value = req
-        .icap_headers
+        .icap_headers()
         .get("X-TEST")
         .and_then(|value| value.to_str().ok())
         .unwrap_or("");
@@ -355,7 +355,7 @@ Most applications can import the main API directly from the crate root:
 ```rust
 use icap_rs::{
     Body, Client, ClientBuilder, ConnectionPolicy, EmbeddedHttp, Error, IcapResult,
-    Method, PreviewDecision, Request, Response, Server, ServerBuilder,
+    IncomingRequest, Method, PreviewDecision, Request, Response, Server, ServerBuilder,
     ServiceOptions, StatusCode, TransferBehavior,
 };
 ```
@@ -363,7 +363,8 @@ use icap_rs::{
 | Type | Use it for |
 | --- | --- |
 | `Client`, `ClientBuilder`, `ConnectionPolicy` | Connecting to an ICAP service, configuring host/port or `icap://` / `icaps://` URI, keep-alive, timeouts, default headers, and streaming sends. |
-| `Request`, `Method` | Building outbound `OPTIONS`, `REQMOD`, and `RESPMOD` requests, or inspecting requests received by server route handlers. |
+| `Request`, `Method` | Building outbound `OPTIONS`, `REQMOD`, and `RESPMOD` requests for client send/build APIs. |
+| `IncomingRequest` | Inspecting server-side ICAP requests in route handlers. ICAP metadata is read-only; services may mutate or consume only the embedded HTTP message. |
 | `Response`, `StatusCode` | Building ICAP responses, parsing raw responses, validating `ISTag`, serializing RFC-compatible wire bytes, and attaching embedded HTTP messages. |
 | `Server`, `ServerBuilder` | Running a Tokio ICAP service with per-service routes, aliases, default service routing, connection limits, TLS/mTLS, and automatic `OPTIONS`. |
 | `ServiceOptions`, `TransferBehavior` | Describing per-service `OPTIONS` capabilities: `Methods`, `Service`, `ISTag`, `Allow`, `Preview`, `Transfer-*`, `Options-TTL`, and optional `opt-body`. |
@@ -376,13 +377,21 @@ Submodules are still public for discoverability and namespacing:
 `icap_rs::server`, and `icap_rs::error`. Prefer the crate-root imports above
 for normal application code.
 
+Server route handlers receive `IncomingRequest`, not the outbound `Request`
+builder. This intentionally prevents services from rewriting the ICAP request
+line, ICAP headers, preview state, or `Allow` flags after parsing. If a service
+needs to adapt traffic, it should return a `Response` with an embedded HTTP
+request/response, or use `IncomingRequest::embedded_mut()` /
+`IncomingRequest::into_embedded()` to work with the encapsulated HTTP data.
+
 ### Common API Paths
 
 | Goal | API path |
 | --- | --- |
 | Send `OPTIONS` | `Client::send(&Request::options("service"))` |
-| Send buffered `REQMOD` | `Request::reqmod("service").with_http_request(http_request)` then `Client::send` |
-| Send buffered `RESPMOD` | `Request::respmod("service").with_http_response(http_response)` then `Client::send` |
+| Send buffered `REQMOD` | `Request::reqmod("service").with_http_request(http_request)?` then `Client::send` |
+| Send buffered `RESPMOD` | `Request::respmod("service").with_http_response(http_response)?` then `Client::send` |
+| Build from dynamic method input | `Request::try_new(method, "service")?` then `with_http_request(...)` / `with_http_response(...)` |
 | Stream a large body | `with_http_request_head` / `with_http_response_head` plus `Client::send_streaming_reader` |
 | Return no modification | `Response::no_content_with_istag("...")` |
 | Return adapted HTTP | `Response::ok_with_istag("...")?.with_http_response(...)` |
@@ -406,6 +415,7 @@ and `ServerBuilder::with_mtls_from_pem_files` for listeners. See
 ```bash
 cargo run -p icap-rs --example server
 cargo run -p icap-rs --example client
+cargo run -p icap-rs --example streaming_client -- Cargo.toml
 cargo run -p icap-rs --example preview_decision_server
 cargo run -p icap-rs --example tls_client --features tls-rustls
 ```
