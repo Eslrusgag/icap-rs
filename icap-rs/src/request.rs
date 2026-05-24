@@ -49,12 +49,12 @@
 //! # Ok::<(), icap_rs::Error>(())
 //! ```
 
-use crate::ICAP_VERSION;
 use crate::error::{Error, IcapResult};
 use crate::protocol::{
     find_double_crlf, parse_header_lines, parse_http_request_start_line,
     parse_http_response_start_line,
 };
+use crate::ICAP_VERSION;
 use bytes::Bytes;
 use http::{HeaderMap, HeaderName, HeaderValue, Request as HttpRequest, Response as HttpResponse};
 use memchr::memmem;
@@ -396,26 +396,45 @@ impl<R> EmbeddedHttp<R> {
 
 /// Serialize embedded HTTP (client-side).
 ///
-/// Returns `(bytes_of_http_head, optional_http_body_bytes)`.
-pub(crate) fn serialize_embedded_http(e: &EmbeddedHttp<Vec<u8>>) -> (Vec<u8>, Option<Vec<u8>>) {
+/// Returns `(http_head_bytes, body_bytes_up_to_limit, original_body_len)`.
+///
+/// `body_limit` caps how many body bytes are copied into the returned `Vec`.
+/// Pass `None` to copy the full body (required for [`Client::send`] so the
+/// remainder is available after `100 Continue`).
+/// Pass `Some(preview_size)` for dry-run helpers like [`Client::get_request`]
+/// where only the preview bytes need to appear in the wire buffer; the caller
+/// must use `original_body_len` to decide the correct chunk terminator
+/// (`ieof` vs `0\r\n\r\n`) regardless of how many bytes were actually copied.
+pub(crate) fn serialize_embedded_http(
+    e: &EmbeddedHttp<Vec<u8>>,
+    body_limit: Option<usize>,
+) -> (Vec<u8>, Option<Vec<u8>>, usize) {
+    #[inline]
+    fn copy_body(reader: &[u8], limit: Option<usize>) -> (Option<Vec<u8>>, usize) {
+        if reader.is_empty() {
+            return (None, 0);
+        }
+        let original_len = reader.len();
+        let end = limit.map_or(original_len, |lim| original_len.min(lim));
+        (Some(reader[..end].to_vec()), original_len)
+    }
+
     match e {
         EmbeddedHttp::Req { head, body } => {
             let head_bytes = serialize_http_request_head(head);
-            let body_bytes = match body {
-                Body::Full { reader } if reader.is_empty() => None,
-                Body::Full { reader } => Some(reader.clone()),
-                Body::Empty | Body::Preview { .. } => None, // client shouldn't serialize Preview
+            let (body_bytes, original_len) = match body {
+                Body::Full { reader } => copy_body(reader, body_limit),
+                Body::Empty | Body::Preview { .. } => (None, 0),
             };
-            (head_bytes, body_bytes)
+            (head_bytes, body_bytes, original_len)
         }
         EmbeddedHttp::Resp { head, body } => {
             let head_bytes = serialize_http_response_head(head);
-            let body_bytes = match body {
-                Body::Full { reader } if reader.is_empty() => None,
-                Body::Full { reader } => Some(reader.clone()),
-                Body::Empty | Body::Preview { .. } => None,
+            let (body_bytes, original_len) = match body {
+                Body::Full { reader } => copy_body(reader, body_limit),
+                Body::Empty | Body::Preview { .. } => (None, 0),
             };
-            (head_bytes, body_bytes)
+            (head_bytes, body_bytes, original_len)
         }
     }
 }

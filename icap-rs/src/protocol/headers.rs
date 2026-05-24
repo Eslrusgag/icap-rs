@@ -1,12 +1,12 @@
-use crate::ICAP_VERSION;
 use crate::error::{Error, IcapResult};
 use crate::protocol::chunked::write_chunk_into;
 use crate::protocol::encapsulated::parse_encapsulated_value;
 use crate::protocol::validate_istag;
 use crate::response::Response;
+use crate::ICAP_VERSION;
 use http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Version};
 use std::borrow::Cow;
-use std::fmt::Write;
+use std::io::Write as IoWrite;
 use std::str::FromStr;
 use tracing::{trace, warn};
 
@@ -158,31 +158,34 @@ pub fn parse_preview_header_value(hdr_text: &str) -> Option<usize> {
 }
 
 pub fn serialize_icap_response(resp: &Response) -> Vec<u8> {
-    let mut head = String::new();
+    // Pre-allocate: status line (~32 B) + headers (~48 B each) + separator
+    // + body (exact) + chunked overhead (~32 B).
+    let header_cap = 32 + resp.headers.len() * 48 + 2;
+    let body_cap = if resp.body.is_empty() {
+        32
+    } else {
+        resp.body.len() + 32
+    };
+    let mut out = Vec::with_capacity(header_cap + body_cap);
+
+    // Write status line and headers directly into the Vec<u8> via io::Write.
     write!(
-        &mut head,
+        out,
         "{} {} {}\r\n",
         resp.version,
         resp.status_code.as_str(),
         resp.status_text
     )
-    .expect("write to String");
+    .expect("write status line");
     for (name, value) in &resp.headers {
         let canon = canon_icap_header(name.as_str());
-        write!(
-            &mut head,
-            "{}: {}\r\n",
-            canon,
-            value.to_str().unwrap_or_default()
-        )
-        .expect("write to String");
+        write!(out, "{}: {}\r\n", canon, value.to_str().unwrap_or_default()).expect("write header");
     }
-    head.push_str("\r\n");
+    out.extend_from_slice(b"\r\n");
 
-    let mut out = head.into_bytes();
     if resp.body.is_empty() {
         if let Some(offset) = resp.use_original_body {
-            out.extend_from_slice(format!("0; use-original-body={offset}\r\n\r\n").as_bytes());
+            write!(out, "0; use-original-body={offset}\r\n\r\n").expect("write use-original-body");
         }
         return out;
     }
@@ -206,7 +209,7 @@ pub fn serialize_icap_response(resp: &Response) -> Vec<u8> {
             write_chunk_into(&mut out, &resp.body[split..]);
         }
         if let Some(offset) = resp.use_original_body {
-            out.extend_from_slice(format!("0; use-original-body={offset}\r\n\r\n").as_bytes());
+            write!(out, "0; use-original-body={offset}\r\n\r\n").expect("write use-original-body");
         } else {
             out.extend_from_slice(b"0\r\n\r\n");
         }

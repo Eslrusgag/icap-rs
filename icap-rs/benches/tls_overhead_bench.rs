@@ -1,22 +1,36 @@
-use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use http::{Response as HttpResponse, StatusCode as HttpStatus, Version};
 use icap_rs::error::IcapResult;
 use icap_rs::request::{IncomingRequest, Request};
 use icap_rs::response::{Response, StatusCode};
 use icap_rs::server::Server;
-use icap_rs::{Client, Method};
+use icap_rs::{Client, Method, ServiceOptions};
 use std::hint::black_box;
 use std::net::TcpListener as StdTcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+// Maximum new-connection iterations measured per Criterion sample.
+//
+// Two reasons for the cap:
+// 1. Wall-clock: a single TLS handshake takes ~0.5–2ms; without a cap each
+//    sample would take tens of seconds.
+// 2. Ephemeral port exhaustion on Windows: every close() enters TIME_WAIT
+//    (~120-240s by default).  Criterion may request thousands of iterations
+//    per sample which quickly exhausts the ~49k available ephemeral ports.
+//
+// We run exactly this many iterations and then *scale* the reported duration
+// linearly so Criterion's per-iteration statistics are correct.  The scaling
+// assumption (constant per-connection cost) holds for this workload because
+// each new connection is independent with approximately constant handshake cost.
+const MAX_NEW_CONNECTION_ITERS_PER_SAMPLE: u64 = 32;
 use tokio::runtime::{Builder as RtBuilder, Runtime};
 use tokio::time::sleep;
 
 const CERT_PEM: &str = "certs/server.crt";
 const KEY_PEM: &str = "certs/server.key";
 const CA_PEM: &str = "certs/ca.pem";
-const MAX_NEW_CONNECTION_ITERS_PER_SAMPLE: u64 = 32;
 
 struct BenchEnv {
     rt: Runtime,
@@ -99,7 +113,12 @@ fn install_rustls_provider() {
 async fn spawn_plain_server(addr: &str) {
     let server = Server::builder()
         .bind(addr)
-        .route("respmod", [Method::RespMod], fast_204_handler, None)
+        .route(
+            "respmod",
+            [Method::RespMod],
+            fast_204_handler,
+            Some(ServiceOptions::new().with_static_istag("bench-tls")),
+        )
         .build()
         .await
         .expect("build plain benchmark server");
@@ -113,7 +132,12 @@ async fn spawn_tls_server(addr: &str) {
     let server = Server::builder()
         .bind(addr)
         .with_tls_from_pem_files(test_data_path(CERT_PEM), test_data_path(KEY_PEM))
-        .route("respmod", [Method::RespMod], fast_204_handler, None)
+        .route(
+            "respmod",
+            [Method::RespMod],
+            fast_204_handler,
+            Some(ServiceOptions::new().with_static_istag("bench-tls")),
+        )
         .build()
         .await
         .expect("build TLS benchmark server");
@@ -216,19 +240,20 @@ fn bench_new_connection(c: &mut Criterion, env: &Arc<BenchEnv>) {
 }
 
 async fn measure_new_connection_iters(client: &Client, request: &Request, iters: u64) -> Duration {
-    let measured_iters = iters.clamp(1, MAX_NEW_CONNECTION_ITERS_PER_SAMPLE);
+    // Run at most MAX_NEW_CONNECTION_ITERS_PER_SAMPLE real connections, then
+    // scale the elapsed time to what `iters` would have taken.  See the
+    // constant declaration above for the full rationale.
+    let measured = iters.clamp(1, MAX_NEW_CONNECTION_ITERS_PER_SAMPLE);
     let started = Instant::now();
-
-    for _ in 0..measured_iters {
+    for _ in 0..measured {
         let resp = client.send(request).await.expect("client send");
         black_box(resp.status_code());
     }
-
     let scaled_nanos = started
         .elapsed()
         .as_nanos()
         .saturating_mul(u128::from(iters))
-        / u128::from(measured_iters);
+        / u128::from(measured);
     Duration::from_nanos(u64::try_from(scaled_nanos).unwrap_or(u64::MAX))
 }
 

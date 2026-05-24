@@ -22,11 +22,11 @@ use crate::protocol::{
     canon_icap_header, find_double_crlf, parse_encapsulated_header, read_chunked_to_end,
     write_chunk, write_chunk_into,
 };
-use crate::request::{Request, serialize_embedded_http};
-use crate::response::{ParsedResponse, parse_icap_response};
+use crate::request::{serialize_embedded_http, Request};
+use crate::response::{parse_icap_response, ParsedResponse};
 
-use crate::Method;
 use crate::client::tls::{AnyTlsConnector, TlsConnector};
+use crate::Method;
 
 use http::HeaderMap;
 use std::collections::HashSet;
@@ -79,7 +79,7 @@ impl Client {
     /// Useful for debugging or for printing what would be sent without
     /// actually opening a connection.
     pub fn get_request(&self, req: &Request) -> IcapResult<Vec<u8>> {
-        let built = self.build_icap_request_bytes(req, false, req.preview_ieof)?;
+        let built = self.build_icap_request_bytes(req, false, req.preview_ieof, true)?;
         Ok(built.bytes)
     }
 
@@ -115,7 +115,7 @@ impl Client {
             return Ok(resp);
         }
 
-        let built = self.build_icap_request_bytes(req, false, req.preview_ieof)?;
+        let built = self.build_icap_request_bytes(req, false, req.preview_ieof, false)?;
         if let Err(write_err) = AsyncWriteExt::write_all(&mut stream, &built.bytes).await {
             if let Ok((_code, hdr_buf)) =
                 Self::with_timeout(self.inner.read_timeout, read_icap_headers(&mut stream)).await
@@ -223,7 +223,7 @@ impl Client {
             return Ok(resp);
         }
 
-        let built = self.build_icap_request_bytes(req, true, false)?;
+        let built = self.build_icap_request_bytes(req, true, false, false)?;
         AsyncWriteExt::write_all(&mut stream, &built.bytes).await?;
 
         match req.preview_size {
@@ -287,6 +287,7 @@ impl Client {
             req,
             streaming || matches!(req.preview_size, Some(0)),
             req.preview_ieof,
+            true,
         )?;
         let mut out = built.bytes;
         if req.is_mod()
@@ -361,6 +362,7 @@ impl Client {
         req: &Request,
         force_has_body: bool,
         preview0_ieof: bool,
+        limit_body_to_preview: bool,
     ) -> IcapResult<BuiltIcap> {
         req.validate_for_send()?;
 
@@ -396,34 +398,42 @@ impl Client {
             .unwrap_or_else(|| self.inner.host.clone());
 
         // Encapsulated
-        let (http_headers_bytes, http_body_bytes, enc_head_key, enc_body_key) = if req.is_mod() {
-            req.embedded.as_ref().map_or_else(
-                || (Vec::new(), None, None, None),
-                |emb| {
-                    let (hdrs, body_from_emb) = serialize_embedded_http(emb);
-                    let hdr_len = hdrs.len();
-                    let (hdr_key, body_key) = match req.method.as_str() {
-                        "REQMOD" => ("req-hdr", "req-body"),
-                        _ => ("res-hdr", "res-body"),
-                    };
-                    let will_send_body = force_has_body || body_from_emb.is_some();
-                    if will_send_body && !hdrs.is_empty() {
-                        (
-                            hdrs,
-                            body_from_emb,
-                            Some((hdr_key, hdr_len)),
-                            Some(body_key),
-                        )
-                    } else if !hdrs.is_empty() {
-                        (hdrs, None, Some((hdr_key, 0usize)), None)
-                    } else {
-                        (hdrs, None, None, None)
-                    }
-                },
-            )
-        } else {
-            (Vec::new(), None, None, None)
-        };
+        // When only building wire bytes (get_request / get_request_wire) we can
+        // truncate the body copy to at most preview_size bytes.  The real send
+        // path must keep the full body so that remaining_body is correct.
+        let body_limit = limit_body_to_preview.then_some(req.preview_size).flatten();
+
+        let (http_headers_bytes, http_body_bytes, enc_head_key, enc_body_key, original_body_len) =
+            if req.is_mod() {
+                req.embedded.as_ref().map_or_else(
+                    || (Vec::new(), None, None, None, 0usize),
+                    |emb| {
+                        let (hdrs, body_from_emb, orig_len) =
+                            serialize_embedded_http(emb, body_limit);
+                        let hdr_len = hdrs.len();
+                        let (hdr_key, body_key) = match req.method.as_str() {
+                            "REQMOD" => ("req-hdr", "req-body"),
+                            _ => ("res-hdr", "res-body"),
+                        };
+                        let will_send_body = force_has_body || body_from_emb.is_some();
+                        if will_send_body && !hdrs.is_empty() {
+                            (
+                                hdrs,
+                                body_from_emb,
+                                Some((hdr_key, hdr_len)),
+                                Some(body_key),
+                                orig_len,
+                            )
+                        } else if !hdrs.is_empty() {
+                            (hdrs, None, Some((hdr_key, 0usize)), None, orig_len)
+                        } else {
+                            (hdrs, None, None, None, orig_len)
+                        }
+                    },
+                )
+            } else {
+                (Vec::new(), None, None, None, 0usize)
+            };
 
         // Write ICAP headers (except Encapsulated)
         write_icap_headers(
@@ -460,8 +470,12 @@ impl Client {
         if req.is_mod()
             && let Some(body_now) = http_body_bytes
         {
-            let (bytes, expect_continue, remaining) =
-                build_preview_and_chunks(req.preview_size, body_now, preview0_ieof);
+            let (bytes, expect_continue, remaining) = build_preview_and_chunks(
+                req.preview_size,
+                body_now,
+                preview0_ieof,
+                original_body_len,
+            );
             out.extend_from_slice(&bytes);
             return Ok(BuiltIcap {
                 bytes: out,
@@ -987,10 +1001,19 @@ where
     }
 }
 
+/// Encode body bytes into ICAP chunked preview wire format.
+///
+/// `original_body_len` is the **true** full body length and may be larger than
+/// `body.len()` when `body` was truncated to `preview_size` by the caller (the
+/// dry-run `get_request` path).  It is used to determine whether a `0; ieof`
+/// or a plain `0\r\n\r\n` terminator is correct — i.e. whether there is
+/// remaining data beyond the preview window — without requiring the full body
+/// bytes to be in memory.
 fn build_preview_and_chunks(
     preview_size: Option<usize>,
     body: Vec<u8>,
     preview0_ieof: bool,
+    original_body_len: usize,
 ) -> (Vec<u8>, bool, Option<Vec<u8>>) {
     let mut out = Vec::new();
     match preview_size {
@@ -1002,7 +1025,10 @@ fn build_preview_and_chunks(
             (out, false, None)
         }
         Some(0) => {
-            if body.is_empty() {
+            // body is empty after a body_limit=Some(0) truncation even when the
+            // original had bytes.  Use original_body_len to decide the terminator.
+            let has_body = original_body_len > 0;
+            if !has_body {
                 if preview0_ieof {
                     out.extend_from_slice(b"0; ieof\r\n\r\n");
                     (out, false, None)
@@ -1016,17 +1042,23 @@ fn build_preview_and_chunks(
             }
         }
         Some(ps) => {
-            let send_n = body.len().min(ps);
-            if send_n > 0 {
-                write_chunk_into(&mut out, &body[..send_n]);
+            // How many preview bytes we would send in a full (non-truncated) pass.
+            let send_n = original_body_len.min(ps);
+            // How many we actually have (body may be a truncated slice).
+            let actual_send = body.len().min(send_n);
+            if actual_send > 0 {
+                write_chunk_into(&mut out, &body[..actual_send]);
             }
-            let rest = body.len().saturating_sub(send_n);
+            // Remaining bytes beyond the preview window (by original length).
+            let rest = original_body_len.saturating_sub(send_n);
             if rest == 0 {
                 out.extend_from_slice(b"0; ieof\r\n\r\n");
                 (out, false, None)
             } else {
                 out.extend_from_slice(b"0\r\n\r\n");
-                (out, true, Some(body[send_n..].to_vec()))
+                // body[actual_send..] is the remainder we actually have in memory;
+                // may be empty when body was truncated (get_request path).
+                (out, true, Some(body[actual_send..].to_vec()))
             }
         }
     }
@@ -1036,11 +1068,11 @@ fn build_preview_and_chunks(
 mod tests {
     use super::*;
     use crate::protocol::find_double_crlf;
-    use http::{Request as HttpReq, Version, header};
+    use http::{header, Request as HttpReq, Version};
     use rstest::{fixture, rstest};
     use std::future;
     use tokio::net::{TcpListener, TcpStream};
-    use tokio::time::{Duration, timeout};
+    use tokio::time::{timeout, Duration};
 
     fn bytes_to_string_prefix(v: &[u8], n: usize) -> String {
         String::from_utf8_lossy(&v[..v.len().min(n)]).to_string()
@@ -1195,8 +1227,10 @@ mod tests {
         #[case] expect_continue: bool,
         #[case] rest: Option<&[u8]>,
     ) {
+        let body_vec = body.to_vec();
+        let orig_len = body_vec.len();
         let (bytes, got_expect_continue, rest_opt) =
-            build_preview_and_chunks(preview, body.to_vec(), ieof);
+            build_preview_and_chunks(preview, body_vec, ieof, orig_len);
 
         assert!(bytes.starts_with(expected_prefix));
         assert_eq!(got_expect_continue, expect_continue);

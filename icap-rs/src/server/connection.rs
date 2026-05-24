@@ -12,13 +12,13 @@ use crate::protocol::{
     read_chunked_until_zero,
 };
 use crate::request::{
-    IncomingRequest, RequestParserMode, parse_icap_request, parse_icap_request_with_mode,
+    parse_icap_request, parse_icap_request_with_mode, IncomingRequest, RequestParserMode,
 };
 use crate::{Body, EmbeddedHttp, Method, Response, StatusCode};
 
+use super::preview::{mark_request_body_as_preview, PreviewDecision};
+use super::router::{resolve_service, RouteEntry};
 use super::Server;
-use super::preview::{PreviewDecision, mark_request_body_as_preview};
-use super::router::{RouteEntry, resolve_service};
 impl Server {
     /// Handle a single client connection (persistent / keep-alive).
     ///
@@ -133,7 +133,8 @@ impl Server {
                         // Build a minimal parse buffer: ICAP headers + dechunked preview body.
                         // Avoids cloning the entire `buf` (which may be much larger).
                         let preview_len = decoded.len();
-                        let mut parse_buf = Vec::with_capacity((body_abs - buf_start) + preview_len);
+                        let mut parse_buf =
+                            Vec::with_capacity((body_abs - buf_start) + preview_len);
                         parse_buf.extend_from_slice(&buf[buf_start..body_abs]);
                         parse_buf.extend_from_slice(&decoded);
                         let mut preview_req = match parse_request_for_mode(

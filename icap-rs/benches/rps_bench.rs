@@ -1,10 +1,10 @@
-use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use http::{Response as HttpResponse, StatusCode as HttpStatus, Version};
 use icap_rs::error::IcapResult;
 use icap_rs::request::{IncomingRequest, Request};
 use icap_rs::response::{Response, StatusCode};
 use icap_rs::server::Server;
-use icap_rs::{Client, Method};
+use icap_rs::{Client, Method, ServiceOptions};
 use std::hint::black_box;
 use std::net::TcpListener as StdTcpListener;
 use std::sync::Arc;
@@ -13,7 +13,7 @@ use tokio::net::TcpStream;
 use tokio::runtime::{Builder as RtBuilder, Runtime};
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
-use tokio::time::{Duration, sleep};
+use tokio::time::{sleep, Duration};
 
 const CONCURRENCY_LEVELS: &[usize] = &[1, 4, 16];
 
@@ -39,7 +39,12 @@ impl BenchEnv {
         rt.block_on(async {
             let server = Server::builder()
                 .bind(&addr)
-                .route("respmod", [Method::RespMod], fast_204_handler, None)
+                .route(
+                    "respmod",
+                    [Method::RespMod],
+                    fast_204_handler,
+                    Some(ServiceOptions::new().with_static_istag("bench-204")),
+                )
                 .build()
                 .await
                 .expect("build benchmark server");
@@ -122,7 +127,7 @@ async fn connect_with_retry(addr: &str) -> IcapResult<TcpStream> {
     for _ in 0..50 {
         match TcpStream::connect(addr).await {
             Ok(s) => return Ok(s),
-            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
                 last_err = Some(e);
                 sleep(Duration::from_millis(2)).await;
             }
