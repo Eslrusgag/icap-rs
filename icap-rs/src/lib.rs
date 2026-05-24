@@ -12,6 +12,7 @@ pub mod tls;
 
 pub use client::Client;
 pub use client::builder::*;
+pub use client::timeouts::ClientTimeouts;
 pub use error::{Error, IcapResult};
 pub use request::{
     Body, EmbeddedHttp, EmbeddedHttpKind, Incoming, IncomingRequest, Method, Outbound,
@@ -19,7 +20,8 @@ pub use request::{
 };
 pub use response::{Outgoing, OutgoingResponse, Parsed, ParsedResponse, Response, StatusCode};
 pub use server::{
-    PreviewDecision, RouteOutput, Server, ServerBuilder, ServiceOptions, TransferBehavior,
+    PreviewDecision, RouteOutput, Server, ServerBuilder, ServerTimeouts, ServiceOptions,
+    TransferBehavior,
 };
 #[cfg(feature = "tls-rustls")]
 pub use tls::{ClientTlsConfig, ServerTlsConfig, TlsError};
@@ -30,6 +32,3 @@ pub const LIB_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const MAX_HDR_BYTES: usize = 64 * 1024;
 /// Supported ICAP protocol version.
 pub const ICAP_VERSION: &str = "ICAP/1.0";
-
-#[doc = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/docs/tls.md"))]
-pub mod tls_docs {}

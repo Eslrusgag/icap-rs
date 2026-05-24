@@ -15,7 +15,10 @@ use tokio_rustls::{TlsConnector as TokioTlsConnector, client::TlsStream};
 use tracing::warn;
 
 use super::error::TlsError;
-use super::pem::{load_cert_chain, load_private_key, load_roots_into};
+use super::pem::{
+    load_cert_chain, load_private_key, load_roots_into, parse_cert_chain, parse_private_key,
+    parse_roots_into,
+};
 use super::{DEFAULT_HANDSHAKE_TIMEOUT, ensure_crypto_provider};
 
 /// Client-side TLS configuration for ICAPS connections.
@@ -66,7 +69,8 @@ impl ClientTlsConfig {
     }
 
     /// Start with an empty trust store. Only roots added via
-    /// [`ClientTlsConfig::add_root_ca_pem`] will be trusted.
+    /// [`ClientTlsConfig::add_root_ca_pem`] or
+    /// [`ClientTlsConfig::add_root_ca_pem_file`] will be trusted.
     pub fn empty() -> Self {
         Self::new_builder(false)
     }
@@ -87,12 +91,15 @@ impl ClientTlsConfig {
     /// Wrap a pre-built [`rustls::ClientConfig`].
     ///
     /// Methods that modify the builder state ([`add_root_ca_pem`],
-    /// [`with_client_auth_pem`], [`dangerous_disable_cert_verification`])
+    /// [`add_root_ca_pem_file`], [`with_client_auth_pem`],
+    /// [`with_client_auth_pem_files`], [`dangerous_disable_cert_verification`])
     /// return an error when called on a config constructed this way —
     /// configure the [`ClientConfig`] directly instead.
     ///
     /// [`add_root_ca_pem`]: Self::add_root_ca_pem
+    /// [`add_root_ca_pem_file`]: Self::add_root_ca_pem_file
     /// [`with_client_auth_pem`]: Self::with_client_auth_pem
+    /// [`with_client_auth_pem_files`]: Self::with_client_auth_pem_files
     /// [`dangerous_disable_cert_verification`]: Self::dangerous_disable_cert_verification
     pub const fn from_rustls_config(cfg: Arc<ClientConfig>) -> Self {
         Self {
@@ -102,21 +109,42 @@ impl ClientTlsConfig {
         }
     }
 
-    /// Append trust roots from a PEM file (one or more certificates).
-    pub fn add_root_ca_pem(mut self, path: impl AsRef<Path>) -> Result<Self, TlsError> {
-        self.inner = self.inner.add_root_ca_pem(path.as_ref())?;
+    /// Append trust roots from PEM data (one or more certificates).
+    pub fn add_root_ca_pem(mut self, pem: impl AsRef<[u8]>) -> Result<Self, TlsError> {
+        self.inner = self.inner.add_root_ca_pem("<client root CA PEM>", pem)?;
         Ok(self)
     }
 
-    /// Enable mutual TLS by presenting a client certificate chain and key.
+    /// Append trust roots from a PEM file on disk.
+    pub fn add_root_ca_pem_file(mut self, path: impl AsRef<Path>) -> Result<Self, TlsError> {
+        self.inner = self.inner.add_root_ca_pem_file(path.as_ref())?;
+        Ok(self)
+    }
+
+    /// Enable mutual TLS by presenting a PEM certificate chain and key.
     pub fn with_client_auth_pem(
+        mut self,
+        cert: impl AsRef<[u8]>,
+        key: impl AsRef<[u8]>,
+    ) -> Result<Self, TlsError> {
+        self.inner = self.inner.with_client_auth_pem(
+            "<client certificate PEM>",
+            cert,
+            "<client private key PEM>",
+            key,
+        )?;
+        Ok(self)
+    }
+
+    /// Enable mutual TLS from certificate and key PEM files on disk.
+    pub fn with_client_auth_pem_files(
         mut self,
         cert: impl AsRef<Path>,
         key: impl AsRef<Path>,
     ) -> Result<Self, TlsError> {
         self.inner = self
             .inner
-            .with_client_auth_pem(cert.as_ref(), key.as_ref())?;
+            .with_client_auth_pem_files(cert.as_ref(), key.as_ref())?;
         Ok(self)
     }
 
@@ -148,16 +176,16 @@ impl ClientTlsConfig {
     }
 
     /// Build (and cache) the underlying [`rustls::ClientConfig`].
-    pub(crate) fn into_connector(self) -> Result<ClientTlsConnector, TlsError> {
-        ensure_crypto_provider()?;
-        Ok(ClientTlsConnector {
+    pub(crate) fn into_connector(self) -> ClientTlsConnector {
+        ensure_crypto_provider();
+        ClientTlsConnector {
             inner: Arc::new(ConnectorInner {
                 source: self.inner,
                 cached: OnceLock::new(),
             }),
             sni: self.sni,
             handshake_timeout: self.handshake_timeout,
-        })
+        }
     }
 }
 
@@ -169,7 +197,33 @@ impl ClientTlsInner {
         }
     }
 
-    fn add_root_ca_pem(self, path: &Path) -> Result<Self, TlsError> {
+    fn add_root_ca_pem(
+        self,
+        source: impl Into<String>,
+        pem: impl AsRef<[u8]>,
+    ) -> Result<Self, TlsError> {
+        match self {
+            Self::Builder {
+                mut roots,
+                load_native,
+                client_auth,
+                disable_verify,
+            } => {
+                parse_roots_into(&mut roots, source, pem)?;
+                Ok(Self::Builder {
+                    roots,
+                    load_native,
+                    client_auth,
+                    disable_verify,
+                })
+            }
+            Self::Prebuilt(_) => Err(TlsError::ConfigBuild(
+                "extra roots cannot be added on top of a pre-built rustls ClientConfig".into(),
+            )),
+        }
+    }
+
+    fn add_root_ca_pem_file(self, path: &Path) -> Result<Self, TlsError> {
         match self {
             Self::Builder {
                 mut roots,
@@ -191,7 +245,36 @@ impl ClientTlsInner {
         }
     }
 
-    fn with_client_auth_pem(self, cert: &Path, key: &Path) -> Result<Self, TlsError> {
+    fn with_client_auth_pem(
+        self,
+        cert_source: impl Into<String>,
+        cert: impl AsRef<[u8]>,
+        key_source: impl Into<String>,
+        key: impl AsRef<[u8]>,
+    ) -> Result<Self, TlsError> {
+        match self {
+            Self::Builder {
+                roots,
+                load_native,
+                client_auth: _,
+                disable_verify,
+            } => {
+                let chain = parse_cert_chain(cert_source, cert)?;
+                let key = parse_private_key(key_source, key)?;
+                Ok(Self::Builder {
+                    roots,
+                    load_native,
+                    client_auth: Some((chain, key)),
+                    disable_verify,
+                })
+            }
+            Self::Prebuilt(_) => Err(TlsError::ConfigBuild(
+                "client auth cannot be added on top of a pre-built rustls ClientConfig".into(),
+            )),
+        }
+    }
+
+    fn with_client_auth_pem_files(self, cert: &Path, key: &Path) -> Result<Self, TlsError> {
         match self {
             Self::Builder {
                 roots,

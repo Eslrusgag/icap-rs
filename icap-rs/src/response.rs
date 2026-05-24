@@ -812,7 +812,7 @@ mod tests {
             .try_add_header("Bad Header", "value")
             .expect_err("invalid header name should be rejected");
 
-        assert!(matches!(err, Error::Header(_)));
+        assert!(matches!(err, Error::HeaderName(_)));
     }
 
     #[test]

@@ -12,11 +12,11 @@
 //! - Plain TCP by default.
 //! - Enable `tls-rustls` to use TLS (rustls backend).
 //! - `icaps://` URIs automatically switch to TLS using
-//!   [`crate::tls::ClientTlsConfig::with_native_roots`]; supply a custom
-//!   [`crate::tls::ClientTlsConfig`] via [`builder::ClientBuilder::with_tls`]
-//!   to override.
+//!   `ClientTlsConfig::with_native_roots`; supply a custom `ClientTlsConfig`
+//!   via `ClientBuilder::with_tls` to override.
 
 pub mod builder;
+pub mod timeouts;
 
 use crate::error::{Error, IcapResult};
 use crate::protocol::{
@@ -38,6 +38,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::client::builder::{ClientBuilder, ConnectionPolicy};
+use crate::client::timeouts::ClientTimeouts;
 use crate::net::Conn;
 use tokio::fs::File as TokioFile;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -65,7 +66,7 @@ struct ClientRef {
     host_override: Option<String>,
     default_headers: HeaderMap,
     connection_policy: ConnectionPolicy,
-    read_timeout: Option<Duration>,
+    timeouts: ClientTimeouts,
     #[cfg(feature = "tls-rustls")]
     tls: Option<ClientTlsConnector>,
     idle_conn: Mutex<Option<Conn>>,
@@ -92,6 +93,15 @@ impl Client {
     /// - handles `Preview` and `100 Continue` negotiation when applicable,
     /// - and returns the parsed ICAP [`ParsedResponse`].
     pub async fn send(&self, req: &Request) -> IcapResult<ParsedResponse> {
+        Box::pin(Self::with_timeout_as(
+            self.inner.timeouts.operation,
+            self.send_inner(req),
+            Error::ClientTimeout,
+        ))
+        .await
+    }
+
+    async fn send_inner(&self, req: &Request) -> IcapResult<ParsedResponse> {
         trace!(
             "client.send: method={}, service={}",
             req.method, req.service
@@ -118,28 +128,32 @@ impl Client {
         }
 
         let built = self.build_icap_request_bytes(req, false, req.preview_ieof, false)?;
-        if let Err(write_err) = AsyncWriteExt::write_all(&mut stream, &built.bytes).await {
-            if let Ok((_code, hdr_buf)) =
-                Self::with_timeout(self.inner.read_timeout, read_icap_headers(&mut stream)).await
+        if let Err(write_err) = self.write_all(&mut stream, &built.bytes).await {
+            if matches!(write_err, Error::ClientWriteTimeout(_)) {
+                return Err(write_err);
+            }
+            if let Ok((_code, hdr_buf)) = read_icap_headers(&mut stream).await
                 && let Ok(response_buf) = self
                     .read_response_buffer_with_headers(&mut stream, hdr_buf)
                     .await
             {
                 return self.finalize_response(stream, response_buf).await;
             }
-            return Err(write_err.into());
+            return Err(write_err);
         }
 
-        if let Err(flush_err) = AsyncWriteExt::flush(&mut stream).await {
-            if let Ok((_code, hdr_buf)) =
-                Self::with_timeout(self.inner.read_timeout, read_icap_headers(&mut stream)).await
+        if let Err(flush_err) = self.flush(&mut stream).await {
+            if matches!(flush_err, Error::ClientWriteTimeout(_)) {
+                return Err(flush_err);
+            }
+            if let Ok((_code, hdr_buf)) = read_icap_headers(&mut stream).await
                 && let Ok(response_buf) = self
                     .read_response_buffer_with_headers(&mut stream, hdr_buf)
                     .await
             {
                 return self.finalize_response(stream, response_buf).await;
             }
-            return Err(flush_err.into());
+            return Err(flush_err);
         }
 
         // OPTIONS: read headers + optional body, then parse, then decide reuse
@@ -150,18 +164,22 @@ impl Client {
 
         // Preview/100-continue negotiation
         if built.expect_continue {
-            let (code, hdr_buf) =
-                Self::with_timeout(self.inner.read_timeout, read_icap_headers(&mut stream)).await?;
+            let (code, hdr_buf) = Self::with_timeout_as(
+                self.continue_timeout(),
+                read_icap_headers(&mut stream),
+                Error::ClientContinueTimeout,
+            )
+            .await?;
 
             if code == 100 {
                 // send remaining body, then terminating chunk
                 if let Some(rest) = built.remaining_body
                     && !rest.is_empty()
                 {
-                    write_chunk(&mut stream, &rest).await?;
+                    self.write_chunk(&mut stream, &rest).await?;
                 }
-                AsyncWriteExt::write_all(&mut stream, b"0\r\n\r\n").await?;
-                AsyncWriteExt::flush(&mut stream).await?;
+                self.write_all(&mut stream, b"0\r\n\r\n").await?;
+                self.flush(&mut stream).await?;
 
                 // read final response
                 let response_buf = self.read_response_buffer(&mut stream).await?;
@@ -186,7 +204,7 @@ impl Client {
         file_path: P,
     ) -> IcapResult<ParsedResponse> {
         let file = TokioFile::open(file_path).await?;
-        self.send_streaming_reader(req, file).await
+        Box::pin(self.send_streaming_reader(req, file)).await
     }
 
     /// Send a request and stream body bytes from any `AsyncRead` source using ICAP chunked encoding.
@@ -198,6 +216,22 @@ impl Client {
         &self,
         req: &Request,
         mut reader: R,
+    ) -> IcapResult<ParsedResponse>
+    where
+        R: AsyncRead + Unpin + Send,
+    {
+        Box::pin(Self::with_timeout_as(
+            self.inner.timeouts.operation,
+            self.send_streaming_reader_inner(req, &mut reader),
+            Error::ClientTimeout,
+        ))
+        .await
+    }
+
+    async fn send_streaming_reader_inner<R>(
+        &self,
+        req: &Request,
+        reader: &mut R,
     ) -> IcapResult<ParsedResponse>
     where
         R: AsyncRead + Unpin + Send,
@@ -226,46 +260,50 @@ impl Client {
         }
 
         let built = self.build_icap_request_bytes(req, true, false, false)?;
-        AsyncWriteExt::write_all(&mut stream, &built.bytes).await?;
+        self.write_all(&mut stream, &built.bytes).await?;
 
         match req.preview_size {
             None => {
-                write_reader_chunks(&mut stream, &mut reader).await?;
-                AsyncWriteExt::write_all(&mut stream, b"0\r\n\r\n").await?;
-                AsyncWriteExt::flush(&mut stream).await?;
+                write_reader_chunks(&mut stream, reader, self.inner.timeouts.write).await?;
+                self.write_all(&mut stream, b"0\r\n\r\n").await?;
+                self.flush(&mut stream).await?;
 
                 let response_buf = self.read_response_buffer(&mut stream).await?;
                 return self.finalize_response(stream, response_buf).await;
             }
             Some(0) => {
                 if req.preview_ieof {
-                    AsyncWriteExt::write_all(&mut stream, b"0; ieof\r\n\r\n").await?;
+                    self.write_all(&mut stream, b"0; ieof\r\n\r\n").await?;
                 } else {
-                    AsyncWriteExt::write_all(&mut stream, b"0\r\n\r\n").await?;
+                    self.write_all(&mut stream, b"0\r\n\r\n").await?;
                 }
             }
             Some(preview_size) => {
-                let (preview, eof) = read_preview_bytes(&mut reader, preview_size).await?;
+                let (preview, eof) = read_preview_bytes(reader, preview_size).await?;
                 if !preview.is_empty() {
-                    write_chunk(&mut stream, &preview).await?;
+                    self.write_chunk(&mut stream, &preview).await?;
                 }
                 if eof {
-                    AsyncWriteExt::write_all(&mut stream, b"0; ieof\r\n\r\n").await?;
+                    self.write_all(&mut stream, b"0; ieof\r\n\r\n").await?;
                 } else {
-                    AsyncWriteExt::write_all(&mut stream, b"0\r\n\r\n").await?;
+                    self.write_all(&mut stream, b"0\r\n\r\n").await?;
                 }
             }
         }
-        AsyncWriteExt::flush(&mut stream).await?;
+        self.flush(&mut stream).await?;
 
         // Read server decision (100 Continue or final)
-        let (code, hdr_buf) =
-            Self::with_timeout(self.inner.read_timeout, read_icap_headers(&mut stream)).await?;
+        let (code, hdr_buf) = Self::with_timeout_as(
+            self.continue_timeout(),
+            read_icap_headers(&mut stream),
+            Error::ClientContinueTimeout,
+        )
+        .await?;
 
         if code == 100 {
-            write_reader_chunks(&mut stream, &mut reader).await?;
-            AsyncWriteExt::write_all(&mut stream, b"0\r\n\r\n").await?;
-            AsyncWriteExt::flush(&mut stream).await?;
+            write_reader_chunks(&mut stream, reader, self.inner.timeouts.write).await?;
+            self.write_all(&mut stream, b"0\r\n\r\n").await?;
+            self.flush(&mut stream).await?;
 
             // read final response
             let response_buf = self.read_response_buffer(&mut stream).await?;
@@ -305,27 +343,73 @@ impl Client {
         Ok(out)
     }
 
-    async fn with_timeout<T, F>(dur: Option<Duration>, fut: F) -> Result<T, Error>
+    async fn with_timeout_as<T, F>(
+        dur: Option<Duration>,
+        fut: F,
+        timeout_error: fn(Duration) -> Error,
+    ) -> Result<T, Error>
     where
         F: std::future::Future<Output = Result<T, Error>>,
     {
         if let Some(timeout_duration) = dur {
             timeout(timeout_duration, fut)
                 .await
-                .unwrap_or_else(|_| Err(Error::ClientTimeout(timeout_duration)))
+                .unwrap_or_else(|_| Err(timeout_error(timeout_duration)))
         } else {
             fut.await
         }
     }
 
-    async fn read_response_buffer(&self, stream: &mut Conn) -> IcapResult<Vec<u8>> {
-        let (_code, mut response_buf) =
-            Self::with_timeout(self.inner.read_timeout, read_icap_headers(stream)).await?;
-        Self::with_timeout(
-            self.inner.read_timeout,
-            read_icap_body_if_any(stream, &mut response_buf),
+    async fn with_io_timeout<T, F>(
+        dur: Option<Duration>,
+        fut: F,
+        timeout_error: fn(Duration) -> Error,
+    ) -> IcapResult<T>
+    where
+        F: std::future::Future<Output = std::io::Result<T>>,
+    {
+        Self::with_timeout_as(
+            dur,
+            async { fut.await.map_err(Error::Network) },
+            timeout_error,
         )
-        .await?;
+        .await
+    }
+
+    async fn write_all(&self, stream: &mut Conn, bytes: &[u8]) -> IcapResult<()> {
+        Self::with_io_timeout(
+            self.inner.timeouts.write,
+            AsyncWriteExt::write_all(stream, bytes),
+            Error::ClientWriteTimeout,
+        )
+        .await
+    }
+
+    async fn flush(&self, stream: &mut Conn) -> IcapResult<()> {
+        Self::with_io_timeout(
+            self.inner.timeouts.write,
+            AsyncWriteExt::flush(stream),
+            Error::ClientWriteTimeout,
+        )
+        .await
+    }
+
+    async fn write_chunk(&self, stream: &mut Conn, bytes: &[u8]) -> IcapResult<()> {
+        Self::with_timeout_as(
+            self.inner.timeouts.write,
+            write_chunk(stream, bytes),
+            Error::ClientWriteTimeout,
+        )
+        .await
+    }
+
+    fn continue_timeout(&self) -> Option<Duration> {
+        self.inner.timeouts.continue_after_preview
+    }
+
+    async fn read_response_buffer(&self, stream: &mut Conn) -> IcapResult<Vec<u8>> {
+        let (_code, mut response_buf) = read_icap_headers(stream).await?;
+        read_icap_body_if_any(stream, &mut response_buf).await?;
         Ok(response_buf)
     }
 
@@ -334,11 +418,7 @@ impl Client {
         stream: &mut Conn,
         mut response_buf: Vec<u8>,
     ) -> IcapResult<Vec<u8>> {
-        Self::with_timeout(
-            self.inner.read_timeout,
-            read_icap_body_if_any(stream, &mut response_buf),
-        )
-        .await?;
+        read_icap_body_if_any(stream, &mut response_buf).await?;
         Ok(response_buf)
     }
 
@@ -556,7 +636,16 @@ const fn request_has_non_empty_buffered_body(req: &Request) -> bool {
 
 impl ClientRef {
     async fn connect(&self) -> IcapResult<Conn> {
-        let tcp = TcpStream::connect((&*self.host, self.port)).await?;
+        let tcp = Client::with_timeout_as(
+            self.timeouts.connect,
+            async {
+                TcpStream::connect((&*self.host, self.port))
+                    .await
+                    .map_err(Error::Network)
+            },
+            Error::ClientConnectTimeout,
+        )
+        .await?;
 
         #[cfg(feature = "tls-rustls")]
         if let Some(tls) = &self.tls {
@@ -630,7 +719,11 @@ async fn read_until_double_crlf_from<S: AsyncRead + AsyncWrite + Unpin>(
     }
 }
 
-async fn write_reader_chunks<S, R>(stream: &mut S, reader: &mut R) -> IcapResult<()>
+async fn write_reader_chunks<S, R>(
+    stream: &mut S,
+    reader: &mut R,
+    write_timeout: Option<Duration>,
+) -> IcapResult<()>
 where
     S: AsyncWrite + Unpin,
     R: AsyncRead + Unpin,
@@ -641,7 +734,12 @@ where
         if n == 0 {
             return Ok(());
         }
-        write_chunk(stream, &buf[..n]).await?;
+        Client::with_timeout_as(
+            write_timeout,
+            write_chunk(stream, &buf[..n]),
+            Error::ClientWriteTimeout,
+        )
+        .await?;
     }
 }
 
@@ -1212,7 +1310,63 @@ mod tests {
             .try_user_agent("bad\r\nvalue")
             .expect_err("invalid header value should be rejected");
 
-        assert!(matches!(err, Error::Header(_)));
+        assert!(matches!(err, Error::HeaderValue(_)));
+    }
+
+    #[tokio::test]
+    async fn timeout_caps_whole_send_operation() {
+        let port = spawn_raw_icap_server(|mut stream| async move {
+            let _request = read_until_contains(&mut stream, b"\r\n\r\n").await;
+            let () = future::pending::<()>().await;
+        })
+        .await;
+
+        let client = Client::builder()
+            .host("127.0.0.1")
+            .port(port)
+            .timeout(Some(Duration::from_millis(50)))
+            .build();
+
+        let err = client
+            .send(&Request::options("scan"))
+            .await
+            .expect_err("operation timeout should fire");
+
+        assert!(matches!(err, Error::ClientTimeout(d) if d == Duration::from_millis(50)));
+    }
+
+    #[tokio::test]
+    async fn continue_timeout_applies_to_preview_decision() {
+        let port = spawn_raw_icap_server(|mut stream| async move {
+            let _preview = read_until_contains(&mut stream, b"0\r\n\r\n").await;
+            let () = future::pending::<()>().await;
+        })
+        .await;
+
+        let client = Client::builder()
+            .host("127.0.0.1")
+            .port(port)
+            .continue_timeout(Some(Duration::from_millis(50)))
+            .build();
+
+        let err = client
+            .send_streaming_reader(&streaming_req(Some(0)), &b"ABCDEFG"[..])
+            .await
+            .expect_err("continue timeout should fire");
+
+        assert!(matches!(err, Error::ClientContinueTimeout(d) if d == Duration::from_millis(50)));
+    }
+
+    #[tokio::test]
+    async fn write_timeout_applies_to_streaming_body_chunks() {
+        let (mut client, _server) = tokio::io::duplex(1);
+        let mut reader = tokio::io::repeat(0x61).take(1024 * 1024);
+
+        let err = write_reader_chunks(&mut client, &mut reader, Some(Duration::from_millis(50)))
+            .await
+            .expect_err("write timeout should fire");
+
+        assert!(matches!(err, Error::ClientWriteTimeout(d) if d == Duration::from_millis(50)));
     }
 
     #[rstest]

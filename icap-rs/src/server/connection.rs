@@ -1,11 +1,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use smallvec::SmallVec;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::time::timeout;
 use tracing::{trace, warn};
 
-use crate::error::IcapResult;
+use crate::error::{Error, IcapResult};
 use crate::protocol::{
     dechunk_icap_entity, dechunk_icap_entity_with_ieof, find_double_crlf,
     parse_encapsulated_header, parse_preview_header_value, read_chunked_to_end,
@@ -19,6 +21,59 @@ use crate::{Body, EmbeddedHttp, Method, Response, StatusCode};
 use super::Server;
 use super::preview::{PreviewDecision, mark_request_body_as_preview};
 use super::router::{RouteEntry, resolve_service};
+use super::timeouts::ServerTimeouts;
+
+async fn with_timeout_as<T, F>(
+    dur: Option<Duration>,
+    fut: F,
+    mk_err: fn(Duration) -> Error,
+) -> IcapResult<T>
+where
+    F: std::future::Future<Output = IcapResult<T>>,
+{
+    if let Some(d) = dur {
+        match timeout(d, fut).await {
+            Ok(res) => res,
+            Err(_) => Err(mk_err(d)),
+        }
+    } else {
+        fut.await
+    }
+}
+
+async fn write_all_with_timeout<S>(
+    socket: &mut S,
+    bytes: &[u8],
+    dur: Option<Duration>,
+) -> IcapResult<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    with_timeout_as(
+        dur,
+        async {
+            socket.write_all(bytes).await?;
+            Ok(())
+        },
+        Error::ServerWriteTimeout,
+    )
+    .await
+}
+
+async fn flush_with_timeout<S>(socket: &mut S, dur: Option<Duration>) -> IcapResult<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    with_timeout_as(
+        dur,
+        async {
+            socket.flush().await?;
+            Ok(())
+        },
+        Error::ServerWriteTimeout,
+    )
+    .await
+}
 impl Server {
     /// Handle a single client connection (persistent / keep-alive).
     ///
@@ -31,6 +86,7 @@ impl Server {
         default_service: Option<String>,
         advertised_max_conn: Option<usize>,
         request_parser_mode: RequestParserMode,
+        timeouts: ServerTimeouts,
         addr: std::net::SocketAddr,
     ) -> IcapResult<()>
     where
@@ -43,6 +99,12 @@ impl Server {
         let mut buf_start: usize = 0;
 
         loop {
+            // First read of each new request gets the idle keep-alive deadline
+            // (it may legitimately wait a long time on a kept-alive connection);
+            // subsequent reads of the same header block use the tighter
+            // header_read deadline.
+            let mut request_started = !(buf_start == buf.len());
+
             // === Read headers ===
             let h_end = loop {
                 if let Some(end) = find_double_crlf(&buf[buf_start..]) {
@@ -59,16 +121,44 @@ impl Server {
                     return Ok(());
                 }
 
-                let n = match socket.read(&mut tmp).await {
+                let (read_dur, mk_err): (Option<Duration>, fn(Duration) -> Error) =
+                    if request_started {
+                        (timeouts.header_read, Error::ServerHeaderReadTimeout)
+                    } else {
+                        (
+                            timeouts.idle_keepalive.or(timeouts.header_read),
+                            if timeouts.idle_keepalive.is_some() {
+                                Error::ServerIdleTimeout
+                            } else {
+                                Error::ServerHeaderReadTimeout
+                            },
+                        )
+                    };
+
+                let read_res = with_timeout_as(
+                    read_dur,
+                    async {
+                        socket
+                            .read(&mut tmp)
+                            .await
+                            .map_err(Error::Network)
+                    },
+                    mk_err,
+                )
+                .await;
+
+                let n = match read_res {
                     Ok(n) => n,
-                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    Err(Error::Network(e))
+                        if e.kind() == std::io::ErrorKind::UnexpectedEof =>
+                    {
                         return if buf_start == buf.len() {
                             Ok(())
                         } else {
                             Err("EOF before complete ICAP headers".into())
                         };
                     }
-                    Err(e) => return Err(e.into()),
+                    Err(e) => return Err(e),
                 };
 
                 if n == 0 {
@@ -79,6 +169,7 @@ impl Server {
                     };
                 }
                 buf.extend_from_slice(&tmp[..n]);
+                request_started = true;
             };
 
             // Parse header fields as &str — avoids a String allocation.
@@ -108,7 +199,17 @@ impl Server {
             if let Some(body_rel) = enc.req_body.or(enc.res_body) {
                 let body_abs = h_end + body_rel;
                 while buf.len() < body_abs {
-                    let n = socket.read(&mut tmp).await?;
+                    let n = with_timeout_as(
+                        timeouts.body_read,
+                        async {
+                            socket
+                                .read(&mut tmp)
+                                .await
+                                .map_err(Error::Network)
+                        },
+                        Error::ServerBodyReadTimeout,
+                    )
+                    .await?;
                     if n == 0 {
                         return Err("Unexpected EOF before start of ICAP body".into());
                     }
@@ -116,8 +217,14 @@ impl Server {
                 }
 
                 if preview_size.is_some() {
-                    let (preview_end, preview_ieof) =
-                        read_chunked_until_zero(&mut socket, &mut buf, body_abs).await?;
+                    let (preview_end, preview_ieof) = with_timeout_as(
+                        timeouts.body_read,
+                        async {
+                            read_chunked_until_zero(&mut socket, &mut buf, body_abs).await
+                        },
+                        Error::ServerBodyReadTimeout,
+                    )
+                    .await?;
 
                     let mut preview_slice = &buf[body_abs..preview_end];
                     let (mut decoded, _ieof_seen) =
@@ -177,7 +284,8 @@ impl Server {
                                         resp
                                     };
                                     let bytes = resp.to_raw()?;
-                                    socket.write_all(&bytes).await?;
+                                    write_all_with_timeout(&mut socket, &bytes, timeouts.write)
+                                        .await?;
                                     trace!(
                                         client = %addr,
                                         "Preview final response sent with status {}",
@@ -196,11 +304,22 @@ impl Server {
                             }
                         }
 
-                        socket.write_all(b"ICAP/1.0 100 Continue\r\n\r\n").await?;
-                        socket.flush().await?;
+                        write_all_with_timeout(
+                            &mut socket,
+                            b"ICAP/1.0 100 Continue\r\n\r\n",
+                            timeouts.write,
+                        )
+                        .await?;
+                        flush_with_timeout(&mut socket, timeouts.write).await?;
 
-                        let rest_end =
-                            read_chunked_to_end(&mut socket, &mut buf, preview_end).await?;
+                        let rest_end = with_timeout_as(
+                            timeouts.body_read,
+                            async {
+                                read_chunked_to_end(&mut socket, &mut buf, preview_end).await
+                            },
+                            Error::ServerBodyReadTimeout,
+                        )
+                        .await?;
                         let mut rest_slice = &buf[preview_end..rest_end];
                         let (rest_decoded, _) = dechunk_icap_entity_with_ieof(&mut rest_slice)
                             .map_err(|e| format!("dechunk ICAP remainder entity: {e}"))?;
@@ -212,7 +331,14 @@ impl Server {
                     buf.splice(body_abs..msg_end, decoded);
                     msg_end = body_abs + decoded_len;
                 } else {
-                    msg_end = read_chunked_to_end(&mut socket, &mut buf, body_abs).await?;
+                    msg_end = with_timeout_as(
+                        timeouts.body_read,
+                        async {
+                            read_chunked_to_end(&mut socket, &mut buf, body_abs).await
+                        },
+                        Error::ServerBodyReadTimeout,
+                    )
+                    .await?;
                     if msg_end > body_abs {
                         let mut chunked_slice = &buf[body_abs..msg_end];
                         let decoded = dechunk_icap_entity(&mut chunked_slice)
@@ -225,7 +351,17 @@ impl Server {
             } else if let Some(end_rel) = enc.null_body {
                 let end_abs = h_end + end_rel;
                 while buf.len() < end_abs {
-                    let n = socket.read(&mut tmp).await?;
+                    let n = with_timeout_as(
+                        timeouts.body_read,
+                        async {
+                            socket
+                                .read(&mut tmp)
+                                .await
+                                .map_err(Error::Network)
+                        },
+                        Error::ServerBodyReadTimeout,
+                    )
+                    .await?;
                     if n == 0 {
                         return Err("Unexpected EOF before null-body boundary".into());
                     }
@@ -370,7 +506,7 @@ impl Server {
             };
 
             let bytes = resp.to_raw()?;
-            socket.write_all(&bytes).await?;
+            write_all_with_timeout(&mut socket, &bytes, timeouts.write).await?;
             trace!(
                 client = %addr,
                 "Response sent with status {}",

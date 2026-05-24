@@ -159,7 +159,7 @@ async fn fast_204_handler(_req: IncomingRequest) -> IcapResult<Response> {
 
 fn tls_client(port: u16, keep_alive: bool) -> Client {
     let tls = ClientTlsConfig::with_native_roots()
-        .add_root_ca_pem(test_data_path(CA_PEM))
+        .add_root_ca_pem_file(test_data_path(CA_PEM))
         .expect("load benchmark CA")
         .with_sni("localhost");
 

@@ -4,7 +4,7 @@
 //! can distinguish PEM problems from connection-level network failures.
 
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufReader, Cursor};
 use std::path::Path;
 
 use rustls::RootCertStore;
@@ -16,11 +16,28 @@ use super::error::TlsError;
 pub(crate) fn load_cert_chain(path: &Path) -> Result<Vec<CertificateDer<'static>>, TlsError> {
     let file = File::open(path).map_err(|e| TlsError::pem_io(path, e))?;
     let mut reader = BufReader::new(file);
-    let certs = rustls_pemfile::certs(&mut reader)
+    parse_cert_chain_reader(path.display().to_string(), &mut reader)
+}
+
+/// Parse a certificate chain (leaf first, intermediates after) from PEM bytes.
+pub(crate) fn parse_cert_chain(
+    source: impl Into<String>,
+    pem: impl AsRef<[u8]>,
+) -> Result<Vec<CertificateDer<'static>>, TlsError> {
+    let mut reader = Cursor::new(pem.as_ref());
+    parse_cert_chain_reader(source, &mut reader)
+}
+
+fn parse_cert_chain_reader(
+    source: impl Into<String>,
+    reader: &mut impl std::io::BufRead,
+) -> Result<Vec<CertificateDer<'static>>, TlsError> {
+    let source = source.into();
+    let certs = rustls_pemfile::certs(reader)
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| TlsError::pem_parse(path, e.to_string()))?;
+        .map_err(|e| TlsError::pem_parse(&source, e.to_string()))?;
     if certs.is_empty() {
-        return Err(TlsError::pem_parse(path, "no certificates found"));
+        return Err(TlsError::pem_parse(source, "no certificates found"));
     }
     Ok(certs)
 }
@@ -32,9 +49,26 @@ pub(crate) fn load_cert_chain(path: &Path) -> Result<Vec<CertificateDer<'static>
 pub(crate) fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>, TlsError> {
     let file = File::open(path).map_err(|e| TlsError::pem_io(path, e))?;
     let mut reader = BufReader::new(file);
-    let key = rustls_pemfile::private_key(&mut reader)
-        .map_err(|e| TlsError::pem_parse(path, e.to_string()))?;
-    key.ok_or_else(|| TlsError::NoPrivateKey(path.to_path_buf()))
+    parse_private_key_reader(path.display().to_string(), &mut reader)
+}
+
+/// Parse a single private key from PEM bytes.
+pub(crate) fn parse_private_key(
+    source: impl Into<String>,
+    pem: impl AsRef<[u8]>,
+) -> Result<PrivateKeyDer<'static>, TlsError> {
+    let mut reader = Cursor::new(pem.as_ref());
+    parse_private_key_reader(source, &mut reader)
+}
+
+fn parse_private_key_reader(
+    source: impl Into<String>,
+    reader: &mut impl std::io::BufRead,
+) -> Result<PrivateKeyDer<'static>, TlsError> {
+    let source = source.into();
+    let key = rustls_pemfile::private_key(reader)
+        .map_err(|e| TlsError::pem_parse(&source, e.to_string()))?;
+    key.ok_or_else(|| TlsError::NoPrivateKey(source.into()))
 }
 
 /// Load certificates from a PEM file and add them as trust roots.
@@ -43,11 +77,31 @@ pub(crate) fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>, Tl
 /// custom trust roots.
 pub(crate) fn load_roots_into(store: &mut RootCertStore, path: &Path) -> Result<usize, TlsError> {
     let certs = load_cert_chain(path)?;
+    let source = path.display().to_string();
+    add_roots(store, &source, certs)
+}
+
+/// Parse certificates from PEM bytes and add them as trust roots.
+pub(crate) fn parse_roots_into(
+    store: &mut RootCertStore,
+    source: impl Into<String>,
+    pem: impl AsRef<[u8]>,
+) -> Result<usize, TlsError> {
+    let source = source.into();
+    let certs = parse_cert_chain(&source, pem)?;
+    add_roots(store, &source, certs)
+}
+
+fn add_roots(
+    store: &mut RootCertStore,
+    source: &str,
+    certs: Vec<CertificateDer<'static>>,
+) -> Result<usize, TlsError> {
     let mut added = 0usize;
     for cert in certs {
         store
             .add(cert)
-            .map_err(|e| TlsError::ConfigBuild(format!("add CA from {}: {e}", path.display())))?;
+            .map_err(|e| TlsError::ConfigBuild(format!("add CA from {source}: {e}")))?;
         added += 1;
     }
     Ok(added)

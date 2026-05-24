@@ -5,11 +5,9 @@
 //! - [`IcapResult<T>`]: a convenient alias for `Result<T, Error>`.
 //! - [`ToIcapResult`]: a helper trait for converting generic `Result` into `IcapResult`.
 //!
-//! It covers network errors, parsing/serialization, configuration issues, and unexpected failures.
+//! It covers network errors, parsing/serialization, configuration issues, typed
+//! HTTP helper errors, and unexpected failures.
 use http::header::{InvalidHeaderName, InvalidHeaderValue};
-use http::method::InvalidMethod;
-use http::status::InvalidStatusCode;
-use http::uri::{InvalidUri, InvalidUriParts};
 use http::{Error as HttpError, header::ToStrError};
 use std::error::Error as StdError;
 use std::str::Utf8Error;
@@ -20,14 +18,43 @@ use thiserror::Error;
 /// It covers network issues, parsing/serialization errors, invalid protocol fields,
 /// configuration/service/handler failures, and unexpected runtime errors.
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum Error {
     /// Network-level error (TCP connection, timeout, etc.).
     #[error("Network error: {0}")]
     Network(#[from] std::io::Error),
 
-    /// Client Timeout
+    /// The whole client operation exceeded the configured timeout.
     #[error("Client timeout after {0:?}")]
     ClientTimeout(Duration),
+
+    /// The client could not establish a TCP connection within the configured timeout.
+    #[error("Client TCP connect timeout after {0:?}")]
+    ClientConnectTimeout(Duration),
+
+    /// The client could not write request bytes within the configured timeout.
+    #[error("Client write timeout after {0:?}")]
+    ClientWriteTimeout(Duration),
+
+    /// The server did not send `100 Continue` or an early final response in time.
+    #[error("Client continue timeout after {0:?}")]
+    ClientContinueTimeout(Duration),
+
+    /// The server did not finish reading request headers in time.
+    #[error("Server header read timeout after {0:?}")]
+    ServerHeaderReadTimeout(Duration),
+
+    /// The server did not finish reading the request body in time.
+    #[error("Server body read timeout after {0:?}")]
+    ServerBodyReadTimeout(Duration),
+
+    /// The server could not write response bytes within the configured timeout.
+    #[error("Server write timeout after {0:?}")]
+    ServerWriteTimeout(Duration),
+
+    /// A kept-alive client did not send the next request before idle expiry.
+    #[error("Server idle keep-alive timeout after {0:?}")]
+    ServerIdleTimeout(Duration),
 
     /// The peer closed the connection before a complete ICAP header block
     /// was received (no terminating `CRLFCRLF`).
@@ -36,6 +63,14 @@ pub enum Error {
     /// incomplete response.
     #[error("Peer closed before ICAP headers")]
     EarlyCloseWithoutHeaders,
+
+    /// Invalid UTF-8 in wire data.
+    #[error("UTF-8 error: {0}")]
+    Utf8(#[from] Utf8Error),
+
+    /// Invalid UTF-8 while converting owned bytes into text.
+    #[error("UTF-8 conversion error: {0}")]
+    FromUtf8(#[from] FromUtf8Error),
 
     /// Failed to parse an ICAP message.
     #[error("ICAP parsing error: {0}")]
@@ -64,6 +99,18 @@ pub enum Error {
     /// Invalid `ISTag` header
     #[error("Invalid ISTag: {0}")]
     InvalidISTag(String),
+
+    /// Invalid HTTP header name.
+    #[error("Invalid HTTP header name: {0}")]
+    HeaderName(#[from] InvalidHeaderName),
+
+    /// Invalid HTTP header value.
+    #[error("Invalid HTTP header value: {0}")]
+    HeaderValue(#[from] InvalidHeaderValue),
+
+    /// HTTP header value could not be represented as text.
+    #[error("Invalid HTTP header text: {0}")]
+    HeaderToStr(#[from] ToStrError),
 
     /// Missing required ICAP header
     #[error("Missing required header: {0}")]
@@ -96,6 +143,20 @@ pub enum Error {
     /// Unexpected/unclassified error.
     #[error("Unexpected error: {0}")]
     Unexpected(String),
+
+    /// Error from an external helper converted through [`ToIcapResult`].
+    #[error("External error: {message}")]
+    External {
+        /// Human-readable error message.
+        message: String,
+        /// Original source error.
+        #[source]
+        source: Box<dyn StdError + Send + Sync + 'static>,
+    },
+
+    /// Error returned by the `http` crate builders.
+    #[error("HTTP builder error: {0}")]
+    Http(#[from] HttpError),
 
     /// TLS-layer error (handshake, certificate verification, PEM loading…).
     ///
@@ -175,8 +236,10 @@ pub type IcapResult<T> = Result<T, Error>;
 
 /// Converts a generic `Result<T, E>` into an `IcapResult<T>`.
 ///
-/// Any error is wrapped into [`Error::Unexpected`].
+/// Any error is wrapped into [`Error::External`] with the original source
+/// preserved for callers that inspect the error chain.
 pub trait ToIcapResult<T> {
+    /// Convert the result into this crate's error type.
     fn to_icap_result(self) -> IcapResult<T>;
 }
 
@@ -185,57 +248,55 @@ where
     E: StdError + Send + Sync + 'static,
 {
     fn to_icap_result(self) -> IcapResult<T> {
-        self.map_err(|e| Error::Unexpected(e.to_string()))
+        self.map_err(|e| Error::External {
+            message: e.to_string(),
+            source: Box::new(e),
+        })
     }
 }
 
-impl From<Utf8Error> for Error {
-    fn from(e: Utf8Error) -> Self {
-        Self::HttpParse(e.to_string())
+#[cfg(test)]
+mod tests {
+    use super::{Error, IcapResult, ToIcapResult};
+    use std::error::Error as StdError;
+
+    #[test]
+    fn header_value_conversion_preserves_source_error() {
+        let err: Error = http::HeaderValue::from_str("bad\r\nvalue")
+            .expect_err("header value must be rejected")
+            .into();
+
+        assert!(matches!(err, Error::HeaderValue(_)));
+        assert!(StdError::source(&err).is_some());
     }
-}
-impl From<FromUtf8Error> for Error {
-    fn from(e: FromUtf8Error) -> Self {
-        Self::HttpParse(e.to_string())
+
+    #[test]
+    fn http_builder_conversion_preserves_source_error() {
+        let err: Error = http::Request::builder()
+            .method("bad method")
+            .body(())
+            .expect_err("invalid method must be rejected")
+            .into();
+
+        assert!(matches!(err, Error::Http(_)));
+        assert!(StdError::source(&err).is_some());
     }
-}
-impl From<InvalidHeaderName> for Error {
-    fn from(e: InvalidHeaderName) -> Self {
-        Self::Header(e.to_string())
+
+    #[test]
+    fn to_icap_result_preserves_external_source_error() {
+        let result: Result<(), std::io::Error> = Err(std::io::Error::other("external"));
+        let err = result.to_icap_result().expect_err("external error");
+
+        assert!(matches!(err, Error::External { .. }));
+        assert!(StdError::source(&err).is_some());
     }
-}
-impl From<InvalidHeaderValue> for Error {
-    fn from(e: InvalidHeaderValue) -> Self {
-        Self::Header(e.to_string())
-    }
-}
-impl From<ToStrError> for Error {
-    fn from(e: ToStrError) -> Self {
-        Self::Header(e.to_string())
-    }
-}
-impl From<InvalidUri> for Error {
-    fn from(e: InvalidUri) -> Self {
-        Self::InvalidUri(e.to_string())
-    }
-}
-impl From<InvalidUriParts> for Error {
-    fn from(e: InvalidUriParts) -> Self {
-        Self::InvalidUri(e.to_string())
-    }
-}
-impl From<InvalidMethod> for Error {
-    fn from(e: InvalidMethod) -> Self {
-        Self::InvalidMethod(e.to_string())
-    }
-}
-impl From<InvalidStatusCode> for Error {
-    fn from(e: InvalidStatusCode) -> Self {
-        Self::InvalidStatusCode(e.to_string())
-    }
-}
-impl From<HttpError> for Error {
-    fn from(e: HttpError) -> Self {
-        Self::Unexpected(e.to_string())
+
+    #[test]
+    fn icap_result_alias_uses_crate_error() {
+        fn returns_alias() -> IcapResult<()> {
+            Err(Error::parse("bad message"))
+        }
+
+        assert!(matches!(returns_alias(), Err(Error::Parse(_))));
     }
 }

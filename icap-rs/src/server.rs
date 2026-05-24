@@ -62,9 +62,11 @@ mod no_modification;
 pub mod options;
 mod preview;
 mod router;
+pub mod timeouts;
 pub use builder::ServerBuilder;
 pub use preview::PreviewDecision;
 pub use router::RouteOutput;
+pub use timeouts::ServerTimeouts;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -122,6 +124,7 @@ pub struct Server {
     aliases: Arc<HashMap<String, String>>,
     default_service: Option<String>,
     request_parser_mode: RequestParserMode,
+    timeouts: ServerTimeouts,
     #[cfg(feature = "tls-rustls")]
     tls: Option<(TlsAcceptor, Duration)>,
 }
@@ -170,6 +173,7 @@ impl Server {
             let default_service = self.default_service.clone();
             let advertised_max = self.advertised_max_conn;
             let request_parser_mode = self.request_parser_mode;
+            let timeouts = self.timeouts.clone();
 
             #[cfg(feature = "tls-rustls")]
             let tls = self.tls.clone();
@@ -218,6 +222,7 @@ impl Server {
                                 default_service,
                                 advertised_max,
                                 request_parser_mode,
+                                timeouts,
                                 addr,
                             ))
                             .await
@@ -247,6 +252,7 @@ impl Server {
                     default_service,
                     advertised_max,
                     request_parser_mode,
+                    timeouts,
                     addr,
                 ))
                 .await

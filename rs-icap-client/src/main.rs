@@ -74,9 +74,21 @@ struct Args {
     #[arg(short = 'o', long)]
     output: Option<String>,
 
-    /// Read timeout in seconds (client-side). Default: no timeout (like c-icap-client).
+    /// Total timeout in seconds for one ICAP operation. Default: no timeout.
     #[arg(short, long)]
     timeout: Option<u64>,
+
+    /// TCP connect timeout in seconds. Default: no timeout.
+    #[arg(long = "connect-timeout")]
+    connect_timeout: Option<u64>,
+
+    /// Network write timeout in seconds. Default: no timeout.
+    #[arg(long = "write-timeout")]
+    write_timeout: Option<u64>,
+
+    /// Timeout in seconds while waiting for `100 Continue` or an early final response.
+    #[arg(long = "continue-timeout")]
+    continue_timeout: Option<u64>,
 
     /// ICAP method: `OPTIONS|REQMOD|RESPMOD`.
     #[arg(short, long)]
@@ -144,6 +156,10 @@ struct Args {
     #[arg(long = "sni", value_name = "HOSTNAME")]
     sni: Option<String>,
 
+    /// TLS handshake timeout in seconds (used with TLS; ignored for `icap://`).
+    #[arg(long = "tls-handshake-timeout")]
+    tls_handshake_timeout: Option<u64>,
+
     /// Force `Preview: N` explicitly (advanced). If not set, negotiated via OPTIONS.
     #[arg(short = 'w', long)]
     preview_size: Option<usize>,
@@ -188,6 +204,9 @@ fn apply_tls_args(
         if args.sni.is_some() {
             eprintln!("Note: --sni is ignored for icap:// (TLS is off).");
         }
+        if args.tls_handshake_timeout.is_some() {
+            eprintln!("Note: --tls-handshake-timeout is ignored for icap:// (TLS is off).");
+        }
         if args.tls_ca.is_some() {
             eprintln!("Note: --tls-ca is ignored for icap:// (TLS is off).");
         }
@@ -202,13 +221,16 @@ fn apply_tls_args(
 
     let mut tls = ClientTlsConfig::with_native_roots();
     if let Some(pem) = &args.tls_ca {
-        tls = tls.add_root_ca_pem(pem)?;
+        tls = tls.add_root_ca_pem_file(pem)?;
     }
     if let (Some(cert), Some(key)) = (&args.tls_cert, &args.tls_key) {
-        tls = tls.with_client_auth_pem(cert, key)?;
+        tls = tls.with_client_auth_pem_files(cert, key)?;
     }
     if let Some(sni) = &args.sni {
         tls = tls.with_sni(sni);
+    }
+    if let Some(secs) = args.tls_handshake_timeout {
+        tls = tls.with_handshake_timeout(Duration::from_secs(secs));
     }
     if args.insecure {
         // Mirrors c-icap-client `-tls-no-verify`. Logged at WARN.
@@ -236,6 +258,10 @@ fn apply_tls_args(
         ("--tls-cert", args.tls_cert.is_some()),
         ("--tls-key", args.tls_key.is_some()),
         ("--sni", args.sni.is_some()),
+        (
+            "--tls-handshake-timeout",
+            args.tls_handshake_timeout.is_some(),
+        ),
         ("--insecure", args.insecure),
     ] {
         if set {
@@ -298,7 +324,10 @@ async fn main() -> IcapResult<()> {
     let builder = apply_tls_args(builder, &args, is_tls_uri)?;
 
     let client = builder
-        .read_timeout(args.timeout.map(Duration::from_secs))
+        .timeout(args.timeout.map(Duration::from_secs))
+        .connect_timeout(args.connect_timeout.map(Duration::from_secs))
+        .write_timeout(args.write_timeout.map(Duration::from_secs))
+        .continue_timeout(args.continue_timeout.map(Duration::from_secs))
         .user_agent(&ua)
         .build();
     let service = service_from_uri(&args.uri).unwrap_or_else(|| "/".to_string());

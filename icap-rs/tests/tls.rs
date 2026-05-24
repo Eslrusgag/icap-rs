@@ -198,10 +198,6 @@ fn unwrap_tls(err: &Error) -> &TlsError {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn icaps_handshake_success_with_custom_ca() {
     // RFC 3507 is silent on TLS — this validates the ICAPS convention.
@@ -213,7 +209,42 @@ async fn icaps_handshake_success_with_custom_ca() {
     let (addr, _server) = spawn_server(server_tls).await;
 
     let client_tls = ClientTlsConfig::empty()
-        .add_root_ca_pem(&pki.ca_pem_path)
+        .add_root_ca_pem_file(&pki.ca_pem_path)
+        .expect("add ca")
+        .with_sni("localhost");
+    let client = Client::builder()
+        .with_uri(&format!("icaps://localhost:{}/scan", addr.port()))
+        .expect("uri")
+        .with_tls(client_tls)
+        .build();
+
+    let resp = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.send(&Request::options("scan")),
+    )
+    .await
+    .expect("handshake completes")
+    .expect("ICAPS OPTIONS succeeds");
+    assert_eq!(resp.status_code().as_u16(), 200);
+}
+
+#[tokio::test]
+async fn icaps_handshake_success_with_inline_pem_data() {
+    // Certificates may come from memory/config stores; file paths are only a
+    // convenience layer over the PEM-content API.
+    let pki = TestPki::new("localhost");
+    let server_cert_pem =
+        std::fs::read_to_string(&pki.server_cert_pem_path).expect("read server cert");
+    let server_key_pem =
+        std::fs::read_to_string(&pki.server_key_pem_path).expect("read server key");
+    let ca_pem = std::fs::read_to_string(&pki.ca_pem_path).expect("read ca");
+
+    let server_tls = ServerTlsConfig::from_pem(server_cert_pem.as_str(), server_key_pem.as_str())
+        .expect("server tls");
+    let (addr, _server) = spawn_server(server_tls).await;
+
+    let client_tls = ClientTlsConfig::empty()
+        .add_root_ca_pem(ca_pem.as_str())
         .expect("add ca")
         .with_sni("localhost");
     let client = Client::builder()
@@ -273,7 +304,7 @@ async fn icaps_invalid_sni_is_rejected_before_connect() {
 
     // SNI containing characters not allowed in DNS names.
     let client_tls = ClientTlsConfig::empty()
-        .add_root_ca_pem(&pki.ca_pem_path)
+        .add_root_ca_pem_file(&pki.ca_pem_path)
         .expect("add ca")
         .with_sni("not a valid !! sni");
     let client = Client::builder()
@@ -340,14 +371,14 @@ async fn icaps_mtls_accepts_valid_client_cert() {
     let server_tls =
         ServerTlsConfig::from_pem_files(&pki.server_cert_pem_path, &pki.server_key_pem_path)
             .expect("server tls")
-            .with_client_auth_pem(&pki.ca_pem_path)
+            .with_client_auth_pem_file(&pki.ca_pem_path)
             .expect("require client auth");
     let (addr, _server) = spawn_server(server_tls).await;
 
     let client_tls = ClientTlsConfig::empty()
-        .add_root_ca_pem(&pki.ca_pem_path)
+        .add_root_ca_pem_file(&pki.ca_pem_path)
         .expect("add ca")
-        .with_client_auth_pem(
+        .with_client_auth_pem_files(
             pki.client_cert_pem_path.as_ref().unwrap(),
             pki.client_key_pem_path.as_ref().unwrap(),
         )
@@ -375,13 +406,13 @@ async fn icaps_mtls_rejects_missing_client_cert() {
     let server_tls =
         ServerTlsConfig::from_pem_files(&pki.server_cert_pem_path, &pki.server_key_pem_path)
             .expect("server tls")
-            .with_client_auth_pem(&pki.ca_pem_path)
+            .with_client_auth_pem_file(&pki.ca_pem_path)
             .expect("require client auth");
     let (addr, _server) = spawn_server(server_tls).await;
 
     // Client does NOT present a certificate.
     let client_tls = ClientTlsConfig::empty()
-        .add_root_ca_pem(&pki.ca_pem_path)
+        .add_root_ca_pem_file(&pki.ca_pem_path)
         .expect("add ca")
         .with_sni("localhost");
     let client = Client::builder()

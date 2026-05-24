@@ -77,7 +77,8 @@ pub fn parse_http_request_start_line(start: &str) -> IcapResult<(HttpMethod, &st
     }
 
     Ok((
-        HttpMethod::from_str(method)?,
+        HttpMethod::from_str(method)
+            .map_err(|err| Error::http_parse(format!("invalid embedded HTTP method: {err}")))?,
         uri,
         parse_http_version(version)?,
     ))
@@ -101,7 +102,10 @@ pub fn parse_http_response_start_line(start: &str) -> IcapResult<(Version, HttpS
         .parse::<u16>()
         .map_err(|_| Error::http_parse(format!("invalid embedded HTTP status code: {status}")))?;
 
-    Ok((parse_http_version(version)?, HttpStatus::from_u16(status)?))
+    let status = HttpStatus::from_u16(status)
+        .map_err(|err| Error::http_parse(format!("invalid embedded HTTP status code: {err}")))?;
+
+    Ok((parse_http_version(version)?, status))
 }
 
 pub fn parse_http_version(version: &str) -> IcapResult<Version> {

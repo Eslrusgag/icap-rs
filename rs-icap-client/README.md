@@ -45,8 +45,13 @@ rs-icap-client [OPTIONS]
   `icap://host[:port]/service` or `icaps://host[:port]/service`.
   Default: `icap://127.0.0.1:1344/`.
 - `-m, --method <METHOD>`: ICAP method: `OPTIONS`, `REQMOD`, or `RESPMOD`.
-- `-t, --timeout <SECS>`: client read timeout in seconds. By default no read
-  timeout is applied.
+- `-t, --timeout <SECS>`: total timeout for one ICAP operation. By default no
+  total timeout is applied.
+- `--connect-timeout <SECS>`: TCP connect timeout in seconds.
+- `--write-timeout <SECS>`: network write timeout in seconds for request
+  headers, preview markers, body chunks, and flushes.
+- `--continue-timeout <SECS>`: timeout while waiting for `100 Continue` or an
+  early final response during Preview negotiation.
 - `-d, --debug-level <LEVEL>`: enable logs, where higher values are more
   verbose.
 
@@ -80,11 +85,13 @@ rs-icap-client [OPTIONS]
 
 These options are effective only for `icaps://` URIs.
 
-- `--tls-backend rustls`: select the Rustls backend.
 - `--tls-ca <PEM_FILE>`: add an extra CA bundle to the Rustls trust store.
+- `--tls-cert <PEM_FILE>` and `--tls-key <PEM_FILE>`: present a client
+  certificate and private key for mutual TLS.
 - `--sni <HOSTNAME>`: override SNI and certificate verification name.
-- `--insecure`: compatibility flag. With Rustls 0.23 it is ignored; certificate
-  verification is not disabled.
+- `--tls-handshake-timeout <SECS>`: TLS handshake timeout in seconds.
+- `--insecure`: disable server certificate verification. This is intended only
+  for local testing against self-signed deployments.
 
 ### Output and Debugging
 

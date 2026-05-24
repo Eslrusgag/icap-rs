@@ -8,6 +8,7 @@ use tokio::sync::Semaphore;
 
 use crate::error::IcapResult;
 use crate::request::{IncomingRequest, RequestParserMode};
+use crate::server::timeouts::ServerTimeouts;
 #[cfg(feature = "tls-rustls")]
 use crate::tls::ServerTlsConfig;
 use crate::{Method, ServiceOptions};
@@ -30,6 +31,7 @@ pub struct ServerBuilder {
     aliases: HashMap<String, String>,
     default_service: Option<String>,
     request_parser_mode: RequestParserMode,
+    timeouts: ServerTimeouts,
     #[cfg(feature = "tls-rustls")]
     tls: Option<ServerTlsConfig>,
 }
@@ -92,6 +94,16 @@ impl ServerBuilder {
     /// not explicitly configured on the per-service options.
     pub fn with_max_connections(mut self, n: usize) -> Self {
         self.max_connections_global = Some(n.max(1));
+        self
+    }
+
+    /// Install a full [`ServerTimeouts`] configuration in one shot.
+    ///
+    /// See [`ServerTimeouts`] for the meaning of each field. Defaults are
+    /// `None` (no timeout); fields not set on the supplied value disable the
+    /// corresponding deadline.
+    pub fn with_timeouts(mut self, timeouts: ServerTimeouts) -> Self {
+        self.timeouts = timeouts;
         self
     }
 
@@ -271,6 +283,7 @@ impl ServerBuilder {
             aliases: Arc::new(self.aliases),
             default_service: self.default_service,
             request_parser_mode: self.request_parser_mode,
+            timeouts: self.timeouts,
 
             #[cfg(feature = "tls-rustls")]
             tls,

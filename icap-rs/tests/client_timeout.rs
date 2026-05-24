@@ -63,7 +63,7 @@ pub async fn spawn_slow_icap_server(
 async fn do_options_once(uri: &str, timeout_secs: Option<u64>) -> IcapResult<ParsedResponse> {
     let client = Client::builder()
         .with_uri(uri)?
-        .read_timeout(timeout_secs.map(Duration::from_secs))
+        .timeout(timeout_secs.map(Duration::from_secs))
         .build();
     let req = Request::options("/");
     client.send(&req).await

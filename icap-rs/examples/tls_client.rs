@@ -22,7 +22,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .body(r#"{"name":"John Doe","email":"john@example.com"}"#.as_bytes().to_vec())?;
 
     let tls = ClientTlsConfig::with_native_roots()
-        .add_root_ca_pem(CA_PEM_PATH)?
+        .add_root_ca_pem_file(CA_PEM_PATH)?
         .with_sni("localhost");
 
     let client = Client::builder()

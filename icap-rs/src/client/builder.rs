@@ -1,3 +1,4 @@
+use crate::client::timeouts::ClientTimeouts;
 use crate::client::{Client, ClientRef, parse_authority_with_scheme};
 #[cfg(feature = "tls-rustls")]
 use crate::tls::ClientTlsConfig;
@@ -19,12 +20,13 @@ pub enum ConnectionPolicy {
 }
 
 /// Builder for [`Client`]. Use it to configure host/port, headers, keep-alive,
-/// read timeouts, and other options before creating a client instance.
+/// timeouts, and other options before creating a client instance.
 ///
 /// By default:
 /// - `ConnectionPolicy` is `Close`;
 /// - no host/port are set until you call [`ClientBuilder::host`] / [`ClientBuilder::port`]
 ///   or [`ClientBuilder::with_uri`].
+/// - no operation timeouts are applied unless configured explicitly.
 #[derive(Debug, Default)]
 #[must_use]
 pub struct ClientBuilder {
@@ -33,7 +35,7 @@ pub struct ClientBuilder {
     host_override: Option<String>,
     default_headers: HeaderMap,
     connection_policy: ConnectionPolicy,
-    read_timeout: Option<Duration>,
+    timeouts: ClientTimeouts,
 
     // TLS state. `tls` is the user-supplied config (explicit `with_tls`),
     // `auto_tls` records whether `with_uri("icaps://...")` requested TLS.
@@ -127,11 +129,59 @@ impl ClientBuilder {
         self
     }
 
-    /// Set a read timeout for network operations.
+    /// Install a full [`ClientTimeouts`] configuration in one shot.
     ///
-    /// If `None`, operations have no explicit read timeout and rely on OS defaults.
-    pub const fn read_timeout(mut self, dur: Option<Duration>) -> Self {
-        self.read_timeout = dur;
+    /// Replaces any per-field timeouts set via [`Self::timeout`],
+    /// [`Self::connect_timeout`], [`Self::write_timeout`], or
+    /// [`Self::continue_timeout`]. Per-field setters called *after*
+    /// `with_timeouts` continue to mutate the same struct, so
+    ///
+    /// ```ignore
+    /// builder.with_timeouts(tos).connect_timeout(Some(d))
+    /// ```
+    ///
+    /// is equivalent to mutating `tos.connect` before passing it in.
+    pub fn with_timeouts(mut self, timeouts: ClientTimeouts) -> Self {
+        self.timeouts = timeouts;
+        self
+    }
+
+    /// Set a timeout for the whole client send operation.
+    ///
+    /// This is an outer deadline around connect, optional TLS handshake, writes,
+    /// Preview negotiation, and final response reads. More specific timeouts may
+    /// still fire first.
+    pub const fn timeout(mut self, dur: Option<Duration>) -> Self {
+        self.timeouts.operation = dur;
+        self
+    }
+
+    /// Set a timeout for establishing the TCP connection.
+    ///
+    /// For `icaps://`, this covers TCP connect only. TLS handshakes are governed
+    /// by `ClientTlsConfig::with_handshake_timeout`.
+    pub const fn connect_timeout(mut self, dur: Option<Duration>) -> Self {
+        self.timeouts.connect = dur;
+        self
+    }
+
+    /// Set a timeout for writing ICAP request bytes to the network.
+    ///
+    /// This covers request headers, preview markers, body chunks, and flushes.
+    /// It does not limit reading from the caller-provided body source.
+    pub const fn write_timeout(mut self, dur: Option<Duration>) -> Self {
+        self.timeouts.write = dur;
+        self
+    }
+
+    /// Set a timeout for Preview decision responses.
+    ///
+    /// When a request uses ICAP Preview, the client waits for either
+    /// `100 Continue` or an early final response before sending the remainder.
+    /// If this timeout is not set, only the outer [`timeout`](Self::timeout)
+    /// applies when configured.
+    pub const fn continue_timeout(mut self, dur: Option<Duration>) -> Self {
+        self.timeouts.continue_after_preview = dur;
         self
     }
 
@@ -140,8 +190,8 @@ impl ClientBuilder {
     /// This extracts `host` and `port` for use in the TCP connection. The service
     /// path, if present in the URI, is ignored here and should be set on the
     /// request itself. `icaps://` implicitly enables TLS using
-    /// [`ClientTlsConfig::with_native_roots`]; call [`with_tls`](Self::with_tls)
-    /// before or after `with_uri` to override the default TLS configuration.
+    /// `ClientTlsConfig::with_native_roots`; call `with_tls` before or after
+    /// `with_uri` to override the default TLS configuration.
     ///
     /// The default port is `1344` for `icap://` and `11344` for `icaps://`.
     pub fn with_uri(mut self, uri: &str) -> IcapResult<Self> {
@@ -187,7 +237,7 @@ impl ClientBuilder {
                 (None, true) => Some(ClientTlsConfig::with_native_roots()),
                 (None, false) => None,
             };
-            cfg.map(ClientTlsConfig::into_connector).transpose()?
+            cfg.map(ClientTlsConfig::into_connector)
         };
 
         Ok(Client {
@@ -197,7 +247,7 @@ impl ClientBuilder {
                 host_override: self.host_override,
                 default_headers: self.default_headers,
                 connection_policy: self.connection_policy,
-                read_timeout: self.read_timeout,
+                timeouts: self.timeouts,
                 #[cfg(feature = "tls-rustls")]
                 tls,
                 idle_conn: Mutex::new(None),

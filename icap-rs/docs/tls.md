@@ -25,11 +25,25 @@ The `tls-rustls` umbrella enables:
 - client-side `icaps://` connections,
 - Rustls-backed server listeners,
 - server-side mTLS,
-- loading extra trust roots and a client certificate from PEM files,
+- loading extra trust roots and a client certificate from PEM data or files,
 - a runtime opt-in to disable server certificate verification
   (mirrors `c-icap-client -tls-no-verify`).
 
 Without `tls-rustls`, using an `icaps://` URI returns an error.
+
+## Crypto Provider
+
+rustls 0.23 requires an installed
+[`CryptoProvider`](https://docs.rs/rustls/0.23/rustls/crypto/struct.CryptoProvider.html).
+The crate installs one lazily the first time TLS is used:
+
+- With the default `tls-rustls` feature, `ring` is installed.
+- With `tls-rustls-aws-lc-rs` enabled, aws-lc-rs is installed instead.
+
+If both providers are compiled in, aws-lc-rs is preferred. Applications that
+need to control provider selection can call
+`rustls::crypto::*::default_provider().install_default()` before constructing
+any TLS client or server config.
 
 ## Default Ports
 
@@ -60,7 +74,9 @@ async fn main() -> icap_rs::error::IcapResult<()> {
 
 ### Custom CA Bundle
 
-For self-signed deployments, supply a CA bundle through `ClientTlsConfig`:
+For self-signed deployments, supply a CA bundle through `ClientTlsConfig`.
+The primary API accepts PEM content, so callers can load it from config,
+secrets storage, environment variables, or any other source:
 
 ```rust,ignore
 use icap_rs::{Client, Request};
@@ -69,8 +85,10 @@ use icap_rs::tls::ClientTlsConfig;
 #[cfg(feature = "tls-rustls")]
 #[tokio::main]
 async fn main() -> icap_rs::error::IcapResult<()> {
+    let ca_pem = std::fs::read_to_string("test_data/certs/ca.pem")?;
+
     let tls = ClientTlsConfig::with_native_roots()
-        .add_root_ca_pem("test_data/certs/ca.pem")?
+        .add_root_ca_pem(ca_pem)?
         .with_sni("localhost");
 
     let client = Client::builder()
@@ -88,6 +106,8 @@ async fn main() -> icap_rs::error::IcapResult<()> {
 issued for a DNS name but the client connects to an IP literal or test
 endpoint.
 
+Use `add_root_ca_pem_file` when the certificate bundle really is a file path.
+
 ### Client mTLS
 
 Present a client certificate and key when the server requires one:
@@ -96,8 +116,8 @@ Present a client certificate and key when the server requires one:
 use icap_rs::tls::ClientTlsConfig;
 
 let tls = ClientTlsConfig::with_native_roots()
-    .add_root_ca_pem("test_data/certs/ca.pem")?
-    .with_client_auth_pem("test_data/certs/client.crt", "test_data/certs/client.key")?
+    .add_root_ca_pem_file("test_data/certs/ca.pem")?
+    .with_client_auth_pem_files("test_data/certs/client.crt", "test_data/certs/client.key")?
     .with_sni("localhost");
 ```
 
@@ -142,10 +162,9 @@ const ISTAG: &str = "tls-server-1.0";
 #[cfg(feature = "tls-rustls")]
 #[tokio::main]
 async fn main() -> icap_rs::error::IcapResult<()> {
-    let tls = ServerTlsConfig::from_pem_files(
-        "test_data/certs/server.crt",
-        "test_data/certs/server.key",
-    )?;
+    let cert_pem = std::fs::read_to_string("test_data/certs/server.crt")?;
+    let key_pem = std::fs::read_to_string("test_data/certs/server.key")?;
+    let tls = ServerTlsConfig::from_pem(cert_pem, key_pem)?;
 
     let server = Server::builder()
         .bind("0.0.0.0:11344")
@@ -173,6 +192,9 @@ The server terminates TLS inside the Rustls acceptor and then handles ICAP
 normally. The certificate loader auto-detects PKCS#8, PKCS#1 (RSA) and SEC1
 (EC) private key formats.
 
+Use `ServerTlsConfig::from_pem_files` when the certificate chain and key
+really are files on disk.
+
 When the connection limit is exceeded, TLS listeners drop the TCP socket
 *before* terminating the handshake; clients that hammer an overloaded server
 do not waste server CPU on handshake work.
@@ -185,11 +207,12 @@ Require clients to present a certificate signed by a trusted CA:
 use icap_rs::tls::ServerTlsConfig;
 
 let tls = ServerTlsConfig::from_pem_files("certs/server.crt", "certs/server.key")?
-    .with_client_auth_pem("certs/ca.pem")?;
+    .with_client_auth_pem_file("certs/ca.pem")?;
 ```
 
-Use `with_optional_client_auth_pem` instead to request — but not require —
-a client certificate.
+Use `with_client_auth_pem` / `with_optional_client_auth_pem` for PEM content,
+or `with_optional_client_auth_pem_file` to request — but not require — a
+client certificate with CA roots loaded from a file.
 
 ## Bring Your Own `rustls` Config
 

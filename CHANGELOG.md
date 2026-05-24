@@ -5,11 +5,12 @@
 ### Added
 
 - New top-level `tls` module (`ServerTlsConfig`, `ClientTlsConfig`, `TlsError`) consolidating all Rustls usage; replaces the ad-hoc TLS plumbing previously spread across `server/builder.rs` and `client/tls/*`.
-- Server TLS builder with explicit `from_pem_files`, `with_client_auth_pem` (mTLS), `with_optional_client_auth_pem`, `with_alpn`, `with_handshake_timeout`, and `from_rustls_config` escape hatch.
-- Client TLS builder with `with_native_roots`, `empty`, `add_root_ca_pem`, `with_client_auth_pem`, `with_sni`, `with_handshake_timeout`, and `from_rustls_config` escape hatch. Client mTLS is now supported.
+- Server TLS builder with explicit `from_pem` for PEM content, `from_pem_files` for file paths, `with_client_auth_pem` / `with_optional_client_auth_pem` for CA PEM content, file-path variants for both mTLS modes, `with_handshake_timeout`, and `from_rustls_config` escape hatch.
+- Client TLS builder with `with_native_roots`, `empty`, PEM-content and PEM-file trust root helpers, PEM-content and PEM-file client auth helpers, `with_sni`, `with_handshake_timeout`, and `from_rustls_config` escape hatch. Client mTLS is now supported.
 - Cargo feature `tls-rustls-ring` (default backend) and additive `tls-rustls-aws-lc-rs`; explicit `ensure_crypto_provider()` on first TLS use removes the implicit `install_default()` race.
 - Cargo feature `dangerous-insecure-tls` enabling a real `dangerous_disable_cert_verification()` on the client (parity with `c-icap-client -tls-no-verify`), gated behind the feature with a `WARN` log when used.
 - TLS handshake timeout enforced on both server (accept loop) and client (`connect`); surfaced as `TlsError::HandshakeTimeout` instead of a generic I/O error.
+- Client-side total-operation, TCP connect, write, and Preview continue timeouts via `ClientBuilder`, with matching `rs-icap-client` CLI flags.
 - `Error::Tls(TlsError)` variant — TLS failures (handshake, cert verification, PEM parsing, invalid SNI, missing crypto provider) no longer collapse into `Error::Network`.
 - `PreviewDecision` route handlers: services may return a final response after the preview bytes or continue with `100 Continue` from the regular route. `route`/`route_reqmod` handlers now return `IcapResult<PreviewDecision>`.
 - `Allow: 206` no-modification responses using the `use-original-body` partial-content marker; `rs-icap-client` reconstructs `206 Partial Content` output by appending the original body suffix from the offset.
@@ -24,7 +25,7 @@
 - ICAP responses with embedded HTTP now use RFC 3507 framing: `req-hdr`/`res-hdr` bytes are sent unchunked, and ICAP chunked coding starts only at `req-body`/`res-body`/`opt-body`. The previous (invalid) format that chunked `HTTP head + HTTP body` as one block is no longer produced or accepted.
 - Response parsing now rejects legacy unchunked entity bytes after a `req-body`/`res-body`/`opt-body` offset. Peers must send an ICAP-chunked entity body at that offset.
 - `ServerBuilder` TLS API replaced: `with_tls_from_pem_files` and `with_mtls_from_pem_files` removed in favour of `with_tls(ServerTlsConfig)`. The internal `TlsParams` type is gone.
-- `ClientBuilder` TLS API replaced: `use_rustls`, `danger_disable_cert_verify` (which was a documented no-op), `sni_hostname`, and `add_root_ca_pem_file` removed in favour of `with_tls(ClientTlsConfig)`. The `TlsBackend` enum is removed.
+- `ClientBuilder` TLS API replaced: `use_rustls`, `danger_disable_cert_verify` (which was a documented no-op), `sni_hostname`, and the old builder-level root-CA helper removed in favour of `with_tls(ClientTlsConfig)`. The `TlsBackend` enum is removed.
 - OpenSSL backend stubs removed entirely (`client/tls/openssl.rs`, commented `use_openssl` paths in `net.rs`/`client/builder.rs`).
 - `ServerBuilder::route_preview` removed; preview-time decisions belong to regular `route`/`route_reqmod` handlers returning `IcapResult<PreviewDecision>`.
 - Strict request parser now requires `Encapsulated` for all methods (including `OPTIONS`); legacy peers must opt into compatibility mode explicitly.

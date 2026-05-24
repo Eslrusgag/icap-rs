@@ -85,10 +85,14 @@ the advertised `Methods` value from registered routes and can inherit
 
 ## Preview Flow
 
-Preview is represented explicitly on both the client and server paths.
+Preview is represented explicitly on both the client and server paths:
+outbound [`Request`] values configure the wire behavior, [`Client::send`] and
+[`Client::send_streaming_reader`] drive the client-side handshake, and server
+routes receive [`IncomingRequest`] values that may expose [`Body::Preview`] to
+preview-aware handlers.
 
-Client requests can set `Preview: N` and optionally send `ieof` for
-`Preview: 0`:
+Client requests can set `Preview: N` with [`Request::preview`] and optionally
+send `ieof` for `Preview: 0` with [`Request::preview_ieof`]:
 
 ```rust,no_run
 use http::{Request as HttpRequest, Version};
@@ -113,9 +117,10 @@ fn build_request() -> IcapResult<Request> {
 ```
 
 Server handlers normally receive the request after the full body is available.
-If a route handler returns `IcapResult<PreviewDecision>`, it is preview-aware:
-the server can call it after preview bytes arrive and before sending
-`ICAP/1.0 100 Continue`.
+If a [`ServerBuilder::route_reqmod`], [`ServerBuilder::route_respmod`], or
+[`ServerBuilder::route`] handler returns [`IcapResult<PreviewDecision>`], it is
+preview-aware: the server can call it after preview bytes arrive and before
+sending `ICAP/1.0 100 Continue`.
 
 ```rust,no_run
 use icap_rs::{IcapResult, IncomingRequest, PreviewDecision, Response, Server, ServiceOptions};
@@ -148,8 +153,11 @@ async fn main() -> IcapResult<()> {
 }
 ```
 
-Returning `PreviewDecision::Continue` resumes the RFC preview flow: the server
-sends `100 Continue`, reads the remainder, and dispatches the full request.
+Returning [`PreviewDecision::Continue`] resumes the RFC preview flow: the
+server sends `100 Continue`, reads the remainder, and dispatches the full
+request. Returning [`PreviewDecision::Respond`] sends the supplied final
+[`Response`] immediately. Services advertise the preview window in generated
+`OPTIONS` responses with [`ServiceOptions::with_preview`].
 
 ## Modifying an HTTP Request
 
@@ -219,8 +227,9 @@ async fn main() -> IcapResult<()> {
 
 ## Streaming Bodies
 
-The client can stream request bodies from an `AsyncRead` using ICAP chunked
-framing. The final ICAP response is parsed into `Response`.
+The client can stream request bodies from an `AsyncRead` using
+[`Client::send_streaming_reader`] and ICAP chunked framing. The final ICAP
+response is parsed into [`Response`].
 
 ```rust,no_run
 use http::{Request as HttpRequest, Version};
@@ -366,41 +375,190 @@ use icap_rs::{
 
 | Type | Use it for |
 | --- | --- |
-| `Client`, `ClientBuilder`, `ConnectionPolicy` | Connecting to an ICAP service, configuring host/port or `icap://` / `icaps://` URI, keep-alive, timeouts, default headers, and streaming sends. |
-| `Request`, `Method` | Building outbound `OPTIONS`, `REQMOD`, and `RESPMOD` requests for client send/build APIs. |
-| `IncomingRequest` | Inspecting server-side ICAP requests in route handlers. ICAP metadata is read-only; services may mutate or consume only the embedded HTTP message. |
-| `Response`, `StatusCode` | Building ICAP responses, parsing raw responses, validating `ISTag`, serializing RFC-compatible wire bytes, and attaching embedded HTTP messages. |
-| `Server`, `ServerBuilder` | Running a Tokio ICAP service with per-service routes, aliases, default service routing, connection limits, TLS/mTLS, and automatic `OPTIONS`. |
-| `ServiceOptions`, `TransferBehavior` | Describing per-service `OPTIONS` capabilities: `Methods`, `Service`, explicit `ISTag`, `Allow`, `Preview`, `Transfer-*`, `Options-TTL`, and optional `opt-body`. |
-| `Body`, `EmbeddedHttp` | Inspecting embedded HTTP request/response heads and bodies in server handlers. Regular handlers receive `Body::Full`; preview-aware handlers may receive `Body::Preview`. |
-| `PreviewDecision` | Returning an early final response from a preview-aware route, or continuing the RFC preview flow. |
-| `Error`, `IcapResult` | Handling protocol, parsing, serialization, network, service, and handler errors without converting them into generic I/O errors. |
+| [`Client`], [`ClientBuilder`], [`ConnectionPolicy`] | Connecting to an ICAP service, configuring host/port or `icap://` / `icaps://` URI, keep-alive, timeouts, default headers, and streaming sends. |
+| [`Request`], [`Method`] | Building outbound `OPTIONS`, `REQMOD`, and `RESPMOD` requests for client send/build APIs. |
+| [`IncomingRequest`] | Inspecting server-side ICAP requests in route handlers. ICAP metadata is read-only; services may mutate or consume only the embedded HTTP message. |
+| [`Response`], [`StatusCode`] | Building ICAP responses, parsing raw responses, validating `ISTag`, serializing RFC-compatible wire bytes, and attaching embedded HTTP messages. |
+| [`Server`], [`ServerBuilder`] | Running a Tokio ICAP service with per-service routes, aliases, default service routing, connection limits, TLS/mTLS, and automatic `OPTIONS`. |
+| [`ServiceOptions`], [`TransferBehavior`] | Describing per-service `OPTIONS` capabilities: `Methods`, `Service`, explicit `ISTag`, `Allow`, `Preview`, `Transfer-*`, `Options-TTL`, and optional `opt-body`. |
+| [`Body`], [`EmbeddedHttp`] | Inspecting embedded HTTP request/response heads and bodies in server handlers. Regular handlers receive [`Body::Full`]; preview-aware handlers may receive [`Body::Preview`]. |
+| [`PreviewDecision`] | Returning an early final response from a preview-aware route, or continuing the RFC preview flow. |
+| [`Error`], [`IcapResult`] | Handling protocol, parsing, serialization, network, service, and handler errors without converting them into generic I/O errors. |
 
 Submodules are still public for discoverability and namespacing:
 `icap_rs::client`, `icap_rs::request`, `icap_rs::response`,
 `icap_rs::server`, and `icap_rs::error`. Prefer the crate-root imports above
 for normal application code.
 
-Server route handlers receive `IncomingRequest`, not the outbound `Request`
+Server route handlers receive [`IncomingRequest`], not the outbound [`Request`]
 builder. This intentionally prevents services from rewriting the ICAP request
 line, ICAP headers, preview state, or `Allow` flags after parsing. If a service
-needs to adapt traffic, it should return a `Response` with an embedded HTTP
-request/response, or use `IncomingRequest::embedded_mut()` /
-`IncomingRequest::into_embedded()` to work with the encapsulated HTTP data.
+needs to adapt traffic, it should return a [`Response`] with an embedded HTTP
+request/response, or use [`IncomingRequest::embedded_mut`] /
+[`IncomingRequest::into_embedded`] to work with the encapsulated HTTP data.
 
-### Common API Paths
+### Common API Examples
 
-| Goal | API path |
-| --- | --- |
-| Send `OPTIONS` | `Client::send(&Request::options("service"))` |
-| Send buffered `REQMOD` | `Request::reqmod("service").with_http_request(http_request)?` then `Client::send` |
-| Send buffered `RESPMOD` | `Request::respmod("service").with_http_response(http_response)?` then `Client::send` |
-| Build from dynamic method input | `Request::try_new(method, "service")?` then `with_http_request(...)` / `with_http_response(...)` |
-| Stream a large body | `with_http_request_head` / `with_http_response_head` plus `Client::send_streaming_reader` |
-| Return no modification | `Response::no_content_with_istag("...")` |
-| Return adapted HTTP | `Response::ok_with_istag("...")?.with_http_response(...)` |
-| Run a service | `Server::builder().route_reqmod(..., Some(ServiceOptions::new().with_static_istag("...")))` / `route_respmod(...)` / `route(...)` |
-| Advertise capabilities | `ServiceOptions::new().with_static_istag(...).allow_204().with_preview(...)` |
+Send an `OPTIONS` request with [`Client::send`] and [`Request::options`]:
+
+```rust,no_run
+use icap_rs::{Client, IcapResult, Request};
+
+async fn options(client: &Client) -> IcapResult<()> {
+    let response = client.send(&Request::options("respmod")).await?;
+    println!("ICAP {}", response.status_code());
+    Ok(())
+}
+```
+
+Configure client-side network deadlines through [`ClientBuilder`]:
+
+```rust,no_run
+use std::time::Duration;
+use icap_rs::Client;
+
+let client = Client::builder()
+    .with_uri("icap://icap.example:1344/respmod")?
+    .timeout(Some(Duration::from_secs(60)))
+    .connect_timeout(Some(Duration::from_secs(3)))
+    .write_timeout(Some(Duration::from_secs(30)))
+    .continue_timeout(Some(Duration::from_secs(10)))
+    .try_build()?;
+# Ok::<(), icap_rs::Error>(())
+```
+
+Build a buffered `REQMOD` request with [`Request::reqmod`] and
+[`Request::with_http_request`]:
+
+```rust
+use http::Request as HttpRequest;
+use icap_rs::{IcapResult, Request};
+
+fn reqmod() -> IcapResult<Request> {
+    let http = HttpRequest::builder()
+        .method("GET")
+        .uri("http://origin.example/")
+        .header("Host", "origin.example")
+        .body(Vec::new())
+        .expect("valid HTTP request");
+
+    Request::reqmod("scan").with_http_request(http)
+}
+```
+
+Build a buffered `RESPMOD` request with [`Request::respmod`] and
+[`Request::with_http_response`]:
+
+```rust
+use http::{Response as HttpResponse, StatusCode, Version};
+use icap_rs::{IcapResult, Request};
+
+fn respmod() -> IcapResult<Request> {
+    let http = HttpResponse::builder()
+        .status(StatusCode::OK)
+        .version(Version::HTTP_11)
+        .header("Content-Type", "text/plain")
+        .body(b"hello".to_vec())
+        .expect("valid HTTP response");
+
+    Request::respmod("scan").with_http_response(http)
+}
+```
+
+Use [`Request::try_new`] when the ICAP method comes from dynamic input:
+
+```rust
+use http::Request as HttpRequest;
+use icap_rs::{IcapResult, Request};
+
+fn dynamic_method(method: &str) -> IcapResult<Request> {
+    let http = HttpRequest::builder()
+        .method("GET")
+        .uri("http://origin.example/")
+        .header("Host", "origin.example")
+        .body(Vec::new())
+        .expect("valid HTTP request");
+
+    Request::try_new(method, "scan")?.with_http_request(http)
+}
+```
+
+Stream a large body by pairing [`Request::with_http_request_head`] with
+[`Client::send_streaming_reader`]:
+
+```rust,no_run
+use http::Request as HttpRequest;
+use icap_rs::{Client, IcapResult, Request};
+
+async fn stream_reqmod(client: &Client) -> IcapResult<()> {
+    let http_head = HttpRequest::builder()
+        .method("POST")
+        .uri("http://origin.example/upload")
+        .header("Host", "origin.example")
+        .body(())
+        .expect("valid HTTP request head");
+
+    let request = Request::reqmod("scan").with_http_request_head(http_head)?;
+    let response = client
+        .send_streaming_reader(&request, tokio::io::empty())
+        .await?;
+
+    println!("ICAP {}", response.status_code());
+    Ok(())
+}
+```
+
+Return no modification with [`Response::no_content_with_istag`], or return an
+adapted HTTP message with [`Response::ok_with_istag`] and
+[`Response::with_http_response`]:
+
+```rust
+use http::{Response as HttpResponse, StatusCode};
+use icap_rs::{IcapResult, Response};
+
+fn no_modification() -> IcapResult<Response> {
+    Response::no_content_with_istag("policy-1")
+}
+
+fn adapted_response() -> IcapResult<Response> {
+    let http = HttpResponse::builder()
+        .status(StatusCode::OK)
+        .body(b"adapted".to_vec())
+        .expect("valid HTTP response");
+
+    Response::ok_with_istag("policy-1")?.with_http_response(&http)
+}
+```
+
+Run a service with [`Server::builder`], [`ServerBuilder::route_reqmod`], and
+[`ServiceOptions`]:
+
+```rust,no_run
+use icap_rs::{IcapResult, IncomingRequest, Response, Server, ServiceOptions};
+
+const ISTAG: &str = "policy-1";
+
+async fn run() -> IcapResult<()> {
+    let options = ServiceOptions::new()
+        .with_static_istag(ISTAG)
+        .allow_204()
+        .with_preview(1024);
+
+    let server = Server::builder()
+        .bind("127.0.0.1:1344")
+        .route_reqmod(
+            "scan",
+            |_request: IncomingRequest| async move {
+                Response::no_content_with_istag(ISTAG)
+            },
+            Some(options),
+        )
+        .build()
+        .await?;
+
+    server.run().await
+}
+```
 
 ## TLS and ICAPS
 
@@ -412,9 +570,10 @@ icap-rs = { version = "0.3.0", features = ["tls-rustls"] }
 
 Then use `icaps://` URIs for clients, and `ServerBuilder::with_tls` plus a
 [`ServerTlsConfig`](src/tls/server.rs) on the server side (use
-`with_client_auth_pem` for mTLS). On the client, customise TLS via
+`with_client_auth_pem` for in-memory PEM data or `with_client_auth_pem_file`
+for file paths). On the client, customise TLS via
 [`ClientTlsConfig`](src/tls/client.rs) and `ClientBuilder::with_tls`.
-See [`docs/tls.md`](docs/tls.md) for the full guide.
+See the `icap_rs::tls` module documentation for the full guide.
 
 ## Examples
 
