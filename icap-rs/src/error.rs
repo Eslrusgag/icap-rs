@@ -10,7 +10,7 @@ use http::header::{InvalidHeaderName, InvalidHeaderValue};
 use http::method::InvalidMethod;
 use http::status::InvalidStatusCode;
 use http::uri::{InvalidUri, InvalidUriParts};
-use http::{Error as HttpError, header::ToStrError};
+use http::{header::ToStrError, Error as HttpError};
 use std::error::Error as StdError;
 use std::str::Utf8Error;
 use std::string::FromUtf8Error;
@@ -96,6 +96,14 @@ pub enum Error {
     /// Unexpected/unclassified error.
     #[error("Unexpected error: {0}")]
     Unexpected(String),
+
+    /// TLS-layer error (handshake, certificate verification, PEM loading…).
+    ///
+    /// See [`crate::tls::TlsError`] for the structured variants. Only present
+    /// when the crate is built with the `tls-rustls` feature.
+    #[cfg(feature = "tls-rustls")]
+    #[error(transparent)]
+    Tls(#[from] crate::tls::TlsError),
 }
 
 impl Error {

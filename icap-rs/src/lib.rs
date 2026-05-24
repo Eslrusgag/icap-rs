@@ -7,9 +7,11 @@ mod protocol;
 pub mod request;
 pub mod response;
 pub mod server;
+#[cfg(feature = "tls-rustls")]
+pub mod tls;
 
-pub use client::Client;
 pub use client::builder::*;
+pub use client::Client;
 pub use error::{Error, IcapResult};
 pub use request::{
     Body, EmbeddedHttp, EmbeddedHttpKind, Incoming, IncomingRequest, Method, Outbound,
@@ -19,6 +21,8 @@ pub use response::{Outgoing, OutgoingResponse, Parsed, ParsedResponse, Response,
 pub use server::{
     PreviewDecision, RouteOutput, Server, ServerBuilder, ServiceOptions, TransferBehavior,
 };
+#[cfg(feature = "tls-rustls")]
+pub use tls::{ClientTlsConfig, ServerTlsConfig, TlsError};
 
 /// Lib version.
 pub const LIB_VERSION: &str = env!("CARGO_PKG_VERSION");

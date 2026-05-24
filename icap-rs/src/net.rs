@@ -1,18 +1,14 @@
 //! Connection wrapper used by the ICAP client.
 //!
-//! This module exposes a enum [`Conn`] that abstracts over the
-//! underlying transport:
-//!
-//! - plain TCP (`TcpStream`)
-//! - TLS over **rustls** (`tokio_rustls::client::TlsStream<TcpStream>`) — when the
-//!   `tls-rustls` feature is enabled
+//! Exposes [`Conn`], a tagged transport over either a plain TCP socket or a
+//! rustls-backed TLS stream (when the `tls-rustls` feature is compiled in).
 use pin_project_lite::pin_project;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 
 #[cfg(feature = "tls-rustls")]
 mod conn_def {
-    use super::{AsyncRead, AsyncWrite, TcpStream, pin_project};
+    use super::{pin_project, AsyncRead, AsyncWrite, TcpStream};
 
     pin_project! {
         /// Transport connection when the rustls TLS backend is compiled in.
@@ -20,8 +16,6 @@ mod conn_def {
         /// Variants:
         /// - [`Conn::Plain`] — raw `TcpStream`
         /// - [`Conn::Rustls`] — TLS via `tokio-rustls` + rustls
-        ///
-        /// OpenSSL variant is intentionally disabled/commented out.
         #[project = ConnProj]
         #[derive(Debug)]
         pub enum Conn {
@@ -29,8 +23,6 @@ mod conn_def {
             Plain  { #[pin] inner: TcpStream },
             /// TLS connection using rustls.
             Rustls { #[pin] inner: tokio_rustls::client::TlsStream<TcpStream> },
-            // /// TLS connection using OpenSSL. (disabled)
-            // Openssl { #[pin] inner: tokio_openssl::SslStream<TcpStream> },
         }
     }
 
@@ -43,7 +35,6 @@ mod conn_def {
             match self.project() {
                 ConnProj::Plain { inner } => inner.poll_read(cx, buf),
                 ConnProj::Rustls { inner } => inner.poll_read(cx, buf),
-                // ConnProj::Openssl { inner } => inner.poll_read(cx, buf),
             }
         }
     }
@@ -57,7 +48,6 @@ mod conn_def {
             match self.project() {
                 ConnProj::Plain { inner } => inner.poll_write(cx, buf),
                 ConnProj::Rustls { inner } => inner.poll_write(cx, buf),
-                // ConnProj::Openssl { inner } => inner.poll_write(cx, buf),
             }
         }
         fn poll_flush(
@@ -67,7 +57,6 @@ mod conn_def {
             match self.project() {
                 ConnProj::Plain { inner } => inner.poll_flush(cx),
                 ConnProj::Rustls { inner } => inner.poll_flush(cx),
-                // ConnProj::Openssl { inner } => inner.poll_flush(cx),
             }
         }
         fn poll_shutdown(
@@ -77,19 +66,14 @@ mod conn_def {
             match self.project() {
                 ConnProj::Plain { inner } => inner.poll_shutdown(cx),
                 ConnProj::Rustls { inner } => inner.poll_shutdown(cx),
-                // ConnProj::Openssl { inner } => inner.poll_shutdown(cx),
             }
         }
     }
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// Case 2: no TLS features (Plain only)
-// ──────────────────────────────────────────────────────────────────────────────
-
 #[cfg(not(feature = "tls-rustls"))]
 mod conn_def {
-    use super::{AsyncRead, AsyncWrite, TcpStream, pin_project};
+    use super::{pin_project, AsyncRead, AsyncWrite, TcpStream};
 
     pin_project! {
         /// Transport connection when no TLS backends are compiled in.
@@ -144,6 +128,7 @@ mod conn_def {
 
 /// Re-export the feature-shaped `Conn` so callers can use a stable path.
 pub use conn_def::Conn;
+
 
 impl Conn {
     /// Returns mutable access to the underlying plain TCP stream when transport is non-TLS.

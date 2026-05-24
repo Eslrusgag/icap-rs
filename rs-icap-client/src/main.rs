@@ -1,5 +1,5 @@
 use clap::builder::styling::{AnsiColor, Color, Style, Styles};
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 
 use http::{
     HeaderName, HeaderValue, Method, Request as HttpRequest, Response as HttpResponse, StatusCode,
@@ -52,13 +52,6 @@ pub const fn cli_styles() -> Styles {
                 .fg_color(Some(Color::Ansi(AnsiColor::BrightCyan))),
         )
         .placeholder(Style::new().fg_color(Some(Color::Ansi(AnsiColor::BrightBlue))))
-}
-
-#[derive(ValueEnum, Clone, Debug)]
-enum TlsBackendCli {
-    Rustls,
-    // OpenSSL backend is intentionally disabled/commented out
-    // Openssl,
 }
 
 #[derive(Parser, Debug)]
@@ -129,17 +122,23 @@ struct Args {
     #[arg(long = "rhx")]
     rhx_header: Vec<String>,
 
-    /// Select TLS backend (effective only for `icaps://`).
-    #[arg(long = "tls-backend", value_enum)]
-    tls_backend: Option<TlsBackendCli>,
-
-    /// Compatibility flag. With rustls 0.23 this is ignored.
+    /// Disable server certificate verification (rustls).
+    /// Equivalent to c-icap-client `-tls-no-verify`. **Insecure.**
     #[arg(long, action = clap::ArgAction::SetTrue)]
     insecure: bool,
 
     /// Use extra CA bundle (PEM) for TLS (rustls only).
     #[arg(long = "tls-ca", value_name = "PEM_FILE")]
     tls_ca: Option<String>,
+
+    /// Path to a client certificate chain in PEM (rustls only). Pair with
+    /// `--tls-key` to enable mutual TLS.
+    #[arg(long = "tls-cert", value_name = "PEM_FILE", requires = "tls_key")]
+    tls_cert: Option<String>,
+
+    /// Path to the client private key in PEM (rustls only).
+    #[arg(long = "tls-key", value_name = "PEM_FILE", requires = "tls_cert")]
+    tls_key: Option<String>,
 
     /// Override SNI hostname (used with TLS; ignored for `icap://`).
     #[arg(long = "sni", value_name = "HOSTNAME")]
@@ -172,6 +171,78 @@ struct IcapCaps {
     allow_204_advertised: bool,
     methods: HashSet<String>,
     timeout_secs: Option<u64>,
+}
+
+/// Apply CLI TLS arguments (`--tls-ca`, `--tls-cert`/`--tls-key`, `--sni`,
+/// `--insecure`) to a `ClientBuilder`. When the crate is built without
+/// `tls-rustls`, the TLS flags are reported as noops.
+#[cfg(feature = "tls-rustls")]
+fn apply_tls_args(
+    builder: icap_rs::ClientBuilder,
+    args: &Args,
+    is_tls_uri: bool,
+) -> IcapResult<icap_rs::ClientBuilder> {
+    use icap_rs::tls::ClientTlsConfig;
+
+    if !is_tls_uri {
+        if args.sni.is_some() {
+            eprintln!("Note: --sni is ignored for icap:// (TLS is off).");
+        }
+        if args.tls_ca.is_some() {
+            eprintln!("Note: --tls-ca is ignored for icap:// (TLS is off).");
+        }
+        if args.tls_cert.is_some() || args.tls_key.is_some() {
+            eprintln!("Note: --tls-cert/--tls-key are ignored for icap:// (TLS is off).");
+        }
+        if args.insecure {
+            eprintln!("Note: --insecure is ignored for icap:// (TLS is off).");
+        }
+        return Ok(builder);
+    }
+
+    let mut tls = ClientTlsConfig::with_native_roots();
+    if let Some(pem) = &args.tls_ca {
+        tls = tls.add_root_ca_pem(pem)?;
+    }
+    if let (Some(cert), Some(key)) = (&args.tls_cert, &args.tls_key) {
+        tls = tls.with_client_auth_pem(cert, key)?;
+    }
+    if let Some(sni) = &args.sni {
+        tls = tls.with_sni(sni);
+    }
+    if args.insecure {
+        // Mirrors c-icap-client `-tls-no-verify`. Logged at WARN.
+        tls = tls.dangerous_disable_cert_verification()?;
+    }
+    Ok(builder.with_tls(tls))
+}
+
+// Mirror the `tls-rustls` signature so the call site needs no cfg.
+#[cfg(not(feature = "tls-rustls"))]
+#[allow(clippy::unnecessary_wraps)]
+fn apply_tls_args(
+    builder: icap_rs::ClientBuilder,
+    args: &Args,
+    is_tls_uri: bool,
+) -> IcapResult<icap_rs::ClientBuilder> {
+    if is_tls_uri {
+        eprintln!(
+            "Error: `icaps://` requested but this binary was built without feature `tls-rustls`."
+        );
+        std::process::exit(2);
+    }
+    for (flag, set) in [
+        ("--tls-ca", args.tls_ca.is_some()),
+        ("--tls-cert", args.tls_cert.is_some()),
+        ("--tls-key", args.tls_key.is_some()),
+        ("--sni", args.sni.is_some()),
+        ("--insecure", args.insecure),
+    ] {
+        if set {
+            eprintln!("Note: {flag} requires a binary built with feature `tls-rustls`.");
+        }
+    }
+    Ok(builder)
 }
 
 #[tokio::main]
@@ -222,75 +293,9 @@ async fn main() -> IcapResult<()> {
         icap_rs::LIB_VERSION
     );
 
-    let mut builder = Client::builder().with_uri(&args.uri)?;
+    let builder = Client::builder().with_uri(&args.uri)?;
     let is_tls_uri = args.uri.starts_with("icaps://");
-
-    if let Some(be) = &args.tls_backend {
-        if is_tls_uri {
-            match be {
-                TlsBackendCli::Rustls => {
-                    #[cfg(feature = "tls-rustls")]
-                    {
-                        builder = builder.use_rustls();
-                    }
-                    #[cfg(not(feature = "tls-rustls"))]
-                    {
-                        eprintln!("This binary was built without feature `tls-rustls`");
-                        std::process::exit(2);
-                    }
-                } // TlsBackendCli::Openssl => {
-                  //     // OpenSSL backend intentionally disabled
-                  //     #[cfg(feature = "tls-openssl")]
-                  //     {
-                  //         builder = builder.use_openssl();
-                  //     }
-                  //     #[cfg(not(feature = "tls-openssl"))]
-                  //     {
-                  //         eprintln!("This binary was built without feature `tls-openssl`");
-                  //         std::process::exit(2);
-                  //     }
-                  // }
-            }
-        } else {
-            eprintln!("Note: --tls-backend is ignored for icap:// (use icaps:// to enable TLS).");
-        }
-    }
-
-    if let Some(sni) = &args.sni {
-        if is_tls_uri {
-            builder = builder.sni_hostname(sni);
-        } else {
-            eprintln!("Note: --sni is ignored for icap:// (TLS is off).");
-        }
-    }
-
-    #[cfg(feature = "tls-rustls")]
-    {
-        if let Some(pem_path) = &args.tls_ca {
-            if is_tls_uri {
-                builder = builder.add_root_ca_pem_file(pem_path)?;
-            } else {
-                eprintln!("Note: --tls-ca is ignored for icap:// (TLS is off).");
-            }
-        }
-    }
-    #[cfg(not(feature = "tls-rustls"))]
-    {
-        if args.tls_ca.is_some() {
-            eprintln!("--tls-ca requires a binary built with feature `tls-rustls`.");
-        }
-    }
-
-    if args.insecure {
-        if is_tls_uri {
-            #[cfg(feature = "tls-rustls")]
-            eprintln!(
-                "Warning: --insecure is ignored with rustls 0.23 (public no-verify API is unavailable)."
-            );
-        } else {
-            eprintln!("Note: --insecure is ignored for icap:// (TLS is off).");
-        }
-    }
+    let builder = apply_tls_args(builder, &args, is_tls_uri)?;
 
     let client = builder
         .read_timeout(args.timeout.map(Duration::from_secs))

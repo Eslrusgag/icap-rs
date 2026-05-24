@@ -13,7 +13,7 @@ default = []
 
 # Top-level flag to compile TLS support using Rustls.
 # Pulls in tokio-rustls for async I/O, rustls core, system trust store loading,
-# and PEM parsing for custom roots.
+# PEM parsing, and the `ring` crypto provider as the default.
 tls-rustls = [
     "dep:tokio-rustls",
     "dep:rustls",
@@ -21,6 +21,12 @@ tls-rustls = [
     "dep:rustls-pemfile",
     "rustls/ring",
 ]
+
+# Additive opt-in: compile the `aws-lc-rs` crypto provider alongside `ring`.
+# When this feature is enabled, the runtime installer prefers aws-lc-rs.
+# Implies `tls-rustls`, so user code that gates on `feature = "tls-rustls"`
+# keeps working unchanged.
+tls-rustls-aws-lc-rs = ["tls-rustls", "rustls/aws-lc-rs"]
 
 
 [dependencies]
@@ -49,6 +55,7 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true, features = ["html_reports"] }
+rcgen = { workspace = true }
 rstest = { workspace = true }
 tracing-subscriber = { workspace = true }
 
@@ -68,6 +75,18 @@ path = "examples/streaming_client.rs"
 [[example]]
 name = "tls_client"
 path = "examples/tls_client.rs"
+required-features = ["tls-rustls"]
+
+[[example]]
+name = "tls_server"
+path = "examples/tls_server.rs"
+required-features = ["tls-rustls"]
+
+[[example]]
+name = "tls_mtls_client"
+path = "examples/tls_mtls_client.rs"
+required-features = ["tls-rustls"]
+
 
 [[example]]
 name = "preview_decision_server"

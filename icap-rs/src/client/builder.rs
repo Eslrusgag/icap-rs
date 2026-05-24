@@ -1,13 +1,11 @@
-use crate::client::tls::{AnyTlsConnector, TlsBackend};
-use crate::client::{Client, ClientRef, parse_authority_with_scheme};
+use crate::client::{parse_authority_with_scheme, Client, ClientRef};
+#[cfg(feature = "tls-rustls")]
+use crate::tls::ClientTlsConfig;
 use crate::{Error, IcapResult};
 use http::{HeaderMap, HeaderName, HeaderValue};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
-
-#[cfg(feature = "tls-rustls")]
-use rustls::pki_types::CertificateDer;
 
 /// Policy for connection lifetime management.
 ///
@@ -27,7 +25,7 @@ pub enum ConnectionPolicy {
 /// - `ConnectionPolicy` is `Close`;
 /// - no host/port are set until you call [`ClientBuilder::host`] / [`ClientBuilder::port`]
 ///   or [`ClientBuilder::with_uri`].
-#[derive(Debug)]
+#[derive(Debug, Default)]
 #[must_use]
 pub struct ClientBuilder {
     host: Option<String>,
@@ -37,13 +35,14 @@ pub struct ClientBuilder {
     connection_policy: ConnectionPolicy,
     read_timeout: Option<Duration>,
 
-    // TLS (plain by default)
-    tls_backend: Option<TlsBackend>, // None => plain
-    danger_disable_verify: bool,
-    sni_hostname: Option<String>,
-
+    // TLS state. `tls` is the user-supplied config (explicit `with_tls`),
+    // `auto_tls` records whether `with_uri("icaps://...")` requested TLS.
+    // At build time, an explicit config always wins; otherwise auto-TLS
+    // defaults to native roots.
     #[cfg(feature = "tls-rustls")]
-    extra_roots: Vec<CertificateDer<'static>>,
+    tls: Option<ClientTlsConfig>,
+    #[cfg(feature = "tls-rustls")]
+    auto_tls: bool,
 }
 
 impl ClientBuilder {
@@ -138,9 +137,13 @@ impl ClientBuilder {
 
     /// Configure the builder from an ICAP URI (`icap://...` or `icaps://...`).
     ///
-    /// This extracts `host` and `port` for use in the TCP connection. The service path,
-    /// if present in the URI, is ignored here and should be set on the request itself.
-    /// `icaps://` enables TLS automatically.
+    /// This extracts `host` and `port` for use in the TCP connection. The service
+    /// path, if present in the URI, is ignored here and should be set on the
+    /// request itself. `icaps://` implicitly enables TLS using
+    /// [`ClientTlsConfig::with_native_roots`]; call [`with_tls`](Self::with_tls)
+    /// before or after `with_uri` to override the default TLS configuration.
+    ///
+    /// The default port is `1344` for `icap://` and `11344` for `icaps://`.
     pub fn with_uri(mut self, uri: &str) -> IcapResult<Self> {
         let (host, port, tls) = parse_authority_with_scheme(uri)?;
         self.host = Some(host);
@@ -148,13 +151,8 @@ impl ClientBuilder {
         if tls {
             #[cfg(feature = "tls-rustls")]
             {
-                self = self.use_rustls();
+                self.auto_tls = true;
             }
-            // #[cfg(all(not(feature = "tls-rustls"), feature = "tls-openssl"))]
-            // {
-            //     self = self.use_openssl();
-            // }
-            //#[cfg(all(not(feature = "tls-rustls"), not(feature = "tls-openssl")))]
             #[cfg(not(feature = "tls-rustls"))]
             {
                 return Err(Error::Service(
@@ -165,48 +163,14 @@ impl ClientBuilder {
         Ok(self)
     }
 
-    #[cfg(feature = "tls-rustls")]
-    pub const fn use_rustls(mut self) -> Self {
-        self.tls_backend = Some(TlsBackend::Rustls);
-        self
-    }
-
-    // #[cfg(feature = "tls-openssl")]
-    // pub fn use_openssl(mut self) -> Self {
-    //     self.tls_backend = Some(TlsBackend::Openssl);
-    //     self
-    // }
-
-    /// Custom SNI hostname to use for TLS handshakes.
-    pub fn sni_hostname(mut self, s: &str) -> Self {
-        self.sni_hostname = Some(s.into());
-        self
-    }
-
-    /// Compatibility toggle for disabling certificate verification.
+    /// Enable TLS using the supplied [`ClientTlsConfig`].
     ///
-    /// With rustls 0.23 this is currently a no-op, kept for API compatibility.
-    pub const fn danger_disable_cert_verify(mut self, yes: bool) -> Self {
-        self.danger_disable_verify = yes;
-        self
-    }
-
-    /// Add root CAs from a PEM file (rustls only).
+    /// Always wins over the implicit configuration enabled by
+    /// [`with_uri("icaps://…")`](Self::with_uri).
     #[cfg(feature = "tls-rustls")]
-    pub fn add_root_ca_pem_file(mut self, path: impl AsRef<std::path::Path>) -> IcapResult<Self> {
-        use std::fs::File;
-        use std::io::BufReader;
-
-        let f = File::open(path.as_ref())?;
-        let mut rdr = BufReader::new(f);
-
-        let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
-            rustls_pemfile::certs(&mut rdr)
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| format!("PEM parse error: {e}"))?;
-
-        self.extra_roots.extend(certs);
-        Ok(self)
+    pub fn with_tls(mut self, config: ClientTlsConfig) -> Self {
+        self.tls = Some(config);
+        self
     }
 
     /// Build a [`Client`], returning an error when required configuration is missing.
@@ -216,30 +180,14 @@ impl ClientBuilder {
             .ok_or_else(|| Error::service("ClientBuilder: host is required"))?;
         let port = self.port.unwrap_or(1344);
 
-        let any_tls = match self.tls_backend {
-            None => AnyTlsConnector::plain(),
-            #[cfg(feature = "tls-rustls")]
-            Some(TlsBackend::Rustls) => {
-                use crate::client::tls::rustls::RustlsConfig;
-                AnyTlsConnector::rustls(RustlsConfig {
-                    danger_disable_verify: self.danger_disable_verify,
-                    extra_roots: self.extra_roots,
-                })
-            } // Some(TlsBackend::Openssl) => {
-            //     #[cfg(feature = "tls-openssl")]
-            //     {
-            //         use crate::client::tls::openssl::OpensslConfig;
-            //         AnyTlsConnector::openssl(OpensslConfig {
-            //             danger_disable_verify: self.danger_disable_verify,
-            //         })
-            //     }
-            //     #[cfg(not(feature = "tls-openssl"))]
-            //     {
-            //         panic!("enable `tls-openssl` feature")
-            //     }
-            // }
-            #[cfg(not(feature = "tls-rustls"))]
-            Some(_) => return Err(Error::service("enable `tls-rustls` feature")),
+        #[cfg(feature = "tls-rustls")]
+        let tls = {
+            let cfg = match (self.tls, self.auto_tls) {
+                (Some(cfg), _) => Some(cfg),
+                (None, true) => Some(ClientTlsConfig::with_native_roots()),
+                (None, false) => None,
+            };
+            cfg.map(ClientTlsConfig::into_connector).transpose()?
         };
 
         Ok(Client {
@@ -250,9 +198,9 @@ impl ClientBuilder {
                 default_headers: self.default_headers,
                 connection_policy: self.connection_policy,
                 read_timeout: self.read_timeout,
-                tls: any_tls,
+                #[cfg(feature = "tls-rustls")]
+                tls,
                 idle_conn: Mutex::new(None),
-                sni_hostname: self.sni_hostname,
             }),
         })
     }
@@ -265,23 +213,5 @@ impl ClientBuilder {
     /// [`ClientBuilder::try_build`] for fallible construction.
     pub fn build(self) -> Client {
         self.try_build().expect("ClientBuilder build failed")
-    }
-}
-
-impl Default for ClientBuilder {
-    fn default() -> Self {
-        Self {
-            host: None,
-            port: None,
-            host_override: None,
-            default_headers: HeaderMap::new(),
-            connection_policy: ConnectionPolicy::default(),
-            read_timeout: None,
-            tls_backend: None,
-            danger_disable_verify: false,
-            sni_hostname: None,
-            #[cfg(feature = "tls-rustls")]
-            extra_roots: Vec::new(),
-        }
     }
 }

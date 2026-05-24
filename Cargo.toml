@@ -47,6 +47,7 @@ clap = "4.6.1"
 
 # Tests and benchmarks
 criterion = "0.8.2"
+rcgen = "0.14.8"
 rstest = "0.26.1"
 
 [workspace.lints.rust]

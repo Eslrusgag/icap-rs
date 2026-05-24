@@ -1,26 +1,27 @@
 //! Example ICAPS server using PEM files from `test_data/certs`.
 //! Build with TLS enabled (`--features tls-rustls`).
 
-#[cfg(feature = "tls-rustls")]
 use icap_rs::error::IcapResult;
-#[cfg(feature = "tls-rustls")]
 use icap_rs::server::options::ServiceOptions;
-#[cfg(feature = "tls-rustls")]
+use icap_rs::tls::ServerTlsConfig;
 use icap_rs::{IncomingRequest, Method, Response, Server};
 
-#[cfg(feature = "tls-rustls")]
 const ISTAG: &str = "scan-1.0";
 
-#[cfg(feature = "tls-rustls")]
 #[tokio::main]
 async fn main() -> IcapResult<()> {
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::TRACE)
         .init();
 
+    let tls = ServerTlsConfig::from_pem_files(
+        "test_data/certs/server.crt",
+        "test_data/certs/server.key",
+    )?;
+
     let server = Server::builder()
         .bind("0.0.0.0:13443")
-        .with_tls_from_pem_files("test_data/certs/server.crt", "test_data/certs/server.key")
+        .with_tls(tls)
         .route(
             "scan",
             [Method::ReqMod, Method::RespMod],
@@ -40,9 +41,4 @@ async fn main() -> IcapResult<()> {
         .await?;
 
     server.run().await
-}
-
-#[cfg(not(feature = "tls-rustls"))]
-fn main() {
-    eprintln!("This example requires feature `tls-rustls`.");
 }

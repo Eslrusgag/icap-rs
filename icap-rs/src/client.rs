@@ -8,14 +8,15 @@
 //! - Keep-Alive reuse of a single idle connection.
 //! - Encapsulated header calculation and chunked bodies.
 //!
-//! TLS backends:
+//! TLS:
 //! - Plain TCP by default.
-//! - Enable `tls-rustls` to use TLS.
-//! - `icaps://` URIs automatically switch to TLS; which backend is used
-//!   depends on enabled features or explicit selection in the builder.
+//! - Enable `tls-rustls` to use TLS (rustls backend).
+//! - `icaps://` URIs automatically switch to TLS using
+//!   [`crate::tls::ClientTlsConfig::with_native_roots`]; supply a custom
+//!   [`crate::tls::ClientTlsConfig`] via [`builder::ClientBuilder::with_tls`]
+//!   to override.
 
 pub mod builder;
-mod tls;
 
 use crate::error::{Error, IcapResult};
 use crate::protocol::{
@@ -25,7 +26,8 @@ use crate::protocol::{
 use crate::request::{serialize_embedded_http, Request};
 use crate::response::{parse_icap_response, ParsedResponse};
 
-use crate::client::tls::{AnyTlsConnector, TlsConnector};
+#[cfg(feature = "tls-rustls")]
+use crate::tls::client::ClientTlsConnector;
 use crate::Method;
 
 use http::HeaderMap;
@@ -64,9 +66,9 @@ struct ClientRef {
     default_headers: HeaderMap,
     connection_policy: ConnectionPolicy,
     read_timeout: Option<Duration>,
-    tls: AnyTlsConnector,
+    #[cfg(feature = "tls-rustls")]
+    tls: Option<ClientTlsConnector>,
     idle_conn: Mutex<Option<Conn>>,
-    sni_hostname: Option<String>,
 }
 
 impl Client {
@@ -555,13 +557,17 @@ const fn request_has_non_empty_buffered_body(req: &Request) -> bool {
 impl ClientRef {
     async fn connect(&self) -> IcapResult<Conn> {
         let tcp = TcpStream::connect((&*self.host, self.port)).await?;
-        // Priority order for SNI selection: user-provided SNI → host_override → host
-        let sni = self
-            .sni_hostname
-            .clone()
-            .or_else(|| self.host_override.clone())
-            .unwrap_or_else(|| self.host.clone());
-        self.tls.connect(tcp, &sni).await
+
+        #[cfg(feature = "tls-rustls")]
+        if let Some(tls) = &self.tls {
+            // Fallback SNI: explicit host_override, otherwise the connection host.
+            let fallback = self.host_override.as_deref().unwrap_or(&self.host);
+            let sni = tls.resolve_sni(fallback).to_string();
+            let stream = tls.connect(tcp, &sni).await?;
+            return Ok(Conn::Rustls { inner: stream });
+        }
+
+        Ok(Conn::Plain { inner: tcp })
     }
 }
 

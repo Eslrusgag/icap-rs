@@ -68,9 +68,13 @@ pub use router::RouteOutput;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+#[cfg(feature = "tls-rustls")]
+use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
+#[cfg(feature = "tls-rustls")]
+use tokio::time::timeout;
 use tracing::{error, trace, warn};
 
 use crate::error::IcapResult;
@@ -119,12 +123,19 @@ pub struct Server {
     default_service: Option<String>,
     request_parser_mode: RequestParserMode,
     #[cfg(feature = "tls-rustls")]
-    tls: Option<TlsAcceptor>,
+    tls: Option<(TlsAcceptor, Duration)>,
 }
 impl Server {
     /// Create a new [`ServerBuilder`].
     pub fn builder() -> ServerBuilder {
         ServerBuilder::default()
+    }
+
+    /// Local socket address the server is bound to.
+    ///
+    /// Useful after binding to an ephemeral port (`127.0.0.1:0`).
+    pub fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
+        self.listener.local_addr()
     }
 
     /// Accept loop:
@@ -167,26 +178,23 @@ impl Server {
                 let _permit = permit_opt;
 
                 if over_limit {
+                    // Reject **before** terminating TLS so a malicious or buggy
+                    // client cannot force the server to spend CPU on a
+                    // handshake just to receive 503. For TLS listeners we
+                    // simply close the TCP socket; clients re-attempt and
+                    // either fit under the limit or are rejected again.
+                    #[cfg(feature = "tls-rustls")]
+                    if tls.is_some() {
+                        let mut sock = socket;
+                        let _ = sock.shutdown().await;
+                        return;
+                    }
+
                     let resp =
                         Response::new(StatusCode::SERVICE_UNAVAILABLE, "Service Unavailable")
                             .add_header("Connection", "close");
                     match resp.to_raw() {
                         Ok(bytes) => {
-                            #[cfg(feature = "tls-rustls")]
-                            {
-                                if let Some(acceptor) = tls {
-                                    match acceptor.accept(socket).await {
-                                        Ok(mut tls_stream) => {
-                                            let _ = tls_stream.write_all(&bytes).await;
-                                            let _ = tls_stream.shutdown().await;
-                                        }
-                                        Err(e) => {
-                                            warn!(client=%addr, error=%e, "TLS handshake failed on overload");
-                                        }
-                                    }
-                                    return;
-                                }
-                            }
                             let mut sock = socket;
                             if let Err(e) = sock.write_all(&bytes).await {
                                 warn!(client=%addr, error=%e, "failed to send 503");
@@ -200,30 +208,35 @@ impl Server {
                 }
 
                 #[cfg(feature = "tls-rustls")]
-                {
-                    if let Some(acceptor) = tls {
-                        match acceptor.accept(socket).await {
-                            Ok(stream) => {
-                                if let Err(e) = Box::pin(Self::handle_connection(
-                                    stream,
-                                    routes,
-                                    aliases,
-                                    default_service,
-                                    advertised_max,
-                                    request_parser_mode,
-                                    addr,
-                                ))
-                                .await
-                                {
-                                    error!(client=%addr, error=%e, "error handling TLS connection");
-                                }
-                            }
-                            Err(e) => {
-                                warn!(client=%addr, error=%e, "TLS handshake failed");
+                if let Some((acceptor, hs_timeout)) = tls {
+                    match timeout(hs_timeout, acceptor.accept(socket)).await {
+                        Ok(Ok(stream)) => {
+                            if let Err(e) = Box::pin(Self::handle_connection(
+                                stream,
+                                routes,
+                                aliases,
+                                default_service,
+                                advertised_max,
+                                request_parser_mode,
+                                addr,
+                            ))
+                            .await
+                            {
+                                error!(client=%addr, error=%e, "error handling TLS connection");
                             }
                         }
-                        return;
+                        Ok(Err(e)) => {
+                            warn!(client=%addr, error=%e, "TLS handshake failed");
+                        }
+                        Err(_) => {
+                            warn!(
+                                client=%addr,
+                                timeout=?hs_timeout,
+                                "TLS handshake timed out",
+                            );
+                        }
                     }
+                    return;
                 }
 
                 // Plain TCP
@@ -250,7 +263,7 @@ mod tests {
     use super::*;
     use crate::{IncomingRequest, Method};
     use rstest::rstest;
-    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::panic::{catch_unwind, AssertUnwindSafe};
 
     async fn handler_ok(_: IncomingRequest) -> IcapResult<Response> {
         Ok(Response::new(StatusCode::OK, "OK")

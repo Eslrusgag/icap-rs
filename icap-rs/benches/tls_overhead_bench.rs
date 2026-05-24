@@ -4,6 +4,7 @@ use icap_rs::error::IcapResult;
 use icap_rs::request::{IncomingRequest, Request};
 use icap_rs::response::{Response, StatusCode};
 use icap_rs::server::Server;
+use icap_rs::tls::{ClientTlsConfig, ServerTlsConfig};
 use icap_rs::{Client, Method, ServiceOptions};
 use std::hint::black_box;
 use std::net::TcpListener as StdTcpListener;
@@ -129,9 +130,12 @@ async fn spawn_plain_server(addr: &str) {
 }
 
 async fn spawn_tls_server(addr: &str) {
+    let tls = ServerTlsConfig::from_pem_files(test_data_path(CERT_PEM), test_data_path(KEY_PEM))
+        .expect("load bench server cert/key");
+
     let server = Server::builder()
         .bind(addr)
-        .with_tls_from_pem_files(test_data_path(CERT_PEM), test_data_path(KEY_PEM))
+        .with_tls(tls)
         .route(
             "respmod",
             [Method::RespMod],
@@ -154,12 +158,15 @@ async fn fast_204_handler(_req: IncomingRequest) -> IcapResult<Response> {
 }
 
 fn tls_client(port: u16, keep_alive: bool) -> Client {
+    let tls = ClientTlsConfig::with_native_roots()
+        .add_root_ca_pem(test_data_path(CA_PEM))
+        .expect("load benchmark CA")
+        .with_sni("localhost");
+
     Client::builder()
         .with_uri(&format!("icaps://localhost:{port}/respmod"))
         .expect("valid ICAPS benchmark URI")
-        .add_root_ca_pem_file(test_data_path(CA_PEM))
-        .expect("load benchmark CA")
-        .sni_hostname("localhost")
+        .with_tls(tls)
         .keep_alive(keep_alive)
         .build()
 }

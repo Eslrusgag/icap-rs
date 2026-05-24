@@ -410,9 +410,11 @@ Enable Rustls support with:
 icap-rs = { version = "0.2.0", features = ["tls-rustls"] }
 ```
 
-Then use `icaps://` URIs for clients or `ServerBuilder::with_tls_from_pem_files`
-and `ServerBuilder::with_mtls_from_pem_files` for listeners. See
-[`docs/tls.md`](docs/tls.md).
+Then use `icaps://` URIs for clients, and `ServerBuilder::with_tls` plus a
+[`ServerTlsConfig`](src/tls/server.rs) on the server side (use
+`with_client_auth_pem` for mTLS). On the client, customise TLS via
+[`ClientTlsConfig`](src/tls/client.rs) and `ClientBuilder::with_tls`.
+See [`docs/tls.md`](docs/tls.md) for the full guide.
 
 ## Examples
 

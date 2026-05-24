@@ -1,35 +1,19 @@
-use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::collections::HashMap;
 use std::future::Future;
-#[cfg(feature = "tls-rustls")]
-use std::path::PathBuf;
 use std::sync::Arc;
 
-#[cfg(feature = "tls-rustls")]
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-#[cfg(feature = "tls-rustls")]
-use rustls::{RootCertStore, ServerConfig};
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
-#[cfg(feature = "tls-rustls")]
-use tokio_rustls::TlsAcceptor;
 
 use crate::error::IcapResult;
 use crate::request::{IncomingRequest, RequestParserMode};
+#[cfg(feature = "tls-rustls")]
+use crate::tls::ServerTlsConfig;
 use crate::{Method, ServiceOptions};
 
+use super::router::{resolve_service, HandlerEntry, RequestHandler, RouteEntry, RouteOutput};
 use super::Server;
-use super::router::{HandlerEntry, RequestHandler, RouteEntry, RouteOutput, resolve_service};
-
-#[cfg(feature = "tls-rustls")]
-#[derive(Clone)]
-struct TlsParams {
-    cert_path: PathBuf,
-    key_path: PathBuf,
-    ca_path: Option<PathBuf>,
-    require_client_auth: bool,
-    alpn_icap: bool,
-}
 
 /// Builder for [`Server`].
 ///
@@ -47,99 +31,33 @@ pub struct ServerBuilder {
     default_service: Option<String>,
     request_parser_mode: RequestParserMode,
     #[cfg(feature = "tls-rustls")]
-    tls: Option<TlsParams>,
+    tls: Option<ServerTlsConfig>,
 }
 
 impl ServerBuilder {
-    #[cfg(feature = "tls-rustls")]
-    /// Enables ICAPS (ICAP over TLS) using Rustls by loading the server certificate
-    /// chain and private key from PEM files.
+    /// Enable ICAPS (ICAP over TLS) using the supplied [`ServerTlsConfig`].
     ///
-    /// The TLS handshake is terminated inside the server via Rustls. By default,
-    /// the server advertises the `icap` ALPN identifier (clients that ignore ALPN
-    /// remain compatible). **Client authentication is not required**; for mTLS use
-    /// [`ServerBuilder::with_mtls_from_pem_files`].
+    /// Configuration objects encapsulate the certificate chain, private key,
+    /// optional client-certificate verification and the handshake timeout.
+    /// See the [`crate::tls`] module for builders to construct one.
     ///
-    /// This method is only available when the `tls-rustls` feature is enabled.
-    ///
-    /// # Parameters
-    /// - `cert_pem`: Path to a PEM file containing the server certificate chain
-    ///   (leaf first, followed by intermediates if any).
-    /// - `key_pem`: Path to a PEM file containing the server’s private key
-    ///   (PKCS#8 or legacy RSA formats are supported).
+    /// Only available when the `tls-rustls` feature is enabled.
     ///
     /// # Example
     /// ```no_run
-    /// use icap_rs::{IcapResult, IncomingRequest, Method, Response, Server, ServiceOptions};
+    /// use icap_rs::{
+    ///     IcapResult, IncomingRequest, Method, Response, Server, ServerTlsConfig, ServiceOptions,
+    /// };
     ///
     /// const ISTAG: &str = "scan-1.0";
     ///
     /// #[tokio::main]
     /// async fn main() -> IcapResult<()> {
+    ///     let tls = ServerTlsConfig::from_pem_files("certs/server.crt", "certs/server.key")?;
+    ///
     ///     let server = Server::builder()
-    ///         .bind("0.0.0.0:13443") // ICAPS port
-    ///         .with_tls_from_pem_files("certs/server.crt", "certs/server.key")
-    ///         .route(
-    ///             "test",
-    ///             [Method::ReqMod, Method::RespMod],
-    ///             |_req: IncomingRequest| async move {
-    ///                 Ok(Response::no_content_with_istag(ISTAG)?)
-    ///             },
-    ///             Some(ServiceOptions::new()
-    ///                 .with_static_istag(ISTAG)
-    ///                 .with_preview(2048)
-    ///                 .allow_204()),
-    ///         )
-    ///         .build().await?;
-    ///
-    ///     server.run().await
-    /// }
-    /// ```
-    pub fn with_tls_from_pem_files(
-        mut self,
-        cert_pem: impl Into<PathBuf>,
-        key_pem: impl Into<PathBuf>,
-    ) -> Self {
-        self.tls = Some(TlsParams {
-            cert_path: cert_pem.into(),
-            key_path: key_pem.into(),
-            ca_path: None,
-            require_client_auth: false,
-            alpn_icap: true,
-        });
-        self
-    }
-
-    #[cfg(feature = "tls-rustls")]
-    /// Enables **mutual TLS (mTLS)** using Rustls: clients must present a certificate
-    /// that validates against the provided CA bundle.
-    ///
-    /// The server performs client-certificate validation using the given CA(s).
-    /// By default, the server advertises the `icap` ALPN identifier.
-    ///
-    /// This method is only available when the `tls-rustls` feature is enabled.
-    ///
-    /// # Parameters
-    /// - `cert_pem`: Path to the server certificate chain in PEM (leaf → intermediates).
-    /// - `key_pem`: Path to the server private key in PEM (PKCS#8 or RSA).
-    /// - `ca_pem`: Path to a PEM file containing one or more CA roots used to verify
-    ///   client certificates.
-    ///
-    /// # Example
-    /// ```no_run
-    /// use icap_rs::{IcapResult, IncomingRequest, Method, Response, Server, ServiceOptions};
-    ///
-    /// const ISTAG: &str = "scan-1.0";
-    ///
-    /// #[tokio::main]
-    /// async fn main() -> IcapResult<()> {
-    ///     let server = Server::builder()
-    ///         .bind("0.0.0.0:13443")
-    ///         .with_mtls_from_pem_files(
-    ///             "certs/server.crt",
-    ///             "certs/server.key",
-    ///             "certs/ca.pem", // trusted CA(s) for client-auth verification
-    ///         )
+    ///         .bind("0.0.0.0:11344")
+    ///         .with_tls(tls)
     ///         .route(
     ///             "scan",
     ///             [Method::ReqMod, Method::RespMod],
@@ -156,19 +74,9 @@ impl ServerBuilder {
     ///     server.run().await
     /// }
     /// ```
-    pub fn with_mtls_from_pem_files(
-        mut self,
-        cert_pem: impl Into<PathBuf>,
-        key_pem: impl Into<PathBuf>,
-        ca_pem: impl Into<PathBuf>,
-    ) -> Self {
-        self.tls = Some(TlsParams {
-            cert_path: cert_pem.into(),
-            key_path: key_pem.into(),
-            ca_path: Some(ca_pem.into()),
-            require_client_auth: true,
-            alpn_icap: true,
-        });
+    #[cfg(feature = "tls-rustls")]
+    pub fn with_tls(mut self, config: ServerTlsConfig) -> Self {
+        self.tls = Some(config);
         self
     }
 
@@ -353,11 +261,7 @@ impl ServerBuilder {
 
         // TLS (only when feature is enabled)
         #[cfg(feature = "tls-rustls")]
-        let tls_acceptor: Option<TlsAcceptor> = if let Some(tls) = &self.tls {
-            Some(load_rustls_acceptor(tls)?)
-        } else {
-            None
-        };
+        let tls = self.tls.map(ServerTlsConfig::into_acceptor).transpose()?;
 
         Ok(Server {
             listener,
@@ -369,7 +273,7 @@ impl ServerBuilder {
             request_parser_mode: self.request_parser_mode,
 
             #[cfg(feature = "tls-rustls")]
-            tls: tls_acceptor,
+            tls,
         })
     }
 }
@@ -418,84 +322,4 @@ fn validate_builder_config(
     }
 
     Ok(())
-}
-
-#[cfg(feature = "tls-rustls")]
-fn load_rustls_acceptor(tls: &TlsParams) -> Result<TlsAcceptor, String> {
-    use std::io::BufReader;
-
-    // Certificates
-    let mut cert_r = BufReader::new(
-        std::fs::File::open(&tls.cert_path).map_err(|e| format!("TLS: open cert: {e}"))?,
-    );
-    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_r)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| format!("TLS: parse certs: {e}"))?;
-
-    // Private key: try PKCS#8 first, then RSA
-    let mut key_r = BufReader::new(
-        std::fs::File::open(&tls.key_path).map_err(|e| format!("TLS: open key: {e}"))?,
-    );
-
-    let mut keys: Vec<PrivateKeyDer<'static>> = rustls_pemfile::pkcs8_private_keys(&mut key_r)
-        .map(|res| res.map(Into::into))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| format!("TLS: parse pkcs8 key: {e}"))?;
-
-    if keys.is_empty() {
-        let mut key_r = BufReader::new(
-            std::fs::File::open(&tls.key_path)
-                .map_err(|e| format!("TLS: reopen key (rsa): {e}"))?,
-        );
-        keys = rustls_pemfile::rsa_private_keys(&mut key_r)
-            .map(|res| res.map(Into::into))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("TLS: parse rsa key: {e}"))?;
-    }
-    let key = keys.into_iter().next().ok_or("TLS: no private key found")?;
-
-    // Server config (+ optional mTLS)
-    let server_config = if tls.require_client_auth {
-        // Load client CA(s)
-        let ca_path = tls
-            .ca_path
-            .clone()
-            .ok_or("TLS: ca_pem path is required for mTLS")?;
-        let mut ca_r = BufReader::new(
-            std::fs::File::open(&ca_path).map_err(|e| format!("TLS: open ca: {e}"))?,
-        );
-        let cas: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut ca_r)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("TLS: parse ca: {e}"))?;
-
-        let mut roots = RootCertStore::empty();
-        for c in cas {
-            roots.add(c).map_err(|e| format!("TLS: add CA: {e}"))?;
-        }
-
-        let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
-            .build()
-            .map_err(|e| format!("TLS: build client verifier: {e}"))?;
-
-        let mut cfg = ServerConfig::builder()
-            .with_client_cert_verifier(verifier)
-            .with_single_cert(certs, key)
-            .map_err(|e| format!("TLS: build server config (mtls): {e}"))?;
-
-        if tls.alpn_icap {
-            cfg.alpn_protocols.push(b"icap".to_vec());
-        }
-        cfg
-    } else {
-        let mut cfg = ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(certs, key)
-            .map_err(|e| format!("TLS: build server config: {e}"))?;
-        if tls.alpn_icap {
-            cfg.alpn_protocols.push(b"icap".to_vec());
-        }
-        cfg
-    };
-
-    Ok(TlsAcceptor::from(Arc::new(server_config)))
 }
