@@ -23,12 +23,12 @@ use crate::protocol::{
     canon_icap_header, find_double_crlf, parse_encapsulated_header, read_chunked_to_end,
     write_chunk, write_chunk_into,
 };
-use crate::request::{serialize_embedded_http, Request};
-use crate::response::{parse_icap_response, ParsedResponse};
+use crate::request::{Request, serialize_embedded_http};
+use crate::response::{ParsedResponse, parse_icap_response};
 
+use crate::Method;
 #[cfg(feature = "tls-rustls")]
 use crate::tls::client::ClientTlsConnector;
-use crate::Method;
 
 use http::HeaderMap;
 use std::collections::HashSet;
@@ -1034,17 +1034,15 @@ fn build_preview_and_chunks(
             // body is empty after a body_limit=Some(0) truncation even when the
             // original had bytes.  Use original_body_len to decide the terminator.
             let has_body = original_body_len > 0;
-            if !has_body {
-                if preview0_ieof {
-                    out.extend_from_slice(b"0; ieof\r\n\r\n");
-                    (out, false, None)
-                } else {
-                    out.extend_from_slice(b"0\r\n\r\n");
-                    (out, true, Some(Vec::new()))
-                }
-            } else {
+            if has_body {
                 out.extend_from_slice(b"0\r\n\r\n");
                 (out, true, Some(body))
+            } else if preview0_ieof {
+                out.extend_from_slice(b"0; ieof\r\n\r\n");
+                (out, false, None)
+            } else {
+                out.extend_from_slice(b"0\r\n\r\n");
+                (out, true, Some(Vec::new()))
             }
         }
         Some(ps) => {
@@ -1074,11 +1072,11 @@ fn build_preview_and_chunks(
 mod tests {
     use super::*;
     use crate::protocol::find_double_crlf;
-    use http::{header, Request as HttpReq, Version};
+    use http::{Request as HttpReq, Version, header};
     use rstest::{fixture, rstest};
     use std::future;
     use tokio::net::{TcpListener, TcpStream};
-    use tokio::time::{timeout, Duration};
+    use tokio::time::{Duration, timeout};
 
     fn bytes_to_string_prefix(v: &[u8], n: usize) -> String {
         String::from_utf8_lossy(&v[..v.len().min(n)]).to_string()

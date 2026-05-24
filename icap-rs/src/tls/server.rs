@@ -6,13 +6,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use rustls::server::{ServerConfig, WebPkiClientVerifier};
 use rustls::RootCertStore;
+use rustls::server::{ServerConfig, WebPkiClientVerifier};
 use tokio_rustls::TlsAcceptor;
 
 use super::error::TlsError;
 use super::pem::{load_cert_chain, load_private_key, load_roots_into};
-use super::{ensure_crypto_provider, DEFAULT_HANDSHAKE_TIMEOUT};
+use super::{DEFAULT_HANDSHAKE_TIMEOUT, ensure_crypto_provider};
 
 /// Server-side TLS configuration for ICAPS listeners.
 ///

@@ -1,4 +1,4 @@
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use http::{Response as HttpResponse, StatusCode as HttpStatus, Version};
 use icap_rs::error::IcapResult;
 use icap_rs::request::{IncomingRequest, Request};
@@ -13,7 +13,7 @@ use tokio::net::TcpStream;
 use tokio::runtime::{Builder as RtBuilder, Runtime};
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 
 const CONCURRENCY_LEVELS: &[usize] = &[1, 4, 16];
 

@@ -1,5 +1,5 @@
-use clap::builder::styling::{AnsiColor, Color, Style, Styles};
 use clap::Parser;
+use clap::builder::styling::{AnsiColor, Color, Style, Styles};
 
 use http::{
     HeaderName, HeaderValue, Method, Request as HttpRequest, Response as HttpResponse, StatusCode,

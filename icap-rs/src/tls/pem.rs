@@ -7,8 +7,8 @@ use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
 
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::RootCertStore;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 use super::error::TlsError;
 

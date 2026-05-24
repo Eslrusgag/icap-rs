@@ -10,7 +10,7 @@ use http::header::{InvalidHeaderName, InvalidHeaderValue};
 use http::method::InvalidMethod;
 use http::status::InvalidStatusCode;
 use http::uri::{InvalidUri, InvalidUriParts};
-use http::{header::ToStrError, Error as HttpError};
+use http::{Error as HttpError, header::ToStrError};
 use std::error::Error as StdError;
 use std::str::Utf8Error;
 use std::string::FromUtf8Error;

@@ -10,8 +10,8 @@ pub mod server;
 #[cfg(feature = "tls-rustls")]
 pub mod tls;
 
-pub use client::builder::*;
 pub use client::Client;
+pub use client::builder::*;
 pub use error::{Error, IcapResult};
 pub use request::{
     Body, EmbeddedHttp, EmbeddedHttpKind, Incoming, IncomingRequest, Method, Outbound,

@@ -1,9 +1,9 @@
+use crate::ICAP_VERSION;
 use crate::error::{Error, IcapResult};
 use crate::protocol::chunked::write_chunk_into;
 use crate::protocol::encapsulated::parse_encapsulated_value;
 use crate::protocol::validate_istag;
 use crate::response::Response;
-use crate::ICAP_VERSION;
 use http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Version};
 use std::borrow::Cow;
 use std::io::Write as IoWrite;

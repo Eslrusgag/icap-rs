@@ -1,4 +1,4 @@
-use crate::client::{parse_authority_with_scheme, Client, ClientRef};
+use crate::client::{Client, ClientRef, parse_authority_with_scheme};
 #[cfg(feature = "tls-rustls")]
 use crate::tls::ClientTlsConfig;
 use crate::{Error, IcapResult};

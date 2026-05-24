@@ -6,17 +6,17 @@ use std::path::Path;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use rustls::RootCertStore;
 use rustls::client::ClientConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
-use rustls::RootCertStore;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
-use tokio_rustls::{client::TlsStream, TlsConnector as TokioTlsConnector};
+use tokio_rustls::{TlsConnector as TokioTlsConnector, client::TlsStream};
 use tracing::warn;
 
 use super::error::TlsError;
 use super::pem::{load_cert_chain, load_private_key, load_roots_into};
-use super::{ensure_crypto_provider, DEFAULT_HANDSHAKE_TIMEOUT};
+use super::{DEFAULT_HANDSHAKE_TIMEOUT, ensure_crypto_provider};
 
 /// Client-side TLS configuration for ICAPS connections.
 ///
@@ -354,10 +354,10 @@ fn build_client_config(source: &ClientTlsInner) -> Result<ClientConfig, String> 
 }
 
 mod danger {
+    use rustls::DigitallySignedStruct;
     use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
     use rustls::crypto::CryptoProvider;
     use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-    use rustls::DigitallySignedStruct;
 
     /// Verifier that accepts any server certificate. Used **only** when
     /// the caller explicitly opted into

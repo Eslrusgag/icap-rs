@@ -49,12 +49,12 @@
 //! # Ok::<(), icap_rs::Error>(())
 //! ```
 
+use crate::ICAP_VERSION;
 use crate::error::{Error, IcapResult};
 use crate::protocol::{
     find_double_crlf, parse_header_lines, parse_http_request_start_line,
     parse_http_response_start_line,
 };
-use crate::ICAP_VERSION;
 use bytes::Bytes;
 use http::{HeaderMap, HeaderName, HeaderValue, Request as HttpRequest, Response as HttpResponse};
 use memchr::memmem;
@@ -273,9 +273,10 @@ impl<T: AsRef<[u8]> + Unpin> AsyncRead for CursorReader<T> {
         _cx: &mut std::task::Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        // Read directly into the ReadBuf's unfilled portion — no intermediate copy.
-        let pos = self.0.position() as usize;
+        // Read directly into the ReadBuf's unfilled portion; invalid cursor positions
+        // are treated as EOF because this reader only advances within the backing slice.
         let src = self.0.get_ref().as_ref();
+        let pos = usize::try_from(self.0.position()).map_or(src.len(), |pos| pos.min(src.len()));
         let remaining = src.len().saturating_sub(pos);
         if remaining > 0 {
             let to_copy = remaining.min(buf.remaining());

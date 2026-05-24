@@ -12,13 +12,13 @@ use crate::protocol::{
     read_chunked_until_zero,
 };
 use crate::request::{
-    parse_icap_request, parse_icap_request_with_mode, IncomingRequest, RequestParserMode,
+    IncomingRequest, RequestParserMode, parse_icap_request, parse_icap_request_with_mode,
 };
 use crate::{Body, EmbeddedHttp, Method, Response, StatusCode};
 
-use super::preview::{mark_request_body_as_preview, PreviewDecision};
-use super::router::{resolve_service, RouteEntry};
 use super::Server;
+use super::preview::{PreviewDecision, mark_request_body_as_preview};
+use super::router::{RouteEntry, resolve_service};
 impl Server {
     /// Handle a single client connection (persistent / keep-alive).
     ///
@@ -83,17 +83,14 @@ impl Server {
 
             // Parse header fields as &str — avoids a String allocation.
             // Both enc and preview_size must be extracted before buf is mutated.
-            let hdr_str = match std::str::from_utf8(&buf[buf_start..h_end]) {
-                Ok(s) => s,
-                Err(_) => {
-                    Self::write_wire_error_response(
-                        &mut socket,
-                        StatusCode::BAD_REQUEST,
-                        "Bad Request",
-                    )
-                    .await?;
-                    return Ok(());
-                }
+            let Ok(hdr_str) = std::str::from_utf8(&buf[buf_start..h_end]) else {
+                Self::write_wire_error_response(
+                    &mut socket,
+                    StatusCode::BAD_REQUEST,
+                    "Bad Request",
+                )
+                .await?;
+                return Ok(());
             };
             let enc = parse_encapsulated_header(hdr_str);
             let preview_size = parse_preview_header_value(hdr_str);

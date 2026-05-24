@@ -263,7 +263,7 @@ mod tests {
     use super::*;
     use crate::{IncomingRequest, Method};
     use rstest::rstest;
-    use std::panic::{catch_unwind, AssertUnwindSafe};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
 
     async fn handler_ok(_: IncomingRequest) -> IcapResult<Response> {
         Ok(Response::new(StatusCode::OK, "OK")

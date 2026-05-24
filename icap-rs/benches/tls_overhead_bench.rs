@@ -1,4 +1,4 @@
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use http::{Response as HttpResponse, StatusCode as HttpStatus, Version};
 use icap_rs::error::IcapResult;
 use icap_rs::request::{IncomingRequest, Request};

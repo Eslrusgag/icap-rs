@@ -13,7 +13,7 @@
 
 ```toml
 # Default rustls backend (ring crypto provider — no C toolchain required).
-icap-rs = { version = "0.2.0", features = ["tls-rustls"] }
+icap-rs = { version = "0.3.0", features = ["tls-rustls"] }
 ```
 
 `tls-rustls-aws-lc-rs` is an additive opt-in that also compiles the

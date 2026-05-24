@@ -11,8 +11,8 @@
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use icap_rs::error::Error;
@@ -21,8 +21,8 @@ use icap_rs::tls::{ClientTlsConfig, ServerTlsConfig, TlsError};
 use icap_rs::{Client, IncomingRequest, Method, Request, Response, Server};
 
 use rcgen::{
-	BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
-	Issuer, KeyPair, KeyUsagePurpose,
+    BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
+    Issuer, KeyPair, KeyUsagePurpose,
 };
 
 // ---------------------------------------------------------------------------

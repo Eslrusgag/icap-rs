@@ -1,5 +1,5 @@
-use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::future::Future;
 use std::sync::Arc;
 
@@ -12,8 +12,8 @@ use crate::request::{IncomingRequest, RequestParserMode};
 use crate::tls::ServerTlsConfig;
 use crate::{Method, ServiceOptions};
 
-use super::router::{resolve_service, HandlerEntry, RequestHandler, RouteEntry, RouteOutput};
 use super::Server;
+use super::router::{HandlerEntry, RequestHandler, RouteEntry, RouteOutput, resolve_service};
 
 /// Builder for [`Server`].
 ///

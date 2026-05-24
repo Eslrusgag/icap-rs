@@ -407,7 +407,7 @@ request/response, or use `IncomingRequest::embedded_mut()` /
 Enable Rustls support with:
 
 ```toml
-icap-rs = { version = "0.2.0", features = ["tls-rustls"] }
+icap-rs = { version = "0.3.0", features = ["tls-rustls"] }
 ```
 
 Then use `icaps://` URIs for clients, and `ServerBuilder::with_tls` plus a

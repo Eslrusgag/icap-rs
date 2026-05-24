@@ -1,4 +1,4 @@
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use http::{Request as HttpRequest, Response as HttpResponse, Version};
 use icap_rs::{Client, ParsedResponse, Request, Response, StatusCode};
 use std::hint::black_box;
