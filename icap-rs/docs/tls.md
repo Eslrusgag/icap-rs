@@ -26,6 +26,7 @@ Without `tls-rustls`, using an `icaps://` URI returns an error.
 ```rust,ignore
 use icap_rs::{Client, Request};
 
+#[cfg(feature = "tls-rustls")]
 #[tokio::main]
 async fn main() -> icap_rs::error::IcapResult<()> {
     let client = Client::builder()
@@ -33,7 +34,7 @@ async fn main() -> icap_rs::error::IcapResult<()> {
         .build();
 
     let response = client.send(&Request::options("respmod")).await?;
-    println!("ICAP {} {}", response.status_code, response.status_text);
+    println!("ICAP {} {}", response.status_code(), response.status_text());
     Ok(())
 }
 ```
@@ -49,6 +50,7 @@ self-signed deployment certificate:
 ```rust,ignore
 use icap_rs::{Client, Request};
 
+#[cfg(feature = "tls-rustls")]
 #[tokio::main]
 async fn main() -> icap_rs::error::IcapResult<()> {
     let client = Client::builder()
@@ -58,7 +60,7 @@ async fn main() -> icap_rs::error::IcapResult<()> {
         .build();
 
     let response = client.send(&Request::options("scan")).await?;
-    println!("ICAP {} {}", response.status_code, response.status_text);
+    println!("ICAP {} {}", response.status_code(), response.status_text());
     Ok(())
 }
 ```
@@ -77,11 +79,12 @@ Install a trusted CA or provide one with `add_root_ca_pem_file`.
 ## Server TLS
 
 ```rust,ignore
-use icap_rs::{Request, Response, Server};
+use icap_rs::{IncomingRequest, Response, Server};
 use icap_rs::server::options::ServiceOptions;
 
 const ISTAG: &str = "tls-server-1.0";
 
+#[cfg(feature = "tls-rustls")]
 #[tokio::main]
 async fn main() -> icap_rs::error::IcapResult<()> {
     let server = Server::builder()
@@ -92,7 +95,7 @@ async fn main() -> icap_rs::error::IcapResult<()> {
         )
         .route_respmod(
             "respmod",
-            |_request: Request| async move {
+            |_request: IncomingRequest| async move {
                 Response::no_content_with_istag(ISTAG)
             },
             Some(
@@ -119,11 +122,12 @@ Use `with_mtls_from_pem_files` when clients must present certificates signed by
 a configured CA:
 
 ```rust,ignore
-use icap_rs::{Request, Response, Server};
+use icap_rs::{IncomingRequest, Response, Server};
 use icap_rs::server::options::ServiceOptions;
 
 const ISTAG: &str = "mtls-server-1.0";
 
+#[cfg(feature = "tls-rustls")]
 #[tokio::main]
 async fn main() -> icap_rs::error::IcapResult<()> {
     let server = Server::builder()
@@ -135,7 +139,7 @@ async fn main() -> icap_rs::error::IcapResult<()> {
         )
         .route_reqmod(
             "scan",
-            |_request: Request| async move {
+            |_request: IncomingRequest| async move {
                 Response::no_content_with_istag(ISTAG)
             },
             Some(

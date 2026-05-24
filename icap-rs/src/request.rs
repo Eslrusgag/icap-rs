@@ -64,7 +64,6 @@ use std::marker::PhantomData;
 use std::str::FromStr;
 use tracing::trace;
 
-use std::io::Read as _;
 use std::io::Write as _;
 use std::pin::Pin;
 use tokio::io::AsyncRead;
@@ -274,17 +273,16 @@ impl<T: AsRef<[u8]> + Unpin> AsyncRead for CursorReader<T> {
         _cx: &mut std::task::Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        let mut tmp = [0u8; 8192];
-        let want = buf.remaining().min(tmp.len());
-        match self.0.read(&mut tmp[..want]) {
-            Ok(n) => {
-                if n > 0 {
-                    buf.put_slice(&tmp[..n]);
-                }
-                std::task::Poll::Ready(Ok(()))
-            }
-            Err(e) => std::task::Poll::Ready(Err(e)),
+        // Read directly into the ReadBuf's unfilled portion — no intermediate copy.
+        let pos = self.0.position() as usize;
+        let src = self.0.get_ref().as_ref();
+        let remaining = src.len().saturating_sub(pos);
+        if remaining > 0 {
+            let to_copy = remaining.min(buf.remaining());
+            buf.put_slice(&src[pos..pos + to_copy]);
+            self.0.set_position((pos + to_copy) as u64);
         }
+        std::task::Poll::Ready(Ok(()))
     }
 }
 impl Body<BodyRead> {

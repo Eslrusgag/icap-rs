@@ -14,7 +14,7 @@ use crate::protocol::{
 use crate::request::{
     IncomingRequest, RequestParserMode, parse_icap_request, parse_icap_request_with_mode,
 };
-use crate::{Body, EmbeddedHttp, Method, Response, ServiceOptions, StatusCode};
+use crate::{Body, EmbeddedHttp, Method, Response, StatusCode};
 
 use super::Server;
 use super::preview::{PreviewDecision, mark_request_body_as_preview};
@@ -38,18 +38,31 @@ impl Server {
     {
         let mut buf: Vec<u8> = Vec::with_capacity(16 * 1024);
         let mut tmp = [0u8; 8192];
+        // Byte offset into `buf` where the current (unprocessed) request starts.
+        // Avoids O(N) Vec::drain on every keep-alive request.
+        let mut buf_start: usize = 0;
 
         loop {
             // === Read headers ===
             let h_end = loop {
-                if let Some(end) = find_double_crlf(&buf) {
-                    break end;
+                if let Some(end) = find_double_crlf(&buf[buf_start..]) {
+                    break buf_start + end;
+                }
+
+                if buf.len() - buf_start > crate::MAX_HDR_BYTES {
+                    Self::write_wire_error_response(
+                        &mut socket,
+                        StatusCode::BAD_REQUEST,
+                        "Request Header Too Large",
+                    )
+                    .await?;
+                    return Ok(());
                 }
 
                 let n = match socket.read(&mut tmp).await {
                     Ok(n) => n,
                     Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                        return if buf.is_empty() {
+                        return if buf_start == buf.len() {
                             Ok(())
                         } else {
                             Err("EOF before complete ICAP headers".into())
@@ -59,7 +72,7 @@ impl Server {
                 };
 
                 if n == 0 {
-                    return if buf.is_empty() {
+                    return if buf_start == buf.len() {
                         Ok(())
                     } else {
                         Err("EOF before complete ICAP headers".into())
@@ -68,18 +81,24 @@ impl Server {
                 buf.extend_from_slice(&tmp[..n]);
             };
 
-            let hdr_text = if let Ok(text) = std::str::from_utf8(&buf[..h_end]) {
-                text.to_string()
-            } else {
-                Self::write_wire_error_response(
-                    &mut socket,
-                    StatusCode::BAD_REQUEST,
-                    "Bad Request",
-                )
-                .await?;
-                return Ok(());
+            // Parse header fields as &str — avoids a String allocation.
+            // Both enc and preview_size must be extracted before buf is mutated.
+            let hdr_str = match std::str::from_utf8(&buf[buf_start..h_end]) {
+                Ok(s) => s,
+                Err(_) => {
+                    Self::write_wire_error_response(
+                        &mut socket,
+                        StatusCode::BAD_REQUEST,
+                        "Bad Request",
+                    )
+                    .await?;
+                    return Ok(());
+                }
             };
-            let enc = match parse_encapsulated_header(&hdr_text) {
+            let enc = parse_encapsulated_header(hdr_str);
+            let preview_size = parse_preview_header_value(hdr_str);
+            // Last use of hdr_str; NLL ends the borrow here so buf can be mutated below.
+            let enc = match enc {
                 Ok(enc) => enc,
                 Err(err) => {
                     warn!(client=%addr, error=%err, "malformed ICAP Encapsulated header");
@@ -99,7 +118,6 @@ impl Server {
                     buf.extend_from_slice(&tmp[..n]);
                 }
 
-                let preview_size = parse_preview_header_value(&hdr_text);
                 if preview_size.is_some() {
                     let (preview_end, preview_ieof) =
                         read_chunked_until_zero(&mut socket, &mut buf, body_abs).await?;
@@ -112,12 +130,14 @@ impl Server {
                     if preview_ieof {
                         msg_end = preview_end;
                     } else {
-                        let mut preview_buf = buf.clone();
+                        // Build a minimal parse buffer: ICAP headers + dechunked preview body.
+                        // Avoids cloning the entire `buf` (which may be much larger).
                         let preview_len = decoded.len();
-                        preview_buf.splice(body_abs..preview_end, decoded.clone());
-                        let preview_msg_end = body_abs + preview_len;
+                        let mut parse_buf = Vec::with_capacity((body_abs - buf_start) + preview_len);
+                        parse_buf.extend_from_slice(&buf[buf_start..body_abs]);
+                        parse_buf.extend_from_slice(&decoded);
                         let mut preview_req = match parse_request_for_mode(
-                            &preview_buf[..preview_msg_end],
+                            &parse_buf,
                             request_parser_mode,
                         ) {
                             Ok(req) => req,
@@ -171,7 +191,8 @@ impl Server {
                                         return Ok(());
                                     }
 
-                                    buf.drain(..preview_end);
+                                    // Advance past preview bytes without O(N) drain.
+                                    advance_buf(&mut buf, &mut buf_start, preview_end);
                                     continue;
                                 }
                             }
@@ -216,7 +237,7 @@ impl Server {
             }
 
             // === Parse + route ===
-            let req = match parse_request_for_mode(&buf[..msg_end], request_parser_mode) {
+            let req = match parse_request_for_mode(&buf[buf_start..msg_end], request_parser_mode) {
                 Ok(req) => req,
                 Err(err) => {
                     warn!(client=%addr, error=%err, "malformed ICAP request");
@@ -239,16 +260,13 @@ impl Server {
                 if method == Method::Options {
                     let mut allowed: SmallVec<Method, 2> = entry.handlers.keys().copied().collect();
                     allowed.sort_unstable();
-                    let mut cfg = entry.options.as_ref().map_or_else(
-                        || {
-                            ServiceOptions::new()
-                                .with_static_istag(&format!("{service_resolved}-default-1.0"))
-                                .with_options_ttl(3600)
-                                .allow_204()
-                                .allow_206()
-                        },
-                        Clone::clone,
-                    );
+                    let Some(mut cfg) = entry.options.clone() else {
+                        return Err(format!(
+                            "Service '{}' has no explicit OPTIONS configuration with ISTag",
+                            service_resolved.as_ref()
+                        )
+                        .into());
+                    };
                     cfg.set_methods(allowed);
                     if cfg.service.is_none() {
                         cfg = cfg
@@ -257,17 +275,21 @@ impl Server {
                     if let (Some(n), None) = (advertised_max_conn, cfg.max_connections) {
                         cfg.with_max_connections(n);
                     }
-                    cfg.build_response_for(&req)
+                    cfg.build_response_for(&req)?
                 } else {
                     let allow_204 = req.allow_204;
                     let allow_206 = req.allow_206;
                     let has_preview = req.icap_headers.get("Preview").is_some();
 
                     if !allow_204 && !has_preview {
-                        let istag_now = entry.options.as_ref().map_or_else(
-                            || format!("{service_resolved}-default-1.0"),
-                            |opts| opts.istag_for(&req),
-                        );
+                        let Some(options) = entry.options.as_ref() else {
+                            return Err(format!(
+                                "Service '{}' has no explicit OPTIONS configuration with ISTag",
+                                service_resolved.as_ref()
+                            )
+                            .into());
+                        };
+                        let istag_now = options.istag_for(&req)?;
 
                         if allow_206
                             && let Some(out) =
@@ -361,8 +383,26 @@ impl Server {
                 let _ = socket.shutdown().await;
                 return Ok(());
             }
-            buf.drain(..msg_end);
+            advance_buf(&mut buf, &mut buf_start, msg_end);
         }
+    }
+}
+
+/// Advance `buf_start` past `new_start`, compacting the buffer when it is cost-effective.
+///
+/// - If all bytes have been consumed, clear the buffer in O(1) without any copy.
+/// - If more than half the capacity is dead space, drain the prefix (one copy of the
+///   remainder, but resets `buf_start` to 0 for future requests).
+/// - Otherwise, just advance the cursor — no copy at all.
+#[inline]
+fn advance_buf(buf: &mut Vec<u8>, buf_start: &mut usize, new_start: usize) {
+    *buf_start = new_start;
+    if *buf_start == buf.len() {
+        buf.clear();
+        *buf_start = 0;
+    } else if *buf_start >= buf.capacity() / 2 {
+        buf.drain(..*buf_start);
+        *buf_start = 0;
     }
 }
 

@@ -389,8 +389,9 @@ mod tests {
 
     #[tokio::test]
     async fn build_errors_when_alias_target_is_unknown() {
+        let options = ServiceOptions::new().with_static_istag("svc-1.0");
         let result = Server::builder()
-            .route_reqmod("svc", handler_ok, None)
+            .route_reqmod("svc", handler_ok, Some(options))
             .alias("alt", "missing")
             .build()
             .await;
@@ -405,7 +406,9 @@ mod tests {
 
     #[tokio::test]
     async fn build_errors_when_service_options_are_invalid() {
-        let options = ServiceOptions::new().add_transfer_rule("exe", TransferBehavior::Preview);
+        let options = ServiceOptions::new()
+            .with_static_istag("svc-1.0")
+            .add_transfer_rule("exe", TransferBehavior::Preview);
         let result = Server::builder()
             .route_reqmod("svc", handler_ok, Some(options))
             .build()
@@ -420,5 +423,20 @@ mod tests {
             msg.contains("Default transfer behavior"),
             "unexpected error: {msg}"
         );
+    }
+
+    #[tokio::test]
+    async fn build_errors_when_service_options_are_missing() {
+        let result = Server::builder()
+            .route_reqmod("svc", handler_ok, None)
+            .build()
+            .await;
+        let err = result
+            .err()
+            .expect("missing service options should fail at build time");
+
+        let msg = err.to_string();
+        assert!(msg.contains("ServiceOptions"), "unexpected error: {msg}");
+        assert!(msg.contains("ISTag"), "unexpected error: {msg}");
     }
 }

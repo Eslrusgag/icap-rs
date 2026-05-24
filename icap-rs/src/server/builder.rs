@@ -197,8 +197,10 @@ impl ServerBuilder {
         self
     }
 
-    /// Register a **service route** for one or more ICAP methods (with optional per-service options).
+    /// Register a **service route** for one or more ICAP methods.
     ///
+    /// - Each service must have a [`ServiceOptions`] value with an explicit
+    ///   `ISTag`; routes without options are rejected by [`build`](Self::build).
     /// - Multiple calls to `.route(..)` for the **same service** are allowed as long as methods do not overlap.
     /// - Registering the **same method** for the same service twice will `panic!` with a clear message.
     /// - The same handler can be reused for multiple methods in a single call.
@@ -377,21 +379,6 @@ fn validate_builder_config(
     aliases: &HashMap<String, String>,
     default_service: Option<&str>,
 ) -> IcapResult<()> {
-    for (service, entry) in routes {
-        if entry.handlers.is_empty() {
-            return Err(crate::error::Error::service(format!(
-                "Service '{service}' has no handlers"
-            )));
-        }
-        if let Some(options) = &entry.options
-            && let Err(err) = options.validate()
-        {
-            return Err(crate::error::Error::service(format!(
-                "Invalid options for service '{service}': {err}"
-            )));
-        }
-    }
-
     if let Some(default) = default_service {
         let resolved = resolve_service(default, aliases, None);
         if !routes.contains_key(resolved.as_ref()) {
@@ -408,6 +395,24 @@ fn validate_builder_config(
             return Err(crate::error::Error::service(format!(
                 "Alias '{from}' resolves to unknown service '{}'",
                 resolved.as_ref()
+            )));
+        }
+    }
+
+    for (service, entry) in routes {
+        if entry.handlers.is_empty() {
+            return Err(crate::error::Error::service(format!(
+                "Service '{service}' has no handlers"
+            )));
+        }
+        let Some(options) = &entry.options else {
+            return Err(crate::error::Error::service(format!(
+                "Service '{service}' must configure ServiceOptions with an explicit ISTag"
+            )));
+        };
+        if let Err(err) = options.validate() {
+            return Err(crate::error::Error::service(format!(
+                "Invalid options for service '{service}': {err}"
             )));
         }
     }

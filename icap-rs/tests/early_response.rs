@@ -9,6 +9,7 @@ use icap_rs::client::Client;
 use icap_rs::error::Error;
 use icap_rs::request::{IncomingRequest, Request};
 use icap_rs::response::{ParsedResponse, Response, StatusCode};
+use icap_rs::server::ServiceOptions;
 
 fn find_free_port() -> u16 {
     let sock = StdTcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
@@ -29,7 +30,7 @@ async fn spawn_server_with_limit(limit: usize) -> (String, JoinHandle<()>) {
                     .try_set_istag("x")
                     .unwrap())
             },
-            None,
+            Some(ServiceOptions::new().with_static_istag("svc-options-1.0")),
         )
         .build()
         .await

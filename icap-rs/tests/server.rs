@@ -17,6 +17,7 @@ async fn always_204_handler(_req: IncomingRequest) -> IcapResult<Response> {
 
 async fn start_server_on(port: u16) {
     let respmod_opts = ServiceOptions::new()
+        .with_static_istag("test-1.0")
         .with_service("Response Modifier")
         .with_options_ttl(60);
 
@@ -39,6 +40,7 @@ async fn start_server_on(port: u16) {
 
 async fn start_reqmod_server_on(port: u16) {
     let reqmod_opts = ServiceOptions::new()
+        .with_static_istag("test-1.0")
         .with_service("Request Modifier")
         .with_options_ttl(60)
         .add_allow("204");

@@ -9,6 +9,7 @@ const ECHO_BODY: &str = "streamed-body";
 
 async fn start_server(port: u16) {
     let opts = ServiceOptions::new()
+        .with_static_istag(ISTAG)
         .with_service("Streaming Writer Test")
         .add_allow("204");
 

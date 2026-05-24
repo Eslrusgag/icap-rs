@@ -11,6 +11,8 @@
 //! Some deployments need the ICAP `ISTag` to reflect a mutable policy (e.g. a
 //! filtering rule-set version). Use [`ServiceOptions::with_istag_provider`] to
 //! supply a closure that computes the `ISTag` *per request* (including `OPTIONS`).
+//! `ServiceOptions` intentionally has no default `ISTag`; services must provide
+//! a static tag or a dynamic provider explicitly.
 //!
 //! ### Example
 //! ```no_run
@@ -29,6 +31,7 @@
 
 use std::sync::Arc;
 
+use crate::error::{Error, IcapResult};
 use crate::request::{IncomingRequest, Method};
 use crate::response::Response;
 use smallvec::SmallVec;
@@ -73,31 +76,32 @@ impl IstagSource {
 pub struct ServiceOptions {
     /// Supported ICAP methods (injected by the router).
     pub(crate) methods: SmallVec<Method, 2>,
+    /// Pre-formatted `"REQMOD, RESPMOD"` string, cached when `set_methods` is called.
+    pub(crate) methods_str: String,
     /// Human-readable service description (optional).
-    pub service: Option<String>,
+    pub(crate) service: Option<String>,
     /// `ISTag` source (static or dynamic provider).
-    pub istag: IstagSource,
+    pub(crate) istag: Option<IstagSource>,
     /// Max concurrent connections hint (optional).
-    pub max_connections: Option<usize>,
+    pub(crate) max_connections: Option<usize>,
     /// TTL (seconds) for caching the OPTIONS response (optional).
-    pub options_ttl: Option<u32>,
-
+    pub(crate) options_ttl: Option<u32>,
     /// Short service identifier (optional).
-    pub service_id: Option<String>,
+    pub(crate) service_id: Option<String>,
     /// Capabilities advertised in `Allow` (optional), e.g. `"204"`.
-    pub allow: Vec<String>,
+    pub(crate) allow: Vec<String>,
     /// `Preview` size in bytes (optional).
-    pub preview: Option<u32>,
+    pub(crate) preview: Option<u32>,
     /// Per-extension transfer behavior (`Transfer-*` headers).
-    pub transfer_rules: HashMap<String, TransferBehavior>,
+    pub(crate) transfer_rules: HashMap<String, TransferBehavior>,
     /// Default transfer behavior applied when an extension is not matched.
-    pub default_transfer_behavior: Option<TransferBehavior>,
+    pub(crate) default_transfer_behavior: Option<TransferBehavior>,
     /// Extra custom headers to include as `Header: Value`.
-    pub custom_headers: HashMap<String, String>,
+    pub(crate) custom_headers: HashMap<String, String>,
     /// `Opt-body-type` (if `opt-body` is present).
-    pub opt_body_type: Option<String>,
+    pub(crate) opt_body_type: Option<String>,
     /// Optional message body to advertise via `Encapsulated: opt-body=0`.
-    pub opt_body: Option<Vec<u8>>,
+    pub(crate) opt_body: Option<Vec<u8>>,
 }
 
 impl Default for ServiceOptions {
@@ -107,15 +111,18 @@ impl Default for ServiceOptions {
 }
 
 impl ServiceOptions {
-    /// Create a new OPTIONS config with required fields.
+    /// Create a new OPTIONS config without an `ISTag`.
     ///
-    /// This uses a **static** `ISTag` by default. To make `ISTag` dynamic, call
-    /// [`with_istag_provider`](Self::with_istag_provider).
+    /// ICAP success responses require an explicit `ISTag`. Call
+    /// [`with_static_istag`](Self::with_static_istag) or
+    /// [`with_istag_provider`](Self::with_istag_provider) before registering
+    /// this config on a server route.
     pub fn new() -> Self {
         Self {
             methods: SmallVec::new(),
+            methods_str: String::new(),
             service: None,
-            istag: IstagSource::Static("default".to_string()),
+            istag: None,
             max_connections: None,
             options_ttl: None,
             service_id: None,
@@ -155,7 +162,7 @@ impl ServiceOptions {
     where
         F: Fn(&IncomingRequest) -> String + Send + Sync + 'static,
     {
-        self.istag = IstagSource::Dynamic(Arc::new(f));
+        self.istag = Some(IstagSource::Dynamic(Arc::new(f)));
         self
     }
 
@@ -164,7 +171,7 @@ impl ServiceOptions {
     /// The value may be passed as a raw token such as `policy-1` or
     /// `QUJD+/8=`. Generated ICAP responses quote it on the wire per RFC 3507.
     pub fn with_static_istag(mut self, istag: &str) -> Self {
-        self.istag = IstagSource::Static(istag.to_string());
+        self.istag = Some(IstagSource::Static(istag.to_string()));
         self
     }
 
@@ -245,18 +252,30 @@ impl ServiceOptions {
         self
     }
 
-    /// Router-only: inject the supported ICAP methods.
+    /// Router-only: inject the supported ICAP methods and cache their formatted string.
     pub(crate) fn set_methods<M>(&mut self, methods: M)
     where
         M: Into<SmallVec<Method, 2>>,
     {
         self.methods = methods.into();
+        // Cache the formatted methods string to avoid repeated allocations per OPTIONS request.
+        let mut s = String::new();
+        for (i, m) in self.methods.iter().enumerate() {
+            if i > 0 {
+                s.push_str(", ");
+            }
+            s.push_str(m.as_str());
+        }
+        self.methods_str = s;
     }
 
     /// Get the `ISTag` for a specific request (static or dynamic).
     #[inline]
-    pub fn istag_for(&self, req: &IncomingRequest) -> String {
-        self.istag.current_for(req)
+    pub fn istag_for(&self, req: &IncomingRequest) -> IcapResult<String> {
+        self.istag
+            .as_ref()
+            .map(|source| source.current_for(req))
+            .ok_or(Error::MissingHeader("ISTag"))
     }
 
     /// Build an ICAP `OPTIONS` response for **this specific request**.
@@ -266,20 +285,12 @@ impl ServiceOptions {
     /// - `ISTag`   — resolved via the static string or dynamic provider
     /// - Standard headers (`Encapsulated`, `Service`, `Max-Connections`, etc.)
     ///
-    pub fn build_response_for(&self, req: &IncomingRequest) -> Response {
-        let mut response = Response::ok();
+    pub fn build_response_for(&self, req: &IncomingRequest) -> IcapResult<Response> {
+        let istag_now = self.istag_for(req)?;
+        let mut response = Response::ok_with_istag(&istag_now)?;
 
-        let methods_str = self
-            .methods
-            .iter()
-            .map(std::string::ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(", ");
-        response = response.add_header("Methods", &methods_str);
-
-        // ISTag — dynamic per-request. `Response` quotes raw token values per RFC 3507.
-        let istag_now = self.istag_for(req);
-        response = response.add_header("ISTag", &istag_now);
+        // Use pre-formatted cached methods string — no allocation per request.
+        response = response.add_header("Methods", &self.methods_str);
 
         // Encapsulated
         let encapsulated_value = if self.opt_body.is_some() {
@@ -352,7 +363,7 @@ impl ServiceOptions {
             response = response.with_body(opt_body);
         }
 
-        response
+        Ok(response)
     }
 
     /// Validate invariants for this configuration.
@@ -360,7 +371,12 @@ impl ServiceOptions {
     /// For dynamic `ISTag` providers it is not possible to validate non-emptiness
     /// at configuration time; perform validation when computing the value if needed.
     pub fn validate(&self) -> Result<(), String> {
-        // No eager validation for dynamic ISTag; keep other invariants.
+        if self.istag.is_none() {
+            return Err(
+                "ISTag must be configured explicitly with with_static_istag or with_istag_provider"
+                    .to_string(),
+            );
+        }
         if !self.transfer_rules.is_empty() && self.default_transfer_behavior.is_none() {
             return Err(
                 "Default transfer behavior must be set when transfer rules are defined".to_string(),

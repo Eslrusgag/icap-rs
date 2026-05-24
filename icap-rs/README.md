@@ -337,6 +337,10 @@ fn comma_separated_header_example() -> IcapResult<()> {
   `ISTag: "QUJD+/8="`. Incoming response parsing is intentionally more
   permissive and accepts unquoted token/base64-like values for compatibility
   with existing ICAP servers.
+- Server `ServiceOptions` never invents a default `ISTag`. Every route must
+  configure one explicitly with `with_static_istag(...)` or
+  `with_istag_provider(...)`, because the tag is service policy metadata and
+  should not be silently chosen by the framework.
 - `204 No Content` is serialized as `Encapsulated: null-body=0` and must not
   carry body bytes.
 - Server handlers that return `204` are guarded: if the request has neither
@@ -367,7 +371,7 @@ use icap_rs::{
 | `IncomingRequest` | Inspecting server-side ICAP requests in route handlers. ICAP metadata is read-only; services may mutate or consume only the embedded HTTP message. |
 | `Response`, `StatusCode` | Building ICAP responses, parsing raw responses, validating `ISTag`, serializing RFC-compatible wire bytes, and attaching embedded HTTP messages. |
 | `Server`, `ServerBuilder` | Running a Tokio ICAP service with per-service routes, aliases, default service routing, connection limits, TLS/mTLS, and automatic `OPTIONS`. |
-| `ServiceOptions`, `TransferBehavior` | Describing per-service `OPTIONS` capabilities: `Methods`, `Service`, `ISTag`, `Allow`, `Preview`, `Transfer-*`, `Options-TTL`, and optional `opt-body`. |
+| `ServiceOptions`, `TransferBehavior` | Describing per-service `OPTIONS` capabilities: `Methods`, `Service`, explicit `ISTag`, `Allow`, `Preview`, `Transfer-*`, `Options-TTL`, and optional `opt-body`. |
 | `Body`, `EmbeddedHttp` | Inspecting embedded HTTP request/response heads and bodies in server handlers. Regular handlers receive `Body::Full`; preview-aware handlers may receive `Body::Preview`. |
 | `PreviewDecision` | Returning an early final response from a preview-aware route, or continuing the RFC preview flow. |
 | `Error`, `IcapResult` | Handling protocol, parsing, serialization, network, service, and handler errors without converting them into generic I/O errors. |
@@ -395,7 +399,7 @@ request/response, or use `IncomingRequest::embedded_mut()` /
 | Stream a large body | `with_http_request_head` / `with_http_response_head` plus `Client::send_streaming_reader` |
 | Return no modification | `Response::no_content_with_istag("...")` |
 | Return adapted HTTP | `Response::ok_with_istag("...")?.with_http_response(...)` |
-| Run a service | `Server::builder().route_reqmod(...)` / `route_respmod(...)` / `route(...)` |
+| Run a service | `Server::builder().route_reqmod(..., Some(ServiceOptions::new().with_static_istag("...")))` / `route_respmod(...)` / `route(...)` |
 | Advertise capabilities | `ServiceOptions::new().with_static_istag(...).allow_204().with_preview(...)` |
 
 ## TLS and ICAPS
