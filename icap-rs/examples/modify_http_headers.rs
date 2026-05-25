@@ -83,12 +83,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         h.insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
                     }
                 }
-                let http = builder
-                    .body(body_bytes)
-                    .map_err(|e| format!("build http::Response: {e}"))?;
+                let http = builder.body(body_bytes).map_err(|e| {
+                    icap_rs::HandlerError::internal(format!("build http::Response: {e}"))
+                })?;
 
                 info!(stripped = %strip, html = %is_html, "modified headers");
-                Response::ok_with_istag(ISTAG)?.with_http_response(&http)
+                Ok(Response::ok_with_istag(ISTAG)?.with_http_response(&http)?)
             },
             Some(opts),
         )

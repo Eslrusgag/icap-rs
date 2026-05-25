@@ -18,7 +18,9 @@
 pub mod builder;
 pub mod timeouts;
 
-use crate::error::{Error, IcapResult};
+#[cfg(test)]
+use crate::error::ProtocolError;
+use crate::error::{Error, IcapResult, TimeoutError, TimeoutKind};
 use crate::protocol::{
     canon_icap_header, find_double_crlf, parse_encapsulated_header, read_chunked_to_end,
     write_chunk, write_chunk_into,
@@ -96,7 +98,7 @@ impl Client {
         Box::pin(Self::with_timeout_as(
             self.inner.timeouts.operation,
             self.send_inner(req),
-            Error::ClientTimeout,
+            Error::client_total_timeout,
         ))
         .await
     }
@@ -129,7 +131,13 @@ impl Client {
 
         let built = self.build_icap_request_bytes(req, false, req.preview_ieof, false)?;
         if let Err(write_err) = self.write_all(&mut stream, &built.bytes).await {
-            if matches!(write_err, Error::ClientWriteTimeout(_)) {
+            if matches!(
+                write_err,
+                Error::Timeout(TimeoutError {
+                    kind: TimeoutKind::ClientWrite,
+                    ..
+                })
+            ) {
                 return Err(write_err);
             }
             if let Ok((_code, hdr_buf)) = read_icap_headers(&mut stream).await
@@ -143,7 +151,13 @@ impl Client {
         }
 
         if let Err(flush_err) = self.flush(&mut stream).await {
-            if matches!(flush_err, Error::ClientWriteTimeout(_)) {
+            if matches!(
+                flush_err,
+                Error::Timeout(TimeoutError {
+                    kind: TimeoutKind::ClientWrite,
+                    ..
+                })
+            ) {
                 return Err(flush_err);
             }
             if let Ok((_code, hdr_buf)) = read_icap_headers(&mut stream).await
@@ -167,7 +181,7 @@ impl Client {
             let (code, hdr_buf) = Self::with_timeout_as(
                 self.continue_timeout(),
                 read_icap_headers(&mut stream),
-                Error::ClientContinueTimeout,
+                Error::client_continue_timeout,
             )
             .await?;
 
@@ -223,7 +237,7 @@ impl Client {
         Box::pin(Self::with_timeout_as(
             self.inner.timeouts.operation,
             self.send_streaming_reader_inner(req, &mut reader),
-            Error::ClientTimeout,
+            Error::client_total_timeout,
         ))
         .await
     }
@@ -296,7 +310,7 @@ impl Client {
         let (code, hdr_buf) = Self::with_timeout_as(
             self.continue_timeout(),
             read_icap_headers(&mut stream),
-            Error::ClientContinueTimeout,
+            Error::client_continue_timeout,
         )
         .await?;
 
@@ -368,19 +382,14 @@ impl Client {
     where
         F: std::future::Future<Output = std::io::Result<T>>,
     {
-        Self::with_timeout_as(
-            dur,
-            async { fut.await.map_err(Error::Network) },
-            timeout_error,
-        )
-        .await
+        Self::with_timeout_as(dur, async { fut.await.map_err(Error::Io) }, timeout_error).await
     }
 
     async fn write_all(&self, stream: &mut Conn, bytes: &[u8]) -> IcapResult<()> {
         Self::with_io_timeout(
             self.inner.timeouts.write,
             AsyncWriteExt::write_all(stream, bytes),
-            Error::ClientWriteTimeout,
+            Error::client_write_timeout,
         )
         .await
     }
@@ -389,7 +398,7 @@ impl Client {
         Self::with_io_timeout(
             self.inner.timeouts.write,
             AsyncWriteExt::flush(stream),
-            Error::ClientWriteTimeout,
+            Error::client_write_timeout,
         )
         .await
     }
@@ -398,7 +407,7 @@ impl Client {
         Self::with_timeout_as(
             self.inner.timeouts.write,
             write_chunk(stream, bytes),
-            Error::ClientWriteTimeout,
+            Error::client_write_timeout,
         )
         .await
     }
@@ -470,7 +479,7 @@ impl Client {
             self.inner.port,
             Self::trim_leading_slash(&req.service)
         )
-        .map_err(Error::Network)?;
+        .map_err(Error::Io)?;
 
         // ICAP headers
         let host_value = self
@@ -534,9 +543,9 @@ impl Client {
                     &mut out,
                     "Encapsulated: {hdr_key}=0, {body_key}={hdr_len}\r\n"
                 )
-                .map_err(Error::Network)?;
+                .map_err(Error::Io)?;
             } else {
-                write!(&mut out, "Encapsulated: {hdr_key}=0\r\n").map_err(Error::Network)?;
+                write!(&mut out, "Encapsulated: {hdr_key}=0\r\n").map_err(Error::Io)?;
             }
         } else {
             out.extend_from_slice(b"Encapsulated: null-body=0\r\n");
@@ -641,9 +650,9 @@ impl ClientRef {
             async {
                 TcpStream::connect((&*self.host, self.port))
                     .await
-                    .map_err(Error::Network)
+                    .map_err(Error::Io)
             },
-            Error::ClientConnectTimeout,
+            Error::client_connect_timeout,
         )
         .await?;
 
@@ -687,9 +696,7 @@ async fn read_until_len<S: AsyncRead + AsyncWrite + Unpin>(
     while buf.len() < need {
         let n = AsyncReadExt::read(stream, &mut tmp).await?;
         if n == 0 {
-            return Err(Error::Body(
-                "Unexpected EOF while reading response body".into(),
-            ));
+            return Err(Error::body("Unexpected EOF while reading response body"));
         }
         buf.extend_from_slice(&tmp[..n]);
     }
@@ -711,8 +718,8 @@ async fn read_until_double_crlf_from<S: AsyncRead + AsyncWrite + Unpin>(
 
         let n = AsyncReadExt::read(stream, &mut tmp).await?;
         if n == 0 {
-            return Err(Error::Body(
-                "Unexpected EOF while reading encapsulated HTTP headers".into(),
+            return Err(Error::body(
+                "Unexpected EOF while reading encapsulated HTTP headers",
             ));
         }
         buf.extend_from_slice(&tmp[..n]);
@@ -737,7 +744,7 @@ where
         Client::with_timeout_as(
             write_timeout,
             write_chunk(stream, &buf[..n]),
-            Error::ClientWriteTimeout,
+            Error::client_write_timeout,
         )
         .await?;
     }
@@ -798,8 +805,8 @@ fn parse_authority_with_scheme(uri: &str) -> IcapResult<(String, u16, bool)> {
     } else if let Some(r) = s.strip_prefix("icap://") {
         (false, r)
     } else {
-        return Err(Error::InvalidUri(
-            "URI must start with icap:// or icaps://".into(),
+        return Err(Error::invalid_uri(
+            "URI must start with icap:// or icaps://",
         ));
     };
 
@@ -808,14 +815,14 @@ fn parse_authority_with_scheme(uri: &str) -> IcapResult<(String, u16, bool)> {
         let h = &authority[..i];
         let p: u16 = authority[i + 1..]
             .parse()
-            .map_err(|_| Error::InvalidUri("Invalid port".into()))?;
+            .map_err(|_| Error::invalid_uri("Invalid port"))?;
         (h.to_string(), p)
     } else {
         (authority.to_string(), if tls { 11344 } else { 1344 })
     };
 
     if host.is_empty() {
-        return Err(Error::InvalidUri("Empty host in authority".into()));
+        return Err(Error::invalid_uri("Empty host in authority"));
     }
     Ok((host, port, tls))
 }
@@ -1011,12 +1018,12 @@ where
     loop {
         let n = AsyncReadExt::read(stream, &mut tmp)
             .await
-            .map_err(Error::Network)?;
+            .map_err(Error::Io)?;
 
         if n == 0 {
             // EOF
             if buf.is_empty() {
-                return Err(Error::EarlyCloseWithoutHeaders);
+                return Err(Error::Protocol(crate::error::ProtocolError::EarlyClose));
             }
 
             if let Some(c) = code
@@ -1041,7 +1048,7 @@ where
                         buf.extend_from_slice(b"\r\n\r\n");
                     }
                 }
-                return Err(Error::EarlyCloseWithoutHeaders);
+                return Err(Error::Protocol(crate::error::ProtocolError::EarlyClose));
             }
         } else {
             let old_len = buf.len();
@@ -1096,7 +1103,7 @@ where
         }
 
         if buf.len() > crate::MAX_HDR_BYTES {
-            return Err(Error::Header(format!(
+            return Err(Error::header(format!(
                 "Headers too large: {} bytes (max {})",
                 buf.len(),
                 crate::MAX_HDR_BYTES
@@ -1310,7 +1317,10 @@ mod tests {
             .try_user_agent("bad\r\nvalue")
             .expect_err("invalid header value should be rejected");
 
-        assert!(matches!(err, Error::HeaderValue(_)));
+        assert!(matches!(
+            err,
+            Error::Protocol(ProtocolError::HeaderValue(_))
+        ));
     }
 
     #[tokio::test]
@@ -1332,7 +1342,9 @@ mod tests {
             .await
             .expect_err("operation timeout should fire");
 
-        assert!(matches!(err, Error::ClientTimeout(d) if d == Duration::from_millis(50)));
+        assert!(
+            matches!(err, Error::Timeout(TimeoutError { kind: TimeoutKind::ClientTotal, duration: d }) if d == Duration::from_millis(50))
+        );
     }
 
     #[tokio::test]
@@ -1354,7 +1366,9 @@ mod tests {
             .await
             .expect_err("continue timeout should fire");
 
-        assert!(matches!(err, Error::ClientContinueTimeout(d) if d == Duration::from_millis(50)));
+        assert!(
+            matches!(err, Error::Timeout(TimeoutError { kind: TimeoutKind::ClientContinue, duration: d }) if d == Duration::from_millis(50))
+        );
     }
 
     #[tokio::test]
@@ -1366,7 +1380,9 @@ mod tests {
             .await
             .expect_err("write timeout should fire");
 
-        assert!(matches!(err, Error::ClientWriteTimeout(d) if d == Duration::from_millis(50)));
+        assert!(
+            matches!(err, Error::Timeout(TimeoutError { kind: TimeoutKind::ClientWrite, duration: d }) if d == Duration::from_millis(50))
+        );
     }
 
     #[rstest]
@@ -1753,7 +1769,10 @@ mod tests {
             .with_http_response(http)
             .expect_err("REQMOD must reject embedded HTTP responses");
 
-        assert!(matches!(err, Error::Serialization(_)));
+        assert!(matches!(
+            err,
+            Error::Protocol(ProtocolError::Serialization(_))
+        ));
     }
 
     #[rstest]

@@ -115,6 +115,6 @@ pub fn parse_http_version(version: &str) -> IcapResult<Version> {
         "HTTP/1.1" => Ok(Version::HTTP_11),
         "HTTP/2.0" | "HTTP/2" => Ok(Version::HTTP_2),
         "HTTP/3.0" | "HTTP/3" => Ok(Version::HTTP_3),
-        _ => Err(Error::InvalidVersion(version.to_string())),
+        _ => Err(Error::invalid_version(version.to_string())),
     }
 }

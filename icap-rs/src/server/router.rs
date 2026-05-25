@@ -2,9 +2,9 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::future::Future;
 
-use crate::error::IcapResult;
 use crate::{IncomingRequest, Method, Response};
 
+use super::handler::HandlerResult;
 use super::options::ServiceOptions;
 use super::preview::PreviewDecision;
 
@@ -15,37 +15,38 @@ use super::preview::PreviewDecision;
 pub(super) type RequestHandler = Box<
     dyn Fn(
             IncomingRequest,
-        ) -> std::pin::Pin<Box<dyn Future<Output = IcapResult<PreviewDecision>> + Send>>
+        )
+            -> std::pin::Pin<Box<dyn Future<Output = HandlerResult<PreviewDecision>> + Send>>
         + Send
         + Sync,
 >;
 
 /// Return type adapter for route handlers.
 ///
-/// Handlers returning `IcapResult<Response>` keep the full-body behavior: the
-/// server reads the whole request body before invoking them. Handlers returning
-/// `IcapResult<PreviewDecision>` are preview-aware and may be invoked before
-/// `100 Continue`. If a preview-aware handler returns
+/// Handlers returning `HandlerResult<Response>` keep the full-body behavior:
+/// the server reads the whole request body before invoking them. Handlers
+/// returning `HandlerResult<PreviewDecision>` are preview-aware and may be
+/// invoked before `100 Continue`. If a preview-aware handler returns
 /// [`PreviewDecision::Continue`], the server sends `100 Continue`, reads the
 /// remainder, and invokes the same route again with `Body::Full`.
 pub trait RouteOutput: Send + 'static {
     const PREVIEW_AWARE: bool;
 
-    fn into_preview_decision(self) -> IcapResult<PreviewDecision>;
+    fn into_preview_decision(self) -> HandlerResult<PreviewDecision>;
 }
 
-impl RouteOutput for IcapResult<Response> {
+impl RouteOutput for HandlerResult<Response> {
     const PREVIEW_AWARE: bool = false;
 
-    fn into_preview_decision(self) -> IcapResult<PreviewDecision> {
+    fn into_preview_decision(self) -> HandlerResult<PreviewDecision> {
         self.map(PreviewDecision::Respond)
     }
 }
 
-impl RouteOutput for IcapResult<PreviewDecision> {
+impl RouteOutput for HandlerResult<PreviewDecision> {
     const PREVIEW_AWARE: bool = true;
 
-    fn into_preview_decision(self) -> IcapResult<PreviewDecision> {
+    fn into_preview_decision(self) -> HandlerResult<PreviewDecision> {
         self
     }
 }

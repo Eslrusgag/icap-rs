@@ -275,7 +275,7 @@ impl ServiceOptions {
         self.istag
             .as_ref()
             .map(|source| source.current_for(req))
-            .ok_or(Error::MissingHeader("ISTag"))
+            .ok_or(Error::missing_header("ISTag"))
     }
 
     /// Build an ICAP `OPTIONS` response for **this specific request**.

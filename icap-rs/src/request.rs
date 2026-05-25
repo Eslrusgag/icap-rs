@@ -51,6 +51,8 @@
 
 use crate::ICAP_VERSION;
 use crate::error::{Error, IcapResult};
+#[cfg(test)]
+use crate::error::{ProtocolError, ProtocolField};
 use crate::protocol::{
     find_double_crlf, parse_header_lines, parse_http_request_start_line,
     parse_http_response_start_line,
@@ -113,7 +115,7 @@ impl Method {
     /// This is the non-panicking counterpart to `Method::from(&str)`.
     pub fn parse_token(token: &str) -> IcapResult<Self> {
         token.parse().map_err(|_| {
-            Error::InvalidMethod(format!("Unknown ICAP method string: {}", token.trim()))
+            Error::invalid_method(format!("Unknown ICAP method string: {}", token.trim()))
         })
     }
 }
@@ -326,7 +328,7 @@ impl Body<BodyRead> {
         }
 
         match self {
-            Body::Empty => Err(Error::Body("no body".into())),
+            Body::Empty => Err(Error::body("no body")),
             Body::Full { reader } => Ok(reader.as_mut()),
             Body::Preview {
                 bytes,
@@ -868,7 +870,7 @@ pub(crate) fn parse_icap_request_with_mode(
         "RESPMOD" => Method::RespMod,
         "OPTIONS" => Method::Options,
         other => {
-            return Err(Error::InvalidMethod(format!(
+            return Err(Error::invalid_method(format!(
                 "Unknown ICAP method: {other}"
             )));
         }
@@ -882,20 +884,20 @@ pub(crate) fn parse_icap_request_with_mode(
         .ok_or_else(|| Error::parse("Invalid request line"))?;
 
     if !version.eq_ignore_ascii_case(ICAP_VERSION) {
-        return Err(Error::InvalidVersion(version.to_string()));
+        return Err(Error::invalid_version(version.to_string()));
     }
 
     let icap_headers = parse_header_lines(lines)?;
 
     if !icap_headers.contains_key("Host") {
-        return Err(Error::MissingHeader("Host"));
+        return Err(Error::missing_header("Host"));
     }
 
     if (matches!(method, Method::ReqMod | Method::RespMod)
         || (mode == RequestParserMode::Strict && method == Method::Options))
         && !icap_headers.contains_key("Encapsulated")
     {
-        return Err(Error::MissingHeader("Encapsulated"));
+        return Err(Error::missing_header("Encapsulated"));
     }
 
     let service = icap_uri.rsplit('/').next().unwrap_or("").to_string();
@@ -943,7 +945,7 @@ pub(crate) fn parse_icap_request_with_mode(
         }
 
         let http_hdr_len = find_double_crlf(http_region)
-            .ok_or_else(|| Error::HttpParse("embedded HTTP headers not complete".to_string()))?;
+            .ok_or_else(|| Error::http_parse("embedded HTTP headers not complete".to_string()))?;
         let http_head_bytes = &http_region[..http_hdr_len];
         let inline_body = &http_region[http_hdr_len..];
 
@@ -974,8 +976,8 @@ pub(crate) fn parse_icap_request_with_mode(
             let body_slice = slice_encapsulated(enc_area, boff, bend)?;
 
             if boff < hdr_off {
-                return Err(Error::Header(
-                    "Encapsulated offsets invalid (body before headers)".into(),
+                return Err(Error::header(
+                    "Encapsulated offsets invalid (body before headers)",
                 ));
             }
 
@@ -998,7 +1000,7 @@ pub(crate) fn parse_icap_request_with_mode(
 
             let head = builder
                 .body(())
-                .map_err(|e| format!("build http::Response head: {e}"))?;
+                .map_err(|e| Error::http_parse(format!("build http::Response head: {e}")))?;
 
             Some(EmbeddedHttp::Resp {
                 head,
@@ -1021,7 +1023,7 @@ pub(crate) fn parse_icap_request_with_mode(
 
             let head = builder
                 .body(())
-                .map_err(|e| format!("build http::Request head: {e}"))?;
+                .map_err(|e| Error::http_parse(format!("build http::Request head: {e}")))?;
 
             Some(EmbeddedHttp::Req {
                 head,
@@ -1051,33 +1053,33 @@ fn validate_encapsulated_for_method(
     if enc.null_body.is_some()
         && (enc.req_body.is_some() || enc.res_body.is_some() || enc.opt_body.is_some())
     {
-        return Err(Error::Header(
-            "Encapsulated null-body must not be combined with body tokens".into(),
+        return Err(Error::header(
+            "Encapsulated null-body must not be combined with body tokens",
         ));
     }
 
     match method {
         Method::ReqMod => {
             if enc.res_hdr.is_some() || enc.res_body.is_some() || enc.opt_body.is_some() {
-                return Err(Error::Header(
-                    "REQMOD Encapsulated must not contain response or opt-body parts".into(),
+                return Err(Error::header(
+                    "REQMOD Encapsulated must not contain response or opt-body parts",
                 ));
             }
             if enc.req_body.is_some() && enc.req_hdr.is_none() {
-                return Err(Error::Header(
-                    "REQMOD Encapsulated req-body requires req-hdr".into(),
+                return Err(Error::header(
+                    "REQMOD Encapsulated req-body requires req-hdr",
                 ));
             }
         }
         Method::RespMod => {
             if enc.req_body.is_some() || enc.opt_body.is_some() {
-                return Err(Error::Header(
-                    "RESPMOD Encapsulated must not contain req-body or opt-body parts".into(),
+                return Err(Error::header(
+                    "RESPMOD Encapsulated must not contain req-body or opt-body parts",
                 ));
             }
             if enc.res_body.is_some() && enc.res_hdr.is_none() {
-                return Err(Error::Header(
-                    "RESPMOD Encapsulated res-body requires res-hdr".into(),
+                return Err(Error::header(
+                    "RESPMOD Encapsulated res-body requires res-hdr",
                 ));
             }
         }
@@ -1088,8 +1090,8 @@ fn validate_encapsulated_for_method(
                 || enc.res_body.is_some()
                 || enc.opt_body.is_some()
             {
-                return Err(Error::Header(
-                    "OPTIONS request Encapsulated must be absent or null-body".into(),
+                return Err(Error::header(
+                    "OPTIONS request Encapsulated must be absent or null-body",
                 ));
             }
         }
@@ -1121,18 +1123,14 @@ fn next_offset_after(enc: &crate::protocol::Encapsulated, start: usize) -> Optio
 
 fn slice_encapsulated(enc_area: &[u8], start: usize, end: Option<usize>) -> IcapResult<&[u8]> {
     if start > enc_area.len() {
-        return Err(Error::Header("Encapsulated offset out of bounds".into()));
+        return Err(Error::header("Encapsulated offset out of bounds"));
     }
     let end = end.unwrap_or(enc_area.len());
     if end > enc_area.len() {
-        return Err(Error::Header(
-            "Encapsulated end offset out of bounds".into(),
-        ));
+        return Err(Error::header("Encapsulated end offset out of bounds"));
     }
     if end < start {
-        return Err(Error::Header(
-            "Encapsulated offsets invalid (end < start)".into(),
-        ));
+        return Err(Error::header("Encapsulated offsets invalid (end < start)"));
     }
     Ok(&enc_area[start..end])
 }
@@ -1232,7 +1230,7 @@ mod tests {
             .try_icap_header("Bad Header", "value")
             .expect_err("invalid header name should be rejected");
 
-        assert!(matches!(err, Error::HeaderName(_)));
+        assert!(matches!(err, Error::Protocol(ProtocolError::HeaderName(_))));
     }
 
     #[test]
@@ -1240,7 +1238,13 @@ mod tests {
         let err = Request::<Vec<u8>>::try_new("PATCH", "svc")
             .expect_err("unknown method should be rejected");
 
-        assert!(matches!(err, Error::InvalidMethod(_)));
+        assert!(matches!(
+            err,
+            Error::Protocol(ProtocolError::InvalidField {
+                field: ProtocolField::Method,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -1347,7 +1351,10 @@ Encapsulated: req-hdr=0, req-body={req_body_off}\r\n\
             .with_http_request(http_req)
             .expect_err("RESPMOD must reject embedded HTTP requests");
 
-        assert!(matches!(err, Error::Serialization(_)));
+        assert!(matches!(
+            err,
+            Error::Protocol(ProtocolError::Serialization(_))
+        ));
 
         let http_resp = HttpResponse::builder()
             .status(HttpStatus::OK)
@@ -1359,7 +1366,10 @@ Encapsulated: req-hdr=0, req-body={req_body_off}\r\n\
             .with_http_response(http_resp)
             .expect_err("REQMOD must reject embedded HTTP responses");
 
-        assert!(matches!(err, Error::Serialization(_)));
+        assert!(matches!(
+            err,
+            Error::Protocol(ProtocolError::Serialization(_))
+        ));
     }
 
     #[test]
@@ -1368,7 +1378,10 @@ Encapsulated: req-hdr=0, req-body={req_body_off}\r\n\
         let err = req
             .validate_for_send()
             .expect_err("ieof is only valid with Preview: 0");
-        assert!(matches!(err, Error::Serialization(_)));
+        assert!(matches!(
+            err,
+            Error::Protocol(ProtocolError::Serialization(_))
+        ));
     }
 
     // ---------- Version & framing ----------
@@ -1380,7 +1393,9 @@ Encapsulated: req-hdr=0, req-body={req_body_off}\r\n\
                     Encapsulated: req-hdr=0\r\n\
                     \r\n";
         let err = parse_icap_request(raw).unwrap_err();
-        assert!(matches!(err, Error::InvalidVersion(v) if v == "ICAP/2.0"));
+        assert!(
+            matches!(err, Error::Protocol(ProtocolError::InvalidField { field: ProtocolField::Version, value: v, .. }) if v == "ICAP/2.0")
+        );
     }
 
     #[rstest]
@@ -1451,7 +1466,7 @@ Encapsulated: req-hdr=0, req-body={req_body_off}\r\n\
                         \r\n";
         let err1 = parse_icap_request(raw_req).unwrap_err();
         assert!(
-            matches!(err1, Error::MissingHeader(h) if h == "Encapsulated"),
+            matches!(err1, Error::Protocol(ProtocolError::MissingHeader(h)) if h == "Encapsulated"),
             "expected MissingHeader(Encapsulated); got: {err1}"
         );
 
@@ -1460,7 +1475,7 @@ Encapsulated: req-hdr=0, req-body={req_body_off}\r\n\
                          \r\n";
         let err2 = parse_icap_request(raw_resp).unwrap_err();
         assert!(
-            matches!(err2, Error::MissingHeader(h) if h == "Encapsulated"),
+            matches!(err2, Error::Protocol(ProtocolError::MissingHeader(h)) if h == "Encapsulated"),
             "expected MissingHeader(Encapsulated); got: {err2}"
         );
     }
@@ -1592,7 +1607,7 @@ Encapsulated: req-hdr=0, req-body={req_body_off}\r\n\
         );
         let err = parse_icap_request(&raw).unwrap_err();
         assert!(
-            matches!(err, Error::MissingHeader(h) if h == "Encapsulated"),
+            matches!(err, Error::Protocol(ProtocolError::MissingHeader(h)) if h == "Encapsulated"),
             "expected strict MissingHeader(Encapsulated), got: {err}"
         );
     }
@@ -1684,7 +1699,7 @@ Encapsulated: req-hdr=0, req-body={req_body_off}\r\n\
 
         let err = parse_icap_request(&raw).unwrap_err();
         assert!(
-            matches!(err, Error::HttpParse(_)),
+            matches!(err, Error::Protocol(ProtocolError::HttpParse(_))),
             "expected embedded HTTP parse error, got: {err}"
         );
     }
@@ -1703,7 +1718,7 @@ Encapsulated: req-hdr=0, req-body={req_body_off}\r\n\
 
         let err = parse_icap_request(&raw).unwrap_err();
         assert!(
-            matches!(err, Error::HttpParse(_)),
+            matches!(err, Error::Protocol(ProtocolError::HttpParse(_))),
             "expected embedded HTTP status-line parse error, got: {err}"
         );
     }
@@ -1722,7 +1737,7 @@ Encapsulated: req-hdr=0, req-body={req_body_off}\r\n\
 
         let err = parse_icap_request(&raw).unwrap_err();
         assert!(
-            matches!(err, Error::HttpParse(_)),
+            matches!(err, Error::Protocol(ProtocolError::HttpParse(_))),
             "expected embedded HTTP status code parse error, got: {err}"
         );
     }

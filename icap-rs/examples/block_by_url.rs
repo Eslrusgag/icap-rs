@@ -48,7 +48,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 if let Some(reason) = should_block(host, &path) {
                     info!(%host, %path, %reason, "BLOCK");
                     let http = block_page(reason);
-                    return Response::ok_with_istag(ISTAG)?.with_http_response(&http);
+                    return Ok(Response::ok_with_istag(ISTAG)?.with_http_response(&http)?);
                 }
 
                 Ok(Response::no_content_with_istag(ISTAG)?)

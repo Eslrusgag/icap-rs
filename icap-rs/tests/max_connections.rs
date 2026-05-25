@@ -31,7 +31,7 @@ async fn start_server_with_limit(
         .route(
             TEST_SERVICE,
             [Method::ReqMod],
-            |_req: IncomingRequest| async move { Response::no_content_with_istag(TEST_ISTAG) },
+            |_req: IncomingRequest| async move { Ok(Response::no_content_with_istag(TEST_ISTAG)?) },
             Some(
                 ServiceOptions::new()
                     .with_static_istag(TEST_ISTAG)

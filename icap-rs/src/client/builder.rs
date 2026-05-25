@@ -205,8 +205,8 @@ impl ClientBuilder {
             }
             #[cfg(not(feature = "tls-rustls"))]
             {
-                return Err(Error::Service(
-                    "`icaps://` requested but crate built without TLS features".into(),
+                return Err(Error::service(
+                    "`icaps://` requested but crate built without TLS features",
                 ));
             }
         }

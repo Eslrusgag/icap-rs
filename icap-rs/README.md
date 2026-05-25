@@ -68,7 +68,7 @@ async fn main() -> IcapResult<()> {
         .route_respmod(
             "respmod",
             |_request: IncomingRequest| async move {
-                Response::no_content_with_istag(ISTAG)
+                Ok(Response::no_content_with_istag(ISTAG)?)
             },
             Some(options),
         )
@@ -191,7 +191,7 @@ async fn main() -> IcapResult<()> {
                     body: Body::Full { reader },
                 }) = request.into_embedded()
                 else {
-                    return Response::no_content_with_istag(ISTAG);
+                    return Ok(Response::no_content_with_istag(ISTAG)?);
                 };
 
                 let mut builder = HttpRequest::builder()
@@ -209,12 +209,12 @@ async fn main() -> IcapResult<()> {
 
                 let modified_http = builder
                     .body(reader)
-                    .map_err(|err| icap_rs::error::Error::body(
+                    .map_err(|err| icap_rs::HandlerError::internal(
                         format!("build modified HTTP request: {err}")
                     ))?;
 
-                Response::ok_with_istag(ISTAG)?
-                    .with_http_request(&modified_http)
+                Ok(Response::ok_with_istag(ISTAG)?
+                    .with_http_request(&modified_http)?)
             },
             Some(options),
         )
@@ -549,7 +549,7 @@ async fn run() -> IcapResult<()> {
         .route_reqmod(
             "scan",
             |_request: IncomingRequest| async move {
-                Response::no_content_with_istag(ISTAG)
+                Ok(Response::no_content_with_istag(ISTAG)?)
             },
             Some(options),
         )

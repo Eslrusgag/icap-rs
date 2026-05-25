@@ -45,12 +45,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
                 match decide(&client_ip, &user) {
                     Decision::Allow => Ok(Response::no_content_with_istag(ISTAG)?),
-                    Decision::Audit(tag) => Ok(Response::no_content_with_istag(ISTAG)?
-                        .add_header("X-Audit", tag)),
+                    Decision::Audit(tag) => {
+                        Ok(Response::no_content_with_istag(ISTAG)?.add_header("X-Audit", tag))
+                    }
                     Decision::Block(reason) => {
-                        let html = format!(
-                            "<h1>Blocked</h1><p>{reason}</p>"
-                        );
+                        let html = format!("<h1>Blocked</h1><p>{reason}</p>");
                         let http = HttpResponse::builder()
                             .status(HttpStatus::FORBIDDEN)
                             .version(Version::HTTP_11)
@@ -59,7 +58,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             .header("X-Block-Reason", reason)
                             .body(html.into_bytes())
                             .unwrap();
-                        Response::ok_with_istag(ISTAG)?.with_http_response(&http)
+                        Ok(Response::ok_with_istag(ISTAG)?.with_http_response(&http)?)
                     }
                 }
             },

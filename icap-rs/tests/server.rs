@@ -1,6 +1,6 @@
 use http::{Response as HttpResponse, StatusCode as HttpStatus, Version};
 use icap_rs::Client;
-use icap_rs::error::IcapResult;
+use icap_rs::HandlerResult;
 use icap_rs::request::{IncomingRequest, Request};
 use icap_rs::response::{Response, StatusCode};
 use icap_rs::server::Server;
@@ -9,10 +9,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::Duration;
 
-async fn always_204_handler(_req: IncomingRequest) -> IcapResult<Response> {
-    Response::no_content()
+async fn always_204_handler(_req: IncomingRequest) -> HandlerResult<Response> {
+    Ok(Response::no_content()
         .add_header("Server", "icap-rs/test")
-        .try_set_istag("test")
+        .try_set_istag("test")?)
 }
 
 async fn start_server_on(port: u16) {

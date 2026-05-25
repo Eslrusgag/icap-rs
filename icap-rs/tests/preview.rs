@@ -96,7 +96,7 @@ async fn start_server(addr: &str) {
                 if let Some(total_len) = maybe_len
                     && total_len <= preview_n
                 {
-                    return Response::no_content().try_set_istag(ISTAG);
+                    return Ok(Response::no_content().try_set_istag(ISTAG)?);
                 }
 
                 if let Some(EmbeddedHttp::Req { head, body }) = req.into_embedded()
@@ -119,9 +119,9 @@ async fn start_server(addr: &str) {
                         *h = headers;
                     }
 
-                    let http_req = builder
-                        .body(reader)
-                        .map_err(|e| format!("build echo http::Request: {e}"))?;
+                    let http_req = builder.body(reader).map_err(|e| {
+                        icap_rs::HandlerError::internal(format!("build echo http::Request: {e}"))
+                    })?;
 
                     let resp = Response::new(StatusCode::OK, "OK")
                         .try_set_istag(ISTAG)?
@@ -129,7 +129,7 @@ async fn start_server(addr: &str) {
                     return Ok(resp);
                 }
 
-                Response::no_content().try_set_istag(ISTAG)
+                Ok(Response::no_content().try_set_istag(ISTAG)?)
             },
             Some(
                 ServiceOptions::new()

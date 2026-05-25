@@ -17,7 +17,7 @@ pub struct Encapsulated {
 /// Parse only the value of the `Encapsulated:` header.
 pub fn parse_encapsulated_value(val: &str) -> IcapResult<Encapsulated> {
     if val.trim().is_empty() {
-        return Err(Error::MissingHeader("Encapsulated"));
+        return Err(Error::missing_header("Encapsulated"));
     }
 
     let mut enc = Encapsulated::default();
@@ -27,13 +27,13 @@ pub fn parse_encapsulated_value(val: &str) -> IcapResult<Encapsulated> {
         let p = part.trim();
         let (name_raw, off_raw) = p
             .split_once('=')
-            .ok_or_else(|| Error::Header(format!("invalid Encapsulated token: {p}")))?;
+            .ok_or_else(|| Error::header(format!("invalid Encapsulated token: {p}")))?;
 
         let name = name_raw.trim().to_ascii_lowercase();
         let off: usize = off_raw
             .trim()
             .parse()
-            .map_err(|_| Error::Header(format!("invalid Encapsulated offset: {off_raw}")))?;
+            .map_err(|_| Error::header(format!("invalid Encapsulated offset: {off_raw}")))?;
 
         let slot = match name.as_str() {
             "req-hdr" => &mut enc.req_hdr,
@@ -43,7 +43,7 @@ pub fn parse_encapsulated_value(val: &str) -> IcapResult<Encapsulated> {
             "opt-body" => &mut enc.opt_body,
             "null-body" => &mut enc.null_body,
             _ => {
-                return Err(Error::Header(format!(
+                return Err(Error::header(format!(
                     "invalid Encapsulated part name: {}",
                     name_raw.trim()
                 )));
@@ -51,7 +51,7 @@ pub fn parse_encapsulated_value(val: &str) -> IcapResult<Encapsulated> {
         };
 
         if slot.replace(off).is_some() {
-            return Err(Error::Header(format!(
+            return Err(Error::header(format!(
                 "duplicate Encapsulated part name: {}",
                 name_raw.trim()
             )));
@@ -61,7 +61,7 @@ pub fn parse_encapsulated_value(val: &str) -> IcapResult<Encapsulated> {
 
     for w in offsets.windows(2) {
         if w[1] < w[0] {
-            return Err(Error::Header(format!(
+            return Err(Error::header(format!(
                 "Encapsulated offsets not monotonic: {} -> {}",
                 w[0], w[1]
             )));

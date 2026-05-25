@@ -1,5 +1,6 @@
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use http::{Response as HttpResponse, StatusCode as HttpStatus, Version};
+use icap_rs::HandlerResult;
 use icap_rs::error::IcapResult;
 use icap_rs::request::{IncomingRequest, Request};
 use icap_rs::response::{Response, StatusCode};
@@ -80,10 +81,10 @@ impl BenchEnv {
     }
 }
 
-async fn fast_204_handler(_req: IncomingRequest) -> IcapResult<Response> {
-    Response::new(StatusCode::NO_CONTENT, "No Content")
-        .try_set_istag("bench-204")
-        .map(|r| r.add_header("Server", "icap-rs/bench"))
+async fn fast_204_handler(_req: IncomingRequest) -> HandlerResult<Response> {
+    Ok(Response::new(StatusCode::NO_CONTENT, "No Content")
+        .try_set_istag("bench-204")?
+        .add_header("Server", "icap-rs/bench"))
 }
 
 fn sample_http_response() -> HttpResponse<Vec<u8>> {
@@ -169,7 +170,8 @@ async fn run_raw_parallel_keepalive_once(
         });
     }
     while let Some(joined) = set.join_next().await {
-        let resp = joined.map_err(|e| format!("raw task join error: {e}"))??;
+        let resp = joined
+            .map_err(|e| icap_rs::Error::unexpected(format!("raw task join error: {e}")))??;
         black_box(resp);
     }
     Ok(())

@@ -26,9 +26,9 @@ async fn start_server(port: u16) {
                     .body(ECHO_BODY.as_bytes().to_vec())
                     .unwrap();
 
-                Response::new(StatusCode::OK, "OK")
+                Ok(Response::new(StatusCode::OK, "OK")
                     .try_set_istag(ISTAG)?
-                    .with_http_response(&http_resp)
+                    .with_http_response(&http_resp)?)
             },
             Some(opts),
         )

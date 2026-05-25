@@ -4,7 +4,7 @@
 //! conventions (ICAPS over `icaps://` on port 11344 by default) and
 //! verify that protocol-level TLS errors surface through the dedicated
 //! [`TlsError`] variants rather than collapsing into generic
-//! [`Error::Network`] failures.
+//! [`Error::Io`] failures.
 
 #![cfg(feature = "tls-rustls")]
 
@@ -165,8 +165,8 @@ fn install_provider_once() {
     });
 }
 
-async fn echo_204_handler(_req: IncomingRequest) -> icap_rs::IcapResult<Response> {
-    Response::no_content_with_istag(ISTAG)
+async fn echo_204_handler(_req: IncomingRequest) -> icap_rs::HandlerResult<Response> {
+    Ok(Response::no_content_with_istag(ISTAG)?)
 }
 
 /// Spin up an ICAPS server bound to an ephemeral port and return its address.
@@ -265,7 +265,7 @@ async fn icaps_handshake_success_with_inline_pem_data() {
 
 #[tokio::test]
 async fn icaps_handshake_fails_with_untrusted_ca() {
-    // Cert chain validation failure must surface as Error::Tls, not Error::Network.
+    // Cert chain validation failure must surface as Error::Tls, not Error::Io.
     let pki = TestPki::new("localhost");
     let server_tls =
         ServerTlsConfig::from_pem_files(&pki.server_cert_pem_path, &pki.server_key_pem_path)
@@ -430,7 +430,7 @@ async fn icaps_mtls_rejects_missing_client_cert() {
     .expect_err("server should refuse handshake without client cert");
     // In TLS 1.3 the server's `certificate_required` alert is emitted after
     // its Finished, so the client's handshake itself succeeds and the failure
-    // surfaces during the first read as `Error::Network` whose source chain
+    // surfaces during the first read as `Error::Io` whose source chain
     // contains the rustls alert. In TLS 1.2 the same condition aborts the
     // handshake and arrives as `Error::Tls(Handshake)`. Both are correct.
     assert!(
@@ -440,13 +440,13 @@ async fn icaps_mtls_rejects_missing_client_cert() {
 }
 
 /// Returns `true` when the error originates from TLS (either as a structured
-/// [`TlsError`] or as an `Error::Network` whose source chain mentions a rustls
+/// [`TlsError`] or as an `Error::Io` whose source chain mentions a rustls
 /// alert / certificate condition).
 fn is_tls_layer_failure(err: &Error) -> bool {
     if matches!(err, Error::Tls(_)) {
         return true;
     }
-    if let Error::Network(io_err) = err {
+    if let Error::Io(io_err) = err {
         let mut src: Option<&(dyn std::error::Error + 'static)> = Some(io_err);
         while let Some(e) = src {
             let msg = e.to_string();
@@ -477,7 +477,7 @@ async fn icaps_default_port_is_11344() {
         .expect_err("connection must fail");
     // We expect a Network error (DNS / refused), not a config error.
     assert!(
-        matches!(err, Error::Network(_)),
+        matches!(err, Error::Io(_)),
         "expected Network failure, got {err:?}"
     );
 }

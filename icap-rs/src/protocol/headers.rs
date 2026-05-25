@@ -54,7 +54,7 @@ pub fn parse_icap_response_head(raw: &[u8]) -> IcapResult<RawIcapResponseHead> {
     }
 
     if parts[0] != ICAP_VERSION {
-        return Err(Error::InvalidVersion(parts[0].to_string()));
+        return Err(Error::invalid_version(parts[0].to_string()));
     }
 
     let version = parts[0].to_string();
@@ -63,9 +63,9 @@ pub fn parse_icap_response_head(raw: &[u8]) -> IcapResult<RawIcapResponseHead> {
     } else {
         let code_num = parts[1]
             .parse::<u16>()
-            .map_err(|_| Error::InvalidStatusCode("Invalid status code".into()))?;
+            .map_err(|_| Error::invalid_status_code("Invalid status code"))?;
         StatusCode::try_from(code_num).map_err(|_| {
-            Error::InvalidStatusCode(format!("Unknown ICAP status code: {code_num}"))
+            Error::invalid_status_code(format!("Unknown ICAP status code: {code_num}"))
         })?
     };
 
@@ -90,7 +90,7 @@ pub fn parse_icap_response_head(raw: &[u8]) -> IcapResult<RawIcapResponseHead> {
 
             if name.eq_ignore_ascii_case("Encapsulated") {
                 if seen_encapsulated {
-                    return Err(Error::Header("duplicate Encapsulated header".into()));
+                    return Err(Error::header("duplicate Encapsulated header"));
                 }
                 seen_encapsulated = true;
                 encapsulated_value = Some(value.to_string());
@@ -109,7 +109,7 @@ pub fn parse_icap_response_head(raw: &[u8]) -> IcapResult<RawIcapResponseHead> {
 
     if !headers.contains_key("ISTag") {
         if status_code.is_success() {
-            return Err(Error::MissingHeader("ISTag"));
+            return Err(Error::missing_header("ISTag"));
         }
         warn!(code = %status_code, "response without ISTag on non-2xx (accepted for compatibility)");
     }

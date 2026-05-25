@@ -1,4 +1,4 @@
-use icap_rs::error::{Error, IcapResult};
+use icap_rs::error::{Error, IcapResult, TimeoutError, TimeoutKind};
 use icap_rs::response::{ParsedResponse, StatusCode as IcapStatus};
 use icap_rs::{Client, Request};
 use std::time::Duration;
@@ -79,7 +79,10 @@ async fn timeout_fires_when_server_is_too_slow() {
     let elapsed = started.elapsed();
 
     match res {
-        Err(Error::ClientTimeout(d)) => {
+        Err(Error::Timeout(TimeoutError {
+            kind: TimeoutKind::ClientTotal,
+            duration: d,
+        })) => {
             assert_eq!(d.as_secs(), 1);
             assert!(
                 elapsed >= Duration::from_millis(900),

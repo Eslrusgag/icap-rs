@@ -1,6 +1,6 @@
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
-use crate::error::{Error, IcapResult};
+use crate::error::{Error, IcapResult, ProtocolError, ProtocolField};
 use crate::{Response, StatusCode};
 
 use super::Server;
@@ -14,7 +14,10 @@ impl Server {
         S: AsyncWrite + Unpin,
     {
         let (status, reason) = match err {
-            Error::InvalidMethod(_) => (StatusCode::NOT_IMPLEMENTED, "Not Implemented"),
+            Error::Protocol(ProtocolError::InvalidField {
+                field: ProtocolField::Method,
+                ..
+            }) => (StatusCode::NOT_IMPLEMENTED, "Not Implemented"),
             _ => (StatusCode::BAD_REQUEST, "Bad Request"),
         };
         Self::write_wire_error_response(socket, status, reason).await

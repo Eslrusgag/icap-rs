@@ -55,7 +55,7 @@ where
             socket.write_all(bytes).await?;
             Ok(())
         },
-        Error::ServerWriteTimeout,
+        Error::server_write_timeout,
     )
     .await
 }
@@ -70,7 +70,7 @@ where
             socket.flush().await?;
             Ok(())
         },
-        Error::ServerWriteTimeout,
+        Error::server_write_timeout,
     )
     .await
 }
@@ -123,39 +123,32 @@ impl Server {
 
                 let (read_dur, mk_err): (Option<Duration>, fn(Duration) -> Error) =
                     if request_started {
-                        (timeouts.header_read, Error::ServerHeaderReadTimeout)
+                        (timeouts.header_read, Error::server_header_read_timeout)
                     } else {
                         (
                             timeouts.idle_keepalive.or(timeouts.header_read),
                             if timeouts.idle_keepalive.is_some() {
-                                Error::ServerIdleTimeout
+                                Error::server_idle_timeout
                             } else {
-                                Error::ServerHeaderReadTimeout
+                                Error::server_header_read_timeout
                             },
                         )
                     };
 
                 let read_res = with_timeout_as(
                     read_dur,
-                    async {
-                        socket
-                            .read(&mut tmp)
-                            .await
-                            .map_err(Error::Network)
-                    },
+                    async { socket.read(&mut tmp).await.map_err(Error::Io) },
                     mk_err,
                 )
                 .await;
 
                 let n = match read_res {
                     Ok(n) => n,
-                    Err(Error::Network(e))
-                        if e.kind() == std::io::ErrorKind::UnexpectedEof =>
-                    {
+                    Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                         return if buf_start == buf.len() {
                             Ok(())
                         } else {
-                            Err("EOF before complete ICAP headers".into())
+                            Err(Error::Protocol(crate::error::ProtocolError::EarlyClose))
                         };
                     }
                     Err(e) => return Err(e),
@@ -165,7 +158,7 @@ impl Server {
                     return if buf_start == buf.len() {
                         Ok(())
                     } else {
-                        Err("EOF before complete ICAP headers".into())
+                        Err(Error::Protocol(crate::error::ProtocolError::EarlyClose))
                     };
                 }
                 buf.extend_from_slice(&tmp[..n]);
@@ -201,17 +194,12 @@ impl Server {
                 while buf.len() < body_abs {
                     let n = with_timeout_as(
                         timeouts.body_read,
-                        async {
-                            socket
-                                .read(&mut tmp)
-                                .await
-                                .map_err(Error::Network)
-                        },
-                        Error::ServerBodyReadTimeout,
+                        async { socket.read(&mut tmp).await.map_err(Error::Io) },
+                        Error::server_body_read_timeout,
                     )
                     .await?;
                     if n == 0 {
-                        return Err("Unexpected EOF before start of ICAP body".into());
+                        return Err(Error::body("unexpected EOF before start of ICAP body"));
                     }
                     buf.extend_from_slice(&tmp[..n]);
                 }
@@ -219,17 +207,16 @@ impl Server {
                 if preview_size.is_some() {
                     let (preview_end, preview_ieof) = with_timeout_as(
                         timeouts.body_read,
-                        async {
-                            read_chunked_until_zero(&mut socket, &mut buf, body_abs).await
-                        },
-                        Error::ServerBodyReadTimeout,
+                        async { read_chunked_until_zero(&mut socket, &mut buf, body_abs).await },
+                        Error::server_body_read_timeout,
                     )
                     .await?;
 
                     let mut preview_slice = &buf[body_abs..preview_end];
                     let (mut decoded, _ieof_seen) =
-                        dechunk_icap_entity_with_ieof(&mut preview_slice)
-                            .map_err(|e| format!("dechunk ICAP preview entity: {e}"))?;
+                        dechunk_icap_entity_with_ieof(&mut preview_slice).map_err(|e| {
+                            Error::body(format!("dechunk ICAP preview entity: {e}"))
+                        })?;
 
                     if preview_ieof {
                         msg_end = preview_end;
@@ -268,8 +255,22 @@ impl Server {
                             && let Some(handler_entry) = entry.handlers.get(&preview_method)
                             && handler_entry.preview_aware
                         {
+                            let log_service = preview_service_resolved.to_string();
                             mark_request_body_as_preview(&mut preview_req, false);
-                            match (handler_entry.handler)(preview_req).await? {
+                            let decision = match (handler_entry.handler)(preview_req).await {
+                                Ok(d) => d,
+                                Err(err) => {
+                                    warn!(
+                                        client = %addr,
+                                        service = %log_service,
+                                        method = %preview_method,
+                                        error = %err,
+                                        "preview handler returned error"
+                                    );
+                                    PreviewDecision::Respond(err.into_response())
+                                }
+                            };
+                            match decision {
                                 PreviewDecision::Continue => {}
                                 PreviewDecision::Respond(resp) => {
                                     let should_close = !matches!(
@@ -314,15 +315,15 @@ impl Server {
 
                         let rest_end = with_timeout_as(
                             timeouts.body_read,
-                            async {
-                                read_chunked_to_end(&mut socket, &mut buf, preview_end).await
-                            },
-                            Error::ServerBodyReadTimeout,
+                            async { read_chunked_to_end(&mut socket, &mut buf, preview_end).await },
+                            Error::server_body_read_timeout,
                         )
                         .await?;
                         let mut rest_slice = &buf[preview_end..rest_end];
                         let (rest_decoded, _) = dechunk_icap_entity_with_ieof(&mut rest_slice)
-                            .map_err(|e| format!("dechunk ICAP remainder entity: {e}"))?;
+                            .map_err(|e| {
+                                Error::body(format!("dechunk ICAP remainder entity: {e}"))
+                            })?;
                         decoded.extend_from_slice(&rest_decoded);
                         msg_end = rest_end;
                     }
@@ -333,16 +334,14 @@ impl Server {
                 } else {
                     msg_end = with_timeout_as(
                         timeouts.body_read,
-                        async {
-                            read_chunked_to_end(&mut socket, &mut buf, body_abs).await
-                        },
-                        Error::ServerBodyReadTimeout,
+                        async { read_chunked_to_end(&mut socket, &mut buf, body_abs).await },
+                        Error::server_body_read_timeout,
                     )
                     .await?;
                     if msg_end > body_abs {
                         let mut chunked_slice = &buf[body_abs..msg_end];
                         let decoded = dechunk_icap_entity(&mut chunked_slice)
-                            .map_err(|e| format!("dechunk ICAP entity: {e}"))?;
+                            .map_err(|e| Error::body(format!("dechunk ICAP entity: {e}")))?;
                         let decoded_len = decoded.len();
                         buf.splice(body_abs..msg_end, decoded);
                         msg_end = body_abs + decoded_len;
@@ -353,17 +352,12 @@ impl Server {
                 while buf.len() < end_abs {
                     let n = with_timeout_as(
                         timeouts.body_read,
-                        async {
-                            socket
-                                .read(&mut tmp)
-                                .await
-                                .map_err(Error::Network)
-                        },
-                        Error::ServerBodyReadTimeout,
+                        async { socket.read(&mut tmp).await.map_err(Error::Io) },
+                        Error::server_body_read_timeout,
                     )
                     .await?;
                     if n == 0 {
-                        return Err("Unexpected EOF before null-body boundary".into());
+                        return Err(Error::body("unexpected EOF before null-body boundary"));
                     }
                     buf.extend_from_slice(&tmp[..n]);
                 }
@@ -395,11 +389,10 @@ impl Server {
                     let mut allowed: SmallVec<Method, 2> = entry.handlers.keys().copied().collect();
                     allowed.sort_unstable();
                     let Some(mut cfg) = entry.options.clone() else {
-                        return Err(format!(
+                        return Err(Error::service(format!(
                             "Service '{}' has no explicit OPTIONS configuration with ISTag",
                             service_resolved.as_ref()
-                        )
-                        .into());
+                        )));
                     };
                     cfg.set_methods(allowed);
                     if cfg.service.is_none() {
@@ -417,11 +410,10 @@ impl Server {
 
                     if !allow_204 && !has_preview {
                         let Some(options) = entry.options.as_ref() else {
-                            return Err(format!(
+                            return Err(Error::service(format!(
                                 "Service '{}' has no explicit OPTIONS configuration with ISTag",
                                 service_resolved.as_ref()
-                            )
-                            .into());
+                            )));
                         };
                         let istag_now = options.istag_for(&req)?;
 
@@ -448,7 +440,9 @@ impl Server {
                                         h.extend(head.headers().clone());
                                     }
                                     let http_resp = builder.body(reader.clone()).map_err(|e| {
-                                        format!("build http::Response from embedded: {e}")
+                                        Error::body(format!(
+                                            "build http::Response from embedded: {e}"
+                                        ))
                                     })?;
                                     out = out.with_http_response(&http_resp)?;
                                 }
@@ -467,7 +461,9 @@ impl Server {
                                         h.extend(head.headers().clone());
                                     }
                                     let http_req = builder.body(reader.clone()).map_err(|e| {
-                                        format!("build http::Request from embedded: {e}")
+                                        Error::body(format!(
+                                            "build http::Request from embedded: {e}"
+                                        ))
                                     })?;
                                     out = out.with_http_request(&http_req)?;
                                 }
@@ -477,13 +473,28 @@ impl Server {
                             out
                         }
                     } else if let Some(handler_entry) = entry.handlers.get(&method) {
-                        match (handler_entry.handler)(req).await? {
-                            PreviewDecision::Respond(resp) => resp,
-                            PreviewDecision::Continue => {
-                                return Err(
-                                    "Route handler returned Continue after full body was read"
-                                        .into(),
+                        let log_service = service_resolved.to_string();
+                        match (handler_entry.handler)(req).await {
+                            Ok(PreviewDecision::Respond(resp)) => resp,
+                            Ok(PreviewDecision::Continue) => {
+                                warn!(
+                                    client = %addr,
+                                    service = %log_service,
+                                    method = %method,
+                                    "handler returned Continue after full body was read; \
+                                     sending 500"
                                 );
+                                Response::new(StatusCode::INTERNAL_SERVER_ERROR, "Handler error")
+                            }
+                            Err(err) => {
+                                warn!(
+                                    client = %addr,
+                                    service = %log_service,
+                                    method = %method,
+                                    error = %err,
+                                    "handler returned error"
+                                );
+                                err.into_response()
                             }
                         }
                     } else {

@@ -1,6 +1,6 @@
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use http::{Response as HttpResponse, StatusCode as HttpStatus, Version};
-use icap_rs::error::IcapResult;
+use icap_rs::HandlerResult;
 use icap_rs::request::{IncomingRequest, Request};
 use icap_rs::response::{Response, StatusCode};
 use icap_rs::server::Server;
@@ -151,10 +151,10 @@ async fn spawn_tls_server(addr: &str) {
     });
 }
 
-async fn fast_204_handler(_req: IncomingRequest) -> IcapResult<Response> {
-    Response::new(StatusCode::NO_CONTENT, "No Content")
-        .try_set_istag("tls-overhead-bench")
-        .map(|r| r.add_header("Server", "icap-rs/bench"))
+async fn fast_204_handler(_req: IncomingRequest) -> HandlerResult<Response> {
+    Ok(Response::new(StatusCode::NO_CONTENT, "No Content")
+        .try_set_istag("tls-overhead-bench")?
+        .add_header("Server", "icap-rs/bench"))
 }
 
 fn tls_client(port: u16, keep_alive: bool) -> Client {

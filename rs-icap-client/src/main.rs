@@ -451,9 +451,9 @@ async fn main() -> IcapResult<()> {
                 }
             }
 
-            let http_req = httpb
-                .body(body_vec)
-                .map_err(|e| format!("failed to build HTTP request: {e}"))?;
+            let http_req = httpb.body(body_vec).map_err(|e| {
+                icap_rs::Error::http_parse(format!("failed to build HTTP request: {e}"))
+            })?;
             icap_req = icap_req.with_http_request(http_req)?;
         } else {
             // Build embedded HTTP response (HTTP/1.0 by default, like c-icap-client)
@@ -489,9 +489,9 @@ async fn main() -> IcapResult<()> {
             }
 
             let body_vec = file_bytes.clone().unwrap_or_default();
-            let http_resp = httpb
-                .body(body_vec)
-                .map_err(|e| format!("failed to build HTTP response: {e}"))?;
+            let http_resp = httpb.body(body_vec).map_err(|e| {
+                icap_rs::Error::http_parse(format!("failed to build HTTP response: {e}"))
+            })?;
             icap_req = icap_req.with_http_response(http_resp)?;
         }
 
@@ -647,11 +647,10 @@ fn append_original_body_suffix(
     offset: usize,
 ) -> IcapResult<Vec<u8>> {
     if offset > original_body.len() {
-        return Err(format!(
+        return Err(icap_rs::Error::body(format!(
             "use-original-body offset {offset} exceeds original body length {}",
             original_body.len()
-        )
-        .into());
+        )));
     }
 
     response_body.extend_from_slice(&original_body[offset..]);

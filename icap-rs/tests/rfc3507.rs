@@ -6,7 +6,7 @@
 //! mistaken for implemented behavior.
 
 use http::{Request as HttpRequest, Response as HttpResponse, StatusCode as HttpStatus, Version};
-use icap_rs::error::IcapResult;
+use icap_rs::HandlerResult;
 use icap_rs::request::{IncomingRequest, Request};
 use icap_rs::response::{ParsedResponse, Response, StatusCode};
 use icap_rs::server::options::{ServiceOptions, TransferBehavior};
@@ -19,11 +19,11 @@ use tokio::time::Duration;
 
 const ISTAG: &str = "rfc3507";
 
-async fn no_modification_handler(_req: IncomingRequest) -> IcapResult<Response> {
-    Response::no_content().try_set_istag(ISTAG)
+async fn no_modification_handler(_req: IncomingRequest) -> HandlerResult<Response> {
+    Ok(Response::no_content().try_set_istag(ISTAG)?)
 }
 
-async fn preview_final_handler(_req: IncomingRequest) -> IcapResult<PreviewDecision> {
+async fn preview_final_handler(_req: IncomingRequest) -> HandlerResult<PreviewDecision> {
     Ok(PreviewDecision::Respond(
         Response::no_content().try_set_istag(ISTAG)?,
     ))

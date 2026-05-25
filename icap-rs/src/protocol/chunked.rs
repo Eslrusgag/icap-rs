@@ -1,4 +1,4 @@
-use crate::error::IcapResult;
+use crate::error::{Error, IcapResult};
 use memchr::{memchr, memmem};
 use std::io::Write;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -38,7 +38,7 @@ pub fn parse_one_chunk(buf: &[u8], from: usize) -> Option<(usize, bool, usize)> 
     None
 }
 
-pub fn parse_one_chunk_meta(buf: &[u8], from: usize) -> Result<Option<ChunkMeta>, String> {
+pub fn parse_one_chunk_meta(buf: &[u8], from: usize) -> IcapResult<Option<ChunkMeta>> {
     if from >= buf.len() {
         return Ok(None);
     }
@@ -56,9 +56,10 @@ pub fn parse_one_chunk_meta(buf: &[u8], from: usize) -> Result<Option<ChunkMeta>
     });
 
     let size_str = std::str::from_utf8(size_hex)
-        .map_err(|_| "chunk size not utf8".to_string())?
+        .map_err(|_| Error::body("chunk size not utf8"))?
         .trim();
-    let size = usize::from_str_radix(size_str, 16).map_err(|_| "chunk size not hex".to_string())?;
+    let size =
+        usize::from_str_radix(size_str, 16).map_err(|_| Error::body("chunk size not hex"))?;
 
     let has_ieof = ext_part
         .and_then(|b| std::str::from_utf8(b).ok())
@@ -69,7 +70,7 @@ pub fn parse_one_chunk_meta(buf: &[u8], from: usize) -> Result<Option<ChunkMeta>
             return Ok(None);
         }
         if &buf[after_size..after_size + 2] != b"\r\n" {
-            return Err("Invalid chunked terminator".into());
+            return Err(Error::body("invalid chunked terminator"));
         }
         return Ok(Some(ChunkMeta {
             next_pos: after_size + 2,
@@ -84,7 +85,7 @@ pub fn parse_one_chunk_meta(buf: &[u8], from: usize) -> Result<Option<ChunkMeta>
         return Ok(None);
     }
     if &buf[after_size + size..need] != b"\r\n" {
-        return Err("missing CRLF after chunk".into());
+        return Err(Error::body("missing CRLF after chunk"));
     }
     Ok(Some(ChunkMeta {
         next_pos: need,
@@ -111,12 +112,12 @@ where
                     let mut tmp = [0u8; 4096];
                     let n = AsyncReadExt::read(stream, &mut tmp).await?;
                     if n == 0 {
-                        return Err("Unexpected EOF after zero chunk".into());
+                        return Err(Error::body("unexpected EOF after zero chunk"));
                     }
                     buf.extend_from_slice(&tmp[..n]);
                 }
                 if &buf[pos..pos + 2] != b"\r\n" {
-                    return Err("Invalid chunked terminator".into());
+                    return Err(Error::body("invalid chunked terminator"));
                 }
                 return Ok(pos + 2);
             }
@@ -125,7 +126,9 @@ where
             let mut tmp = [0u8; 4096];
             let n = AsyncReadExt::read(stream, &mut tmp).await?;
             if n == 0 {
-                return Err("Unexpected EOF while reading ICAP chunked body".into());
+                return Err(Error::body(
+                    "unexpected EOF while reading ICAP chunked body",
+                ));
             }
             buf.extend_from_slice(&tmp[..n]);
         }
@@ -150,26 +153,31 @@ where
             let mut tmp = [0u8; 4096];
             let n = stream.read(&mut tmp).await?;
             if n == 0 {
-                return Err("Unexpected EOF while reading ICAP preview body".into());
+                return Err(Error::body(
+                    "unexpected EOF while reading ICAP preview body",
+                ));
             }
             buf.extend_from_slice(&tmp[..n]);
         }
     }
 }
 
-pub fn dechunk_icap_entity(data: &mut &[u8]) -> Result<Vec<u8>, String> {
+pub fn dechunk_icap_entity(data: &mut &[u8]) -> IcapResult<Vec<u8>> {
     let mut out = Vec::with_capacity((*data).len());
     let mut d = *data;
 
     loop {
-        let crlf_pos = memmem::find(d, b"\r\n").ok_or("chunk size line without CRLF")?;
+        let crlf_pos =
+            memmem::find(d, b"\r\n").ok_or_else(|| Error::body("chunk size line without CRLF"))?;
         let (size_line, rest) = d.split_at(crlf_pos);
         d = &rest[2..];
 
         let size_hex = memchr(b';', size_line).map_or(size_line, |i| &size_line[..i]);
 
-        let size_str = core::str::from_utf8(size_hex).map_err(|_| "chunk size not utf8")?;
-        let size = usize::from_str_radix(size_str.trim(), 16).map_err(|_| "chunk size not hex")?;
+        let size_str =
+            core::str::from_utf8(size_hex).map_err(|_| Error::body("chunk size not utf8"))?;
+        let size = usize::from_str_radix(size_str.trim(), 16)
+            .map_err(|_| Error::body("chunk size not hex"))?;
 
         if size == 0 {
             if d.starts_with(b"\r\n") {
@@ -180,13 +188,13 @@ pub fn dechunk_icap_entity(data: &mut &[u8]) -> Result<Vec<u8>, String> {
         }
 
         if d.len() < size + 2 {
-            return Err("incomplete chunk data".into());
+            return Err(Error::body("incomplete chunk data"));
         }
 
         out.extend_from_slice(&d[..size]);
 
         if &d[size..size + 2] != b"\r\n" {
-            return Err("missing CRLF after chunk".into());
+            return Err(Error::body("missing CRLF after chunk"));
         }
 
         d = &d[size + 2..];
@@ -195,19 +203,22 @@ pub fn dechunk_icap_entity(data: &mut &[u8]) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-pub fn dechunk_icap_entity_with_ieof(data: &mut &[u8]) -> Result<(Vec<u8>, bool), String> {
+pub fn dechunk_icap_entity_with_ieof(data: &mut &[u8]) -> IcapResult<(Vec<u8>, bool)> {
     let mut out = Vec::with_capacity((*data).len());
     let mut d = *data;
     let ieof = loop {
-        let rel = memmem::find(d, b"\r\n").ok_or("chunk size line without CRLF")?;
+        let rel =
+            memmem::find(d, b"\r\n").ok_or_else(|| Error::body("chunk size line without CRLF"))?;
         let line = &d[..rel];
         d = &d[rel + 2..];
 
         let (size_hex, ext_part) =
             memchr(b';', line).map_or((line, None), |i| (&line[..i], Some(&line[i + 1..])));
 
-        let size_str = std::str::from_utf8(size_hex).map_err(|_| "chunk size not utf8")?;
-        let size = usize::from_str_radix(size_str.trim(), 16).map_err(|_| "chunk size not hex")?;
+        let size_str =
+            std::str::from_utf8(size_hex).map_err(|_| Error::body("chunk size not utf8"))?;
+        let size = usize::from_str_radix(size_str.trim(), 16)
+            .map_err(|_| Error::body("chunk size not hex"))?;
 
         let has_ieof = ext_part
             .and_then(|b| std::str::from_utf8(b).ok())
@@ -217,18 +228,18 @@ pub fn dechunk_icap_entity_with_ieof(data: &mut &[u8]) -> Result<(Vec<u8>, bool)
             if d.starts_with(b"\r\n") {
                 d = &d[2..];
             } else {
-                return Err("missing final CRLF after zero chunk".into());
+                return Err(Error::body("missing final CRLF after zero chunk"));
             }
             *data = d;
             break has_ieof;
         }
 
         if d.len() < size + 2 {
-            return Err("incomplete chunk data".into());
+            return Err(Error::body("incomplete chunk data"));
         }
         out.extend_from_slice(&d[..size]);
         if &d[size..size + 2] != b"\r\n" {
-            return Err("missing CRLF after chunk".into());
+            return Err(Error::body("missing CRLF after chunk"));
         }
         d = &d[size + 2..];
     };
@@ -238,48 +249,51 @@ pub fn dechunk_icap_entity_with_ieof(data: &mut &[u8]) -> Result<(Vec<u8>, bool)
 
 pub fn dechunk_icap_entity_with_use_original_body(
     data: &mut &[u8],
-) -> Result<(Vec<u8>, Option<usize>), String> {
+) -> IcapResult<(Vec<u8>, Option<usize>)> {
     let mut out = Vec::with_capacity((*data).len());
     let mut d = *data;
 
     loop {
-        let crlf_pos = memmem::find(d, b"\r\n").ok_or("chunk size line without CRLF")?;
+        let crlf_pos =
+            memmem::find(d, b"\r\n").ok_or_else(|| Error::body("chunk size line without CRLF"))?;
         let (size_line, rest) = d.split_at(crlf_pos);
         d = &rest[2..];
 
         let size_hex = memchr(b';', size_line).map_or(size_line, |i| &size_line[..i]);
-        let size_str = core::str::from_utf8(size_hex).map_err(|_| "chunk size not utf8")?;
-        let size = usize::from_str_radix(size_str.trim(), 16).map_err(|_| "chunk size not hex")?;
+        let size_str =
+            core::str::from_utf8(size_hex).map_err(|_| Error::body("chunk size not utf8"))?;
+        let size = usize::from_str_radix(size_str.trim(), 16)
+            .map_err(|_| Error::body("chunk size not hex"))?;
 
         if size == 0 {
             let use_original_body = parse_use_original_body_extension(size_line)?;
             if d.starts_with(b"\r\n") {
                 d = &d[2..];
             } else {
-                return Err("missing final CRLF after zero chunk".into());
+                return Err(Error::body("missing final CRLF after zero chunk"));
             }
             *data = d;
             return Ok((out, use_original_body));
         }
 
         if d.len() < size + 2 {
-            return Err("incomplete chunk data".into());
+            return Err(Error::body("incomplete chunk data"));
         }
         out.extend_from_slice(&d[..size]);
         d = &d[size..];
         if !d.starts_with(b"\r\n") {
-            return Err("missing CRLF after chunk".into());
+            return Err(Error::body("missing CRLF after chunk"));
         }
         d = &d[2..];
     }
 }
 
-fn parse_use_original_body_extension(size_line: &[u8]) -> Result<Option<usize>, String> {
+fn parse_use_original_body_extension(size_line: &[u8]) -> IcapResult<Option<usize>> {
     let Some(ext_start) = memchr(b';', size_line) else {
         return Ok(None);
     };
     let ext_text = core::str::from_utf8(&size_line[ext_start + 1..])
-        .map_err(|_| "chunk extension not utf8")?;
+        .map_err(|_| Error::body("chunk extension not utf8"))?;
     for ext in ext_text.split(';') {
         let Some((name, value)) = ext.trim().split_once('=') else {
             continue;
@@ -289,7 +303,7 @@ fn parse_use_original_body_extension(size_line: &[u8]) -> Result<Option<usize>, 
                 .trim()
                 .parse::<usize>()
                 .map(Some)
-                .map_err(|_| "use-original-body offset not decimal".to_string());
+                .map_err(|_| Error::body("use-original-body offset not decimal"));
         }
     }
     Ok(None)

@@ -28,6 +28,8 @@
 
 use crate::ICAP_VERSION;
 use crate::error::{Error, IcapResult};
+#[cfg(test)]
+use crate::error::{ProtocolError, ProtocolField};
 use crate::protocol::{
     Encapsulated, dechunk_icap_entity_with_use_original_body, find_double_crlf, istag_header_value,
     parse_encapsulated_value, parse_icap_response_head, parse_one_chunk, serialize_http_request,
@@ -246,7 +248,7 @@ impl Response<Outgoing> {
     pub fn no_content_with_headers(headers: HeaderMap) -> IcapResult<Self> {
         let istag = headers
             .get("ISTag")
-            .ok_or(Error::MissingHeader("ISTag"))?
+            .ok_or(Error::missing_header("ISTag"))?
             .to_str()?;
         validate_istag(istag)?;
 
@@ -337,7 +339,7 @@ impl Response<Outgoing> {
             let istag = self
                 .headers
                 .get("ISTag")
-                .ok_or(Error::MissingHeader("ISTag"))?
+                .ok_or(Error::missing_header("ISTag"))?
                 .to_str()?;
             validate_istag(istag)?;
         } else if let Some(v) = self.headers.get("ISTag") {
@@ -350,7 +352,7 @@ impl Response<Outgoing> {
         match self.status_code {
             StatusCode::NO_CONTENT => {
                 if !self.body.is_empty() {
-                    return Err(Error::Body("204 must not carry a body".into()));
+                    return Err(Error::body("204 must not carry a body"));
                 }
                 match self.headers.get("Encapsulated") {
                     None => {
@@ -360,9 +362,7 @@ impl Response<Outgoing> {
                         );
                     }
                     Some(v) if v.as_bytes() != b"null-body=0".as_slice() => {
-                        return Err(Error::Header(
-                            "204 requires Encapsulated: null-body=0".into(),
-                        ));
+                        return Err(Error::header("204 requires Encapsulated: null-body=0"));
                     }
                     Some(_) => {}
                 }
@@ -370,7 +370,7 @@ impl Response<Outgoing> {
             StatusCode::OK | StatusCode::PARTIAL_CONTENT => {
                 if !self.headers.contains_key("Encapsulated") {
                     if self.body.is_empty() {
-                        return Err(Error::MissingHeader(
+                        return Err(Error::missing_header(
                             "Encapsulated missing and cannot infer for 2xx with empty body; \
                          set it explicitly or use Response::with_http_response(...)",
                         ));
@@ -382,7 +382,7 @@ impl Response<Outgoing> {
                             .headers
                             .insert(HeaderName::from_static("encapsulated"), hv);
                     } else {
-                        return Err(Error::Header(
+                        return Err(Error::header(
                             "Encapsulated missing and body is not an embedded HTTP/1.x".to_string(),
                         ));
                     }
@@ -419,25 +419,23 @@ impl Response<Outgoing> {
                 .and_then(|v| v.to_str().ok())
             && parse_encapsulated_value(enc_val).is_ok_and(|enc| enc.null_body.is_some())
         {
-            return Err(Error::Body(
-                "Encapsulated: null-body must not carry a body".into(),
-            ));
+            return Err(Error::body("Encapsulated: null-body must not carry a body"));
         }
         if let Some(offset) = resp_ref.use_original_body {
             if resp_ref.status_code != StatusCode::PARTIAL_CONTENT {
-                return Err(Error::Header(
-                    "use-original-body is only valid on 206 Partial Content".into(),
+                return Err(Error::header(
+                    "use-original-body is only valid on 206 Partial Content",
                 ));
             }
             let enc_val = resp_ref
                 .headers
                 .get("Encapsulated")
                 .and_then(|v| v.to_str().ok())
-                .ok_or(Error::MissingHeader("Encapsulated"))?;
+                .ok_or(Error::missing_header("Encapsulated"))?;
             let enc = parse_encapsulated_value(enc_val)?;
             if enc.req_body.or(enc.res_body).or(enc.opt_body).is_none() {
-                return Err(Error::Header(
-                    "use-original-body requires an encapsulated body offset".into(),
+                return Err(Error::header(
+                    "use-original-body requires an encapsulated body offset",
                 ));
             }
             trace!(offset, "serializing 206 use-original-body marker");
@@ -498,10 +496,10 @@ impl Response<Outgoing> {
         }
         let http = builder
             .body(Vec::new())
-            .map_err(|e| Error::Body(format!("build embedded HTTP request head: {e}")))?;
+            .map_err(|e| Error::body(format!("build embedded HTTP request head: {e}")))?;
         let bytes = serialize_http_request(&http);
         let hdr_end = find_double_crlf(&bytes)
-            .ok_or_else(|| Error::Header("embedded HTTP request missing CRLFCRLF".into()))?;
+            .ok_or_else(|| Error::header("embedded HTTP request missing CRLFCRLF"))?;
         self.body = bytes;
         self.use_original_body = Some(offset);
         self.headers.insert(
@@ -528,10 +526,10 @@ impl Response<Outgoing> {
         }
         let http = builder
             .body(Vec::new())
-            .map_err(|e| Error::Body(format!("build embedded HTTP response head: {e}")))?;
+            .map_err(|e| Error::body(format!("build embedded HTTP response head: {e}")))?;
         let bytes = serialize_http_response(&http);
         let hdr_end = find_double_crlf(&bytes)
-            .ok_or_else(|| Error::Header("embedded HTTP response missing CRLFCRLF".into()))?;
+            .ok_or_else(|| Error::header("embedded HTTP response missing CRLFCRLF"))?;
         self.body = bytes;
         self.use_original_body = Some(offset);
         self.headers.insert(
@@ -573,8 +571,8 @@ fn looks_like_http_resp(body: &[u8]) -> bool {
 }
 #[inline]
 fn compute_enc_for_res_body(body: &[u8]) -> IcapResult<String> {
-    let hdr_end = find_double_crlf(body)
-        .ok_or_else(|| Error::Header("embedded HTTP missing CRLFCRLF".into()))?;
+    let hdr_end =
+        find_double_crlf(body).ok_or_else(|| Error::header("embedded HTTP missing CRLFCRLF"))?;
     if body.len() > hdr_end {
         Ok(format!("res-hdr=0, res-body={hdr_end}"))
     } else {
@@ -583,8 +581,8 @@ fn compute_enc_for_res_body(body: &[u8]) -> IcapResult<String> {
 }
 #[inline]
 fn compute_enc_for_req_body(body: &[u8]) -> IcapResult<String> {
-    let hdr_end = find_double_crlf(body)
-        .ok_or_else(|| Error::Header("embedded HTTP missing CRLFCRLF".into()))?;
+    let hdr_end =
+        find_double_crlf(body).ok_or_else(|| Error::header("embedded HTTP missing CRLFCRLF"))?;
     if body.len() > hdr_end {
         Ok(format!("req-hdr=0, req-body={hdr_end}"))
     } else {
@@ -635,17 +633,15 @@ pub(crate) fn parse_icap_response(raw: &[u8]) -> IcapResult<ParsedResponse> {
                     .get("Encapsulated")
                     .and_then(|v| v.to_str().ok())
             })
-            .ok_or(Error::MissingHeader("Encapsulated"))?;
+            .ok_or(Error::missing_header("Encapsulated"))?;
 
         match response.status_code {
             StatusCode::NO_CONTENT => {
                 if !enc_val.trim().eq_ignore_ascii_case("null-body=0") {
-                    return Err(Error::Header(
-                        "204 requires Encapsulated: null-body=0".into(),
-                    ));
+                    return Err(Error::header("204 requires Encapsulated: null-body=0"));
                 }
                 if !body.is_empty() {
-                    return Err(Error::Body("204 must not carry a body".into()));
+                    return Err(Error::body("204 must not carry a body"));
                 }
             }
             StatusCode::OK | StatusCode::PARTIAL_CONTENT => {
@@ -654,8 +650,8 @@ pub(crate) fn parse_icap_response(raw: &[u8]) -> IcapResult<ParsedResponse> {
                 if response.use_original_body.is_some()
                     && response.status_code != StatusCode::PARTIAL_CONTENT
                 {
-                    return Err(Error::Header(
-                        "use-original-body is only valid on 206 Partial Content".into(),
+                    return Err(Error::header(
+                        "use-original-body is only valid on 206 Partial Content",
                     ));
                 }
                 validate_encapsulated_offsets(&enc, body.len())?;
@@ -671,7 +667,7 @@ pub(crate) fn parse_icap_response(raw: &[u8]) -> IcapResult<ParsedResponse> {
 fn validate_encapsulated_offsets(enc: &Encapsulated, enc_len: usize) -> IcapResult<()> {
     for off in encapsulated_offsets(enc) {
         if off > enc_len {
-            return Err(Error::Header(format!(
+            return Err(Error::header(format!(
                 "Encapsulated offset {off} out of range (len={enc_len})"
             )));
         }
@@ -688,20 +684,20 @@ fn dechunk_response_body_if_needed(
     };
 
     if body_start > body.len() {
-        return Err(Error::Header(format!(
+        return Err(Error::header(format!(
             "Encapsulated body offset {body_start} out of range (len={})",
             body.len()
         )));
     }
     if parse_one_chunk(body, body_start).is_none() {
-        return Err(Error::Body(
-            "missing ICAP chunked entity body at Encapsulated body offset".into(),
+        return Err(Error::body(
+            "missing ICAP chunked entity body at Encapsulated body offset",
         ));
     }
 
     let mut chunked = &body[body_start..];
     let (decoded, use_original_body) = dechunk_icap_entity_with_use_original_body(&mut chunked)
-        .map_err(|e| Error::Body(format!("dechunk ICAP entity: {e}")))?;
+        .map_err(|e| Error::body(format!("dechunk ICAP entity: {e}")))?;
     body.splice(body_start.., decoded);
     Ok(use_original_body)
 }
@@ -765,7 +761,10 @@ mod tests {
     #[test]
     fn success_shortcuts_validate_istag() {
         let err = Response::ok_with_istag("BAD TAG").expect_err("shortcut must validate ISTag");
-        assert!(matches!(err, Error::InvalidISTag(_)));
+        assert!(matches!(
+            err,
+            Error::Protocol(ProtocolError::InvalidISTag(_))
+        ));
     }
 
     #[test]
@@ -812,7 +811,7 @@ mod tests {
             .try_add_header("Bad Header", "value")
             .expect_err("invalid header name should be rejected");
 
-        assert!(matches!(err, Error::HeaderName(_)));
+        assert!(matches!(err, Error::Protocol(ProtocolError::HeaderName(_))));
     }
 
     #[test]
@@ -821,7 +820,10 @@ mod tests {
             .try_add_header("ISTag", "BAD TAG WITH SPACE")
             .expect_err("invalid ISTag should be rejected");
 
-        assert!(matches!(err, Error::InvalidISTag(_)));
+        assert!(matches!(
+            err,
+            Error::Protocol(ProtocolError::InvalidISTag(_))
+        ));
     }
 
     #[test]
@@ -858,7 +860,7 @@ mod tests {
     fn to_raw_errors_if_istag_missing() {
         let resp = Response::new(StatusCode::OK, "OK").add_header("Service", "X");
         let err = resp.to_raw().unwrap_err();
-        assert!(matches!(err, Error::MissingHeader(h) if h == "ISTag"));
+        assert!(matches!(err, Error::Protocol(ProtocolError::MissingHeader(h)) if h == "ISTag"));
     }
 
     #[test]
@@ -1057,7 +1059,7 @@ mod response_wire_parser_tests {
         );
         let err = parse_icap_response(&raw).unwrap_err();
         assert!(
-            matches!(err, Error::InvalidVersion(ref v) if v == "ICAP/2.0"),
+            matches!(err, Error::Protocol(ProtocolError::InvalidField { field: ProtocolField::Version, value: ref v, .. }) if v == "ICAP/2.0"),
             "expected InvalidVersion(\"ICAP/2.0\"), got: {err:?}"
         );
     }

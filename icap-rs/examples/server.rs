@@ -133,9 +133,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                     http::HeaderValue::from_str(&reader.len().to_string()).unwrap(),
                                 );
                             }
-                            let http_resp = builder
-                                .body(reader.clone())
-                                .map_err(|e| format!("build http::Response: {e}"))?;
+                            let http_resp = builder.body(reader.clone()).map_err(|e| {
+                                icap_rs::HandlerError::internal(format!(
+                                    "build http::Response: {e}"
+                                ))
+                            })?;
 
                             return Ok(Response::ok_with_istag(&istag_now)?
                                 .with_http_response(&http_resp)?
@@ -173,7 +175,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
                         let istag_now = t.read().unwrap().clone();
                         let http = build_block_403_http("Blocked!", &istag_now);
-                        Response::ok_with_istag(&istag_now)?.with_http_response(&http)
+                        Ok(Response::ok_with_istag(&istag_now)?.with_http_response(&http)?)
                     }
                 }
             },

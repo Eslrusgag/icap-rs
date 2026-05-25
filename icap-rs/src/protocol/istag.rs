@@ -8,7 +8,7 @@ pub fn validate_istag(raw: &str) -> IcapResult<()> {
     let quoted = s.starts_with('"');
     if quoted {
         if !s.ends_with('"') || s.len() < 2 {
-            return Err(Error::InvalidISTag("unterminated quoted ISTag".into()));
+            return Err(Error::invalid_istag("unterminated quoted ISTag"));
         }
         let inner = &s[1..s.len() - 1];
         let mut it = inner.chars();
@@ -17,13 +17,11 @@ pub fn validate_istag(raw: &str) -> IcapResult<()> {
                 if let Some(esc) = it.next() {
                     val.push(esc);
                 } else {
-                    return Err(Error::InvalidISTag(
-                        "dangling escape in quoted ISTag".into(),
-                    ));
+                    return Err(Error::invalid_istag("dangling escape in quoted ISTag"));
                 }
             } else {
                 if c.is_control() {
-                    return Err(Error::InvalidISTag("control char in quoted ISTag".into()));
+                    return Err(Error::invalid_istag("control char in quoted ISTag"));
                 }
                 val.push(c);
             }
@@ -33,7 +31,7 @@ pub fn validate_istag(raw: &str) -> IcapResult<()> {
     }
 
     if val.len() > 32 {
-        return Err(Error::InvalidISTag(format!(
+        return Err(Error::invalid_istag(format!(
             "too long: {} bytes (max 32)",
             val.len()
         )));
@@ -43,7 +41,7 @@ pub fn validate_istag(raw: &str) -> IcapResult<()> {
     }
 
     if !val.chars().all(is_http_token_char) {
-        return Err(Error::InvalidISTag(format!(
+        return Err(Error::invalid_istag(format!(
             "invalid unquoted ISTag: {raw} (use quoted-string to allow extra symbols)"
         )));
     }

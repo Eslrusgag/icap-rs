@@ -296,41 +296,49 @@ fn validate_builder_config(
     aliases: &HashMap<String, String>,
     default_service: Option<&str>,
 ) -> IcapResult<()> {
+    use crate::error::ConfigError;
+
     if let Some(default) = default_service {
         let resolved = resolve_service(default, aliases, None);
         if !routes.contains_key(resolved.as_ref()) {
-            return Err(crate::error::Error::service(format!(
-                "Default service '{default}' resolves to unknown service '{}'",
-                resolved.as_ref()
-            )));
+            return Err(ConfigError::UnknownDefaultService {
+                name: default.to_owned(),
+                resolved: resolved.into_owned(),
+            }
+            .into());
         }
     }
 
     for (from, to) in aliases {
         let resolved = resolve_service(to, aliases, None);
         if !routes.contains_key(resolved.as_ref()) {
-            return Err(crate::error::Error::service(format!(
-                "Alias '{from}' resolves to unknown service '{}'",
-                resolved.as_ref()
-            )));
+            return Err(ConfigError::UnknownAlias {
+                from: from.clone(),
+                resolved: resolved.into_owned(),
+            }
+            .into());
         }
     }
 
     for (service, entry) in routes {
         if entry.handlers.is_empty() {
-            return Err(crate::error::Error::service(format!(
-                "Service '{service}' has no handlers"
-            )));
+            return Err(ConfigError::ServiceWithoutHandlers {
+                service: service.clone(),
+            }
+            .into());
         }
         let Some(options) = &entry.options else {
-            return Err(crate::error::Error::service(format!(
-                "Service '{service}' must configure ServiceOptions with an explicit ISTag"
-            )));
+            return Err(ConfigError::MissingServiceOptions {
+                service: service.clone(),
+            }
+            .into());
         };
         if let Err(err) = options.validate() {
-            return Err(crate::error::Error::service(format!(
-                "Invalid options for service '{service}': {err}"
-            )));
+            return Err(ConfigError::InvalidServiceOptions {
+                service: service.clone(),
+                reason: err.to_string(),
+            }
+            .into());
         }
     }
 

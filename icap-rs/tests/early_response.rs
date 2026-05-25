@@ -84,7 +84,7 @@ async fn early_503_when_conn_limit_exceeded() {
             Ok(Err(err)) if Instant::now() < deadline => {
                 if matches!(
                     err,
-                    Error::Network(ref io_err)
+                    Error::Io(ref io_err)
                         if matches!(
                             io_err.kind(),
                             std::io::ErrorKind::ConnectionAborted

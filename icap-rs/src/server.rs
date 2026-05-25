@@ -58,12 +58,14 @@
 mod builder;
 mod connection;
 mod errors;
+pub mod handler;
 mod no_modification;
 pub mod options;
 mod preview;
 mod router;
 pub mod timeouts;
 pub use builder::ServerBuilder;
+pub use handler::{BoxError, HandlerError, HandlerResult};
 pub use preview::PreviewDecision;
 pub use router::RouteOutput;
 pub use timeouts::ServerTimeouts;
@@ -271,7 +273,7 @@ mod tests {
     use rstest::rstest;
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
-    async fn handler_ok(_: IncomingRequest) -> IcapResult<Response> {
+    async fn handler_ok(_: IncomingRequest) -> crate::HandlerResult<Response> {
         Ok(Response::new(StatusCode::OK, "OK")
             .add_header("Encapsulated", "null-body=0")
             .add_header("Content-Length", "0"))
@@ -402,7 +404,7 @@ mod tests {
             .expect("unknown default service should fail at build time");
 
         let msg = err.to_string();
-        assert!(msg.contains("Default service"), "unexpected error: {msg}");
+        assert!(msg.contains("default service"), "unexpected error: {msg}");
         assert!(msg.contains("missing"), "unexpected error: {msg}");
     }
 
@@ -419,7 +421,7 @@ mod tests {
             .expect("unknown alias target should fail at build time");
 
         let msg = err.to_string();
-        assert!(msg.contains("Alias"), "unexpected error: {msg}");
+        assert!(msg.contains("alias"), "unexpected error: {msg}");
         assert!(msg.contains("missing"), "unexpected error: {msg}");
     }
 
@@ -437,7 +439,7 @@ mod tests {
             .expect("invalid service options should fail at build time");
 
         let msg = err.to_string();
-        assert!(msg.contains("Invalid options"), "unexpected error: {msg}");
+        assert!(msg.contains("invalid options"), "unexpected error: {msg}");
         assert!(
             msg.contains("Default transfer behavior"),
             "unexpected error: {msg}"

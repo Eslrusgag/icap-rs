@@ -25,7 +25,7 @@ async fn main() -> IcapResult<()> {
         .route(
             "scan",
             [Method::ReqMod, Method::RespMod],
-            |_req: IncomingRequest| async move { Response::no_content_with_istag(ISTAG) },
+            |_req: IncomingRequest| async move { Ok(Response::no_content_with_istag(ISTAG)?) },
             Some(
                 ServiceOptions::new()
                     .with_static_istag(ISTAG)
