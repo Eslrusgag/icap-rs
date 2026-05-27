@@ -34,9 +34,7 @@ tls-rustls-aws-lc-rs = ["tls-rustls", "rustls/aws-lc-rs"]
 tokio = { workspace = true, features = ["full"] }
 
 # Protocol/data types
-bytes = { workspace = true }
 http = { workspace = true }
-smallvec = { workspace = true }
 
 # Parsing and async helpers
 async-trait = { workspace = true }

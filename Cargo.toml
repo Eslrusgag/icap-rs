@@ -22,9 +22,7 @@ tokio = "1.52.3"
 tokio-rustls = "0.26.4"
 
 # Protocol/data types
-bytes = "1.11.1"
 http = "1.4.0"
-smallvec = "2.0.0-alpha.12"
 
 # Parsing and async helpers
 async-trait = "0.1.89"

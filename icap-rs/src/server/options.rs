@@ -34,7 +34,6 @@ use std::sync::{Arc, RwLock};
 use crate::error::{Error, IcapResult};
 use crate::request::{IncomingRequest, Method};
 use crate::response::Response;
-use smallvec::SmallVec;
 use std::collections::HashMap;
 
 /// Transfer behavior for file extensions advertised via `Transfer-*` headers.
@@ -154,7 +153,7 @@ impl From<IsTagHandle> for IstagSource {
 #[must_use]
 pub struct ServiceOptions {
     /// Supported ICAP methods (injected by the router).
-    pub(crate) methods: SmallVec<Method, 2>,
+    pub(crate) methods: Vec<Method>,
     /// Pre-formatted `"REQMOD, RESPMOD"` string, cached when `set_methods` is called.
     pub(crate) methods_str: String,
     /// Human-readable service description (optional).
@@ -198,7 +197,7 @@ impl ServiceOptions {
     /// this config on a server route.
     pub fn new() -> Self {
         Self {
-            methods: SmallVec::new(),
+            methods: Vec::new(),
             methods_str: String::new(),
             service: None,
             istag: None,
@@ -342,11 +341,8 @@ impl ServiceOptions {
     }
 
     /// Router-only: inject the supported ICAP methods and cache their formatted string.
-    pub(crate) fn set_methods<M>(&mut self, methods: M)
-    where
-        M: Into<SmallVec<Method, 2>>,
-    {
-        self.methods = methods.into();
+    pub(crate) fn set_methods(&mut self, methods: Vec<Method>) {
+        self.methods = methods;
         // Cache the formatted methods string to avoid repeated allocations per OPTIONS request.
         let mut s = String::new();
         for (i, m) in self.methods.iter().enumerate() {

@@ -498,7 +498,7 @@ async fn preview_handler_can_send_final_response_before_100_continue() {
                 };
                 match body {
                     Body::Preview { bytes, .. } => {
-                        assert_eq!(bytes.as_ref(), b"abcd");
+                        assert_eq!(bytes.as_slice(), b"abcd");
                         Ok(PreviewDecision::Respond(
                             Response::no_content().try_set_istag(ISTAG)?,
                         ))
@@ -592,7 +592,7 @@ async fn preview_handler_continue_reads_remainder_and_calls_full_route() {
                 };
                 match body {
                     Body::Preview { bytes, .. } => {
-                        assert_eq!(bytes.as_ref(), b"abcd");
+                        assert_eq!(bytes.as_slice(), b"abcd");
                         Ok(PreviewDecision::Continue)
                     }
                     Body::Full { reader } => {

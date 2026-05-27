@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use smallvec::SmallVec;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::timeout;
 use tracing::{trace, warn};
@@ -391,7 +390,7 @@ impl Server {
 
             let resp = if let Some(entry) = routes.get(service_resolved.as_ref()) {
                 if method == Method::Options {
-                    let mut allowed: SmallVec<Method, 2> = entry.handlers.keys().copied().collect();
+                    let mut allowed: Vec<Method> = entry.handlers.keys().copied().collect();
                     allowed.sort_unstable();
                     let Some(mut cfg) = entry.options.clone() else {
                         return Err(Error::service(format!(

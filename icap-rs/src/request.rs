@@ -57,7 +57,6 @@ use crate::protocol::{
     find_double_crlf, parse_header_lines, parse_http_request_start_line,
     parse_http_response_start_line,
 };
-use bytes::Bytes;
 use http::{HeaderMap, HeaderName, HeaderValue, Request as HttpRequest, Response as HttpResponse};
 use memchr::memmem;
 use std::fmt;
@@ -287,7 +286,7 @@ impl<R> fmt::Debug for Remainder<R> {
 pub enum Body<R> {
     Empty,
     Preview {
-        bytes: Bytes,
+        bytes: Vec<u8>,
         ieof: bool,
         remainder: Remainder<R>,
     },

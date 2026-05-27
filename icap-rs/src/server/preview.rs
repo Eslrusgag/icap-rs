@@ -1,6 +1,5 @@
 use crate::request::{Body, IncomingRequest, Remainder};
 use crate::{EmbeddedHttp, Response};
-use bytes::Bytes;
 
 /// Decision returned by a preview-aware route handler.
 ///
@@ -37,7 +36,7 @@ pub(super) fn mark_request_body_as_preview(req: &mut IncomingRequest, ieof: bool
 
     let preview = std::mem::take(reader);
     *body = Body::Preview {
-        bytes: Bytes::from(preview),
+        bytes: preview,
         ieof,
         remainder: Remainder::new(Vec::new(), None),
     };
