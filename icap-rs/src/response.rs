@@ -85,6 +85,9 @@ pub struct Response<D = Outgoing> {
     pub(crate) use_original_body: Option<usize>,
     /// Optional body (arbitrary payload, chunked HTTP, etc.).
     pub(crate) body: Vec<u8>,
+    /// Chunk trailer headers parsed from the response body (RFC 7230 §4.1.2).
+    /// Only populated on parsed (client-received) responses; always empty on outgoing responses.
+    pub(crate) chunk_trailers: HeaderMap,
     pub(crate) direction: PhantomData<D>,
 }
 
@@ -187,6 +190,18 @@ impl ParsedResponse {
     pub fn from_raw(raw: &[u8]) -> IcapResult<Self> {
         parse_icap_response(raw)
     }
+
+    /// Return chunk trailer headers that accompanied the response body.
+    ///
+    /// RFC 7230 §4.1.2 (applied by RFC 3507 §6.3) allows an ICAP server to
+    /// append HTTP-style `Name: Value` trailer headers after the zero chunk.
+    /// This method returns those headers as parsed from the wire.
+    ///
+    /// The map is empty when no trailers were present.
+    #[inline]
+    pub fn chunk_trailers(&self) -> &HeaderMap {
+        &self.chunk_trailers
+    }
 }
 
 impl Response<Outgoing> {
@@ -199,6 +214,7 @@ impl Response<Outgoing> {
             headers: HeaderMap::new(),
             use_original_body: None,
             body: Vec::new(),
+            chunk_trailers: HeaderMap::new(),
             direction: PhantomData,
         }
     }
@@ -259,6 +275,7 @@ impl Response<Outgoing> {
             headers,
             use_original_body: None,
             body: Vec::new(),
+            chunk_trailers: HeaderMap::new(),
             direction: PhantomData,
         })
     }
@@ -601,6 +618,7 @@ fn parse_response_head_parts(raw: &[u8]) -> IcapResult<ParsedResponseHead> {
             headers: head.headers,
             use_original_body: None,
             body: Vec::new(),
+            chunk_trailers: HeaderMap::new(),
             direction: PhantomData,
         },
         header_end: head.header_end,
@@ -653,7 +671,10 @@ pub(crate) fn parse_icap_response(raw: &[u8]) -> IcapResult<ParsedResponse> {
             StatusCode::OK | StatusCode::PARTIAL_CONTENT => {
                 let enc_val = enc_val.ok_or(Error::missing_header("Encapsulated"))?;
                 let enc = parse_encapsulated_value(enc_val)?;
-                response.use_original_body = dechunk_response_body_if_needed(&enc, &mut body)?;
+                let (use_original_body, trailers) =
+                    dechunk_response_body_if_needed(&enc, &mut body)?;
+                response.use_original_body = use_original_body;
+                response.chunk_trailers = trailers;
                 if response.use_original_body.is_some()
                     && response.status_code != StatusCode::PARTIAL_CONTENT
                 {
@@ -685,9 +706,9 @@ fn validate_encapsulated_offsets(enc: &Encapsulated, enc_len: usize) -> IcapResu
 fn dechunk_response_body_if_needed(
     enc: &Encapsulated,
     body: &mut Vec<u8>,
-) -> IcapResult<Option<usize>> {
+) -> IcapResult<(Option<usize>, HeaderMap)> {
     let Some(body_start) = enc.req_body.or(enc.res_body).or(enc.opt_body) else {
-        return Ok(None);
+        return Ok((None, HeaderMap::new()));
     };
 
     if body_start > body.len() {
@@ -703,10 +724,11 @@ fn dechunk_response_body_if_needed(
     }
 
     let mut chunked = &body[body_start..];
-    let (decoded, use_original_body) = dechunk_icap_entity_with_use_original_body(&mut chunked)
-        .map_err(|e| Error::body(format!("dechunk ICAP entity: {e}")))?;
+    let (decoded, use_original_body, trailers) =
+        dechunk_icap_entity_with_use_original_body(&mut chunked)
+            .map_err(|e| Error::body(format!("dechunk ICAP entity: {e}")))?;
     body.splice(body_start.., decoded);
-    Ok(use_original_body)
+    Ok((use_original_body, trailers))
 }
 
 fn encapsulated_offsets(enc: &Encapsulated) -> impl Iterator<Item = usize> {

@@ -104,6 +104,9 @@ pub struct Request<R = Vec<u8>, D = Outbound> {
     // Consider moving it to a dedicated server-side envelope or a separate `IncomingMeta` type
     // so that `Request` stays a pure protocol type.
     pub(crate) istag: Option<String>,
+    /// Chunk trailer headers parsed from the embedded HTTP body (RFC 7230 §4.1.2).
+    /// Only populated on server-received requests; always empty on outbound requests.
+    pub(crate) chunk_trailers: HeaderMap,
     pub(crate) direction: PhantomData<D>,
 }
 
@@ -619,6 +622,7 @@ impl<R> Request<R, Outbound> {
             allow_206: false,
             preview_ieof: false,
             istag: None,
+            chunk_trailers: HeaderMap::new(),
             direction: PhantomData,
         }
     }
@@ -760,8 +764,21 @@ impl<R> Request<R, Incoming> {
             allow_206: parts.allow_206,
             preview_ieof: parts.preview_ieof,
             istag: None,
+            chunk_trailers: HeaderMap::new(),
             direction: PhantomData,
         }
+    }
+
+    /// Return chunk trailer headers that accompanied the embedded HTTP body.
+    ///
+    /// RFC 7230 §4.1.2 (applied by RFC 3507 §6.3) allows an ICAP sender to
+    /// append HTTP-style `Name: Value` trailer headers after the zero chunk.
+    /// This method returns those headers as parsed from the wire.
+    ///
+    /// The map is empty when no trailers were present.
+    #[inline]
+    pub fn chunk_trailers(&self) -> &HeaderMap {
+        &self.chunk_trailers
     }
 
     /// Return the `ISTag` that the server resolved from `ServiceOptions` for

@@ -7,6 +7,8 @@ use tokio::sync::watch;
 use tokio::time::timeout;
 use tracing::{trace, warn};
 
+use http::HeaderMap;
+
 use crate::error::{Error, IcapResult};
 use crate::protocol::{
     dechunk_icap_entity, dechunk_icap_entity_with_ieof, find_double_crlf,
@@ -224,6 +226,9 @@ impl Server {
                 }
             };
             let mut msg_end = h_end;
+            // Chunk trailers (RFC 7230 §4.1.2) extracted during dechunking;
+            // applied to the parsed request after parse_request_for_mode.
+            let mut chunk_trailers_pending: Option<HeaderMap> = None;
 
             if let Some(body_rel) = enc.req_body.or(enc.res_body) {
                 let body_abs = h_end + body_rel;
@@ -249,7 +254,7 @@ impl Server {
                     .await?;
 
                     let mut preview_slice = &buf[body_abs..preview_end];
-                    let (mut decoded, _ieof_seen) =
+                    let (mut decoded, _ieof_seen, _preview_trailers) =
                         dechunk_icap_entity_with_ieof(&mut preview_slice).map_err(|e| {
                             Error::body(format!("dechunk ICAP preview entity: {e}"))
                         })?;
@@ -362,12 +367,13 @@ impl Server {
                         )
                         .await?;
                         let mut rest_slice = &buf[preview_end..rest_end];
-                        let (rest_decoded, _) = dechunk_icap_entity_with_ieof(&mut rest_slice)
-                            .map_err(|e| {
+                        let (rest_decoded, _, body_trailers) =
+                            dechunk_icap_entity_with_ieof(&mut rest_slice).map_err(|e| {
                                 Error::body(format!("dechunk ICAP remainder entity: {e}"))
                             })?;
                         decoded.extend_from_slice(&rest_decoded);
                         msg_end = rest_end;
+                        chunk_trailers_pending = Some(body_trailers);
                     }
 
                     let decoded_len = decoded.len();
@@ -382,11 +388,13 @@ impl Server {
                     .await?;
                     if msg_end > body_abs {
                         let mut chunked_slice = &buf[body_abs..msg_end];
-                        let decoded = dechunk_icap_entity(&mut chunked_slice)
+                        let (decoded, body_trailers) = dechunk_icap_entity(&mut chunked_slice)
                             .map_err(|e| Error::body(format!("dechunk ICAP entity: {e}")))?;
                         let decoded_len = decoded.len();
                         buf.splice(body_abs..msg_end, decoded);
                         msg_end = body_abs + decoded_len;
+                        // Parsed below; store trailers after parse_request_for_mode.
+                        chunk_trailers_pending = Some(body_trailers);
                     }
                 }
             } else if let Some(end_rel) = enc.null_body {
@@ -416,6 +424,10 @@ impl Server {
                         return Ok(());
                     }
                 };
+            // Attach any chunk trailers parsed during dechunking.
+            if let Some(trailers) = chunk_trailers_pending.take() {
+                req.chunk_trailers = trailers;
+            }
             let method = req.method;
             let raw_service: &str = req.service.rsplit('/').next().unwrap_or(&req.service);
             let service_resolved =

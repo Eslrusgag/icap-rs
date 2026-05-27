@@ -675,8 +675,226 @@ mod unsupported_rfc3507_gaps {
     #[test]
     #[ignore = "partial support only: server routes by final path segment, not full RFC service URI identity"]
     fn unsupported_section_6_4_full_service_uri_model() {}
+}
 
-    #[test]
-    #[ignore = "partial support only: chunk extensions are parsed for ieof/use-original-body, but trailers have no structured API"]
-    fn unsupported_section_6_3_structured_chunk_trailers() {}
+// ---------------------------------------------------------------------------
+// RFC 3507 §6.3 — Chunk trailers
+// ---------------------------------------------------------------------------
+//
+// RFC 3507 §6.3 states that ICAP bodies use HTTP/1.1 chunked framing, which
+// allows trailer headers after the zero chunk (per RFC 7230 §4.1.2).
+// These tests verify that:
+//   1. Servers can receive ICAP requests that carry chunk trailers.
+//   2. Clients can receive ICAP responses that carry chunk trailers.
+//   3. Trailers are exposed through the structured API.
+
+mod section_6_3_chunk_trailers {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    // Helper: spin up a minimal REQMOD server whose handler exposes received
+    // chunk trailers via a `oneshot` channel.
+    async fn start_trailer_capture_server(
+        trailer_tx: tokio::sync::oneshot::Sender<http::HeaderMap>,
+    ) -> u16 {
+        let port = unused_port();
+        let trailer_tx = std::sync::Mutex::new(Some(trailer_tx));
+
+        let handler = move |req: IncomingRequest| {
+            let tx = trailer_tx.lock().unwrap().take();
+            async move {
+                if let Some(tx) = tx {
+                    let _ = tx.send(req.chunk_trailers().clone());
+                }
+                Ok::<Response, icap_rs::HandlerError>(
+                    Response::no_content().try_set_istag(ISTAG)?,
+                )
+            }
+        };
+
+        let server = Server::builder()
+            .bind(&format!("127.0.0.1:{port}"))
+            .route_reqmod(
+                "svc",
+                handler,
+                Some(ServiceOptions::new().with_static_istag(ISTAG).with_service("Trailer test")),
+            )
+            .build()
+            .await
+            .expect("build server");
+
+        tokio::spawn(async move { let _ = server.run().await; });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        port
+    }
+
+    /// RFC 3507 §6.3 — server correctly parses chunk trailers sent by a client.
+    ///
+    /// Sends a hand-crafted ICAP REQMOD request whose chunked HTTP body ends
+    /// with a trailer header (`X-Checksum: abc123`).
+    #[tokio::test]
+    async fn rfc6_3_server_receives_chunk_trailers() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<http::HeaderMap>();
+        let port = start_trailer_capture_server(tx).await;
+
+        // Build the embedded HTTP request head (unchunked).
+        let http_req_head = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        // Chunked body: one data chunk + zero chunk + trailer + empty line.
+        let http_body_chunked =
+            b"5\r\nhello\r\n0\r\nX-Checksum: abc123\r\n\r\n";
+
+        let req_body_offset = http_req_head.len();
+        let encapsulated = format!("req-hdr=0, req-body={req_body_offset}");
+
+        // Must advertise Allow: 204 so the server routes to the handler rather
+        // than short-circuiting with a 200 echo response.
+        let icap_headers = format!(
+            "REQMOD icap://127.0.0.1:{port}/svc ICAP/1.0\r\n\
+             Host: 127.0.0.1:{port}\r\n\
+             Allow: 204\r\n\
+             Encapsulated: {encapsulated}\r\n\
+             \r\n"
+        );
+
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
+            .expect("connect");
+        stream.write_all(icap_headers.as_bytes()).await.expect("write headers");
+        stream.write_all(http_req_head).await.expect("write http head");
+        stream.write_all(http_body_chunked).await.expect("write chunked body");
+        stream.flush().await.expect("flush");
+
+        // Read and discard the 204 response (handler returned no-content).
+        let mut buf = vec![0u8; 4096];
+        let _n = stream.read(&mut buf).await.expect("read response");
+
+        // Verify that the server received and parsed the trailer.
+        let trailers = tokio::time::timeout(Duration::from_secs(2), rx)
+            .await
+            .expect("trailer channel timeout")
+            .expect("trailer channel recv");
+
+        let checksum = trailers
+            .get("x-checksum")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert_eq!(checksum, "abc123", "X-Checksum trailer must be present and equal abc123");
+    }
+
+    /// RFC 3507 §6.3 — server handles requests with no chunk trailers normally.
+    ///
+    /// Confirms the common case (no trailers) still works correctly and that
+    /// `chunk_trailers()` returns an empty map.
+    #[tokio::test]
+    async fn rfc6_3_server_handles_no_chunk_trailers() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<http::HeaderMap>();
+        let port = start_trailer_capture_server(tx).await;
+
+        // Chunked body with no trailers (standard terminator).
+        let http_req_head = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let http_body_chunked = b"5\r\nhello\r\n0\r\n\r\n";
+
+        let req_body_offset = http_req_head.len();
+        let encapsulated = format!("req-hdr=0, req-body={req_body_offset}");
+        // Must advertise Allow: 204 so the server routes to the handler.
+        let icap_headers = format!(
+            "REQMOD icap://127.0.0.1:{port}/svc ICAP/1.0\r\n\
+             Host: 127.0.0.1:{port}\r\n\
+             Allow: 204\r\n\
+             Encapsulated: {encapsulated}\r\n\
+             \r\n"
+        );
+
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
+            .expect("connect");
+        stream.write_all(icap_headers.as_bytes()).await.expect("write headers");
+        stream.write_all(http_req_head).await.expect("write http head");
+        stream.write_all(http_body_chunked).await.expect("write chunked body");
+        stream.flush().await.expect("flush");
+
+        let mut buf = vec![0u8; 4096];
+        let _n = stream.read(&mut buf).await.expect("read response");
+
+        let trailers = tokio::time::timeout(Duration::from_secs(2), rx)
+            .await
+            .expect("timeout")
+            .expect("recv");
+        assert!(trailers.is_empty(), "chunk_trailers() must be empty when no trailers are present");
+    }
+
+    /// RFC 3507 §6.3 — client receives and parses chunk trailers in ICAP response.
+    ///
+    /// A fake ICAP server sends a 200 OK response whose embedded HTTP response
+    /// body terminates with a `X-Integrity: sha256=deadbeef` trailer.
+    /// The client must expose it via `ParsedResponse::chunk_trailers()`.
+    #[tokio::test]
+    async fn rfc6_3_client_receives_chunk_trailers() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+
+        // Spawn a fake server that sends one response with a chunk trailer.
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.expect("accept");
+            // Drain the incoming request.
+            let mut buf = vec![0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+
+            // Build the embedded HTTP response.
+            let http_resp_head = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n";
+            let http_body_chunked = b"5\r\nhello\r\n0\r\nX-Integrity: sha256=deadbeef\r\n\r\n";
+
+            let res_hdr_offset = 0usize;
+            let res_body_offset = http_resp_head.len();
+            let enc = format!("res-hdr={res_hdr_offset}, res-body={res_body_offset}");
+            let body_bytes: Vec<u8> = [http_resp_head.as_ref(), http_body_chunked.as_ref()].concat();
+            let icap_resp = format!(
+                "ICAP/1.0 200 OK\r\n\
+                 ISTag: \"rfc3507\"\r\n\
+                 Encapsulated: {enc}\r\n\
+                 \r\n"
+            );
+
+            sock.write_all(icap_resp.as_bytes()).await.expect("write resp head");
+            sock.write_all(&body_bytes).await.expect("write resp body");
+            sock.flush().await.expect("flush");
+        });
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        // Minimal raw ICAP request for OPTIONS to elicit a response.
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
+            .expect("connect");
+        let req = format!(
+            "REQMOD icap://127.0.0.1:{port}/svc ICAP/1.0\r\n\
+             Host: 127.0.0.1:{port}\r\n\
+             Encapsulated: null-body=0\r\n\
+             \r\n"
+        );
+        stream.write_all(req.as_bytes()).await.expect("write request");
+        stream.flush().await.expect("flush");
+
+        let mut raw = Vec::new();
+        let mut tmp = [0u8; 4096];
+        loop {
+            let n = stream.read(&mut tmp).await.expect("read");
+            if n == 0 { break; }
+            raw.extend_from_slice(&tmp[..n]);
+            if raw.windows(4).any(|w| w == b"\r\n\r\n") && raw.ends_with(b"\r\n") {
+                break;
+            }
+        }
+
+        let parsed = ParsedResponse::from_raw(&raw).expect("parse response");
+        let integrity = parsed
+            .chunk_trailers()
+            .get("x-integrity")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert_eq!(
+            integrity, "sha256=deadbeef",
+            "X-Integrity trailer must be present in client-parsed response"
+        );
+    }
 }

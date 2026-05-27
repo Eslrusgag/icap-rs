@@ -1,4 +1,5 @@
 use crate::error::{Error, IcapResult};
+use http::{HeaderMap, HeaderName, HeaderValue};
 use memchr::{memchr, memmem};
 use std::io::Write;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -95,6 +96,52 @@ pub fn parse_one_chunk_meta(buf: &[u8], from: usize) -> IcapResult<Option<ChunkM
     }))
 }
 
+/// Parse HTTP-style chunk trailers that follow the zero chunk.
+///
+/// RFC 7230 §4.1.2 (and RFC 3507 §6.3 by reference) allows zero or more
+/// `Name: Value` trailer headers after the `0\r\n` terminator, each ending
+/// with `\r\n`, followed by a final empty `\r\n`.
+///
+/// `data` must start immediately after the `0\r\n` zero-chunk line.
+///
+/// Returns `(trailers, bytes_consumed)` where `bytes_consumed` includes the
+/// final empty `\r\n`.  When there are no trailers (`data` starts with `\r\n`)
+/// the returned `HeaderMap` is empty and `bytes_consumed` is 2.
+#[must_use]
+pub fn parse_chunk_trailers(data: &[u8]) -> IcapResult<(HeaderMap, usize)> {
+    let mut trailers = HeaderMap::new();
+    let mut pos = 0;
+    loop {
+        if data.len() < pos + 2 {
+            return Err(Error::body("incomplete chunk trailers: truncated data"));
+        }
+        // Empty line terminates the trailer block.
+        if &data[pos..pos + 2] == b"\r\n" {
+            return Ok((trailers, pos + 2));
+        }
+        // Find the CRLF that ends this trailer line.
+        let Some(crlf_rel) = memmem::find(&data[pos..], b"\r\n") else {
+            return Err(Error::body("incomplete chunk trailer: missing CRLF"));
+        };
+        let line = &data[pos..pos + crlf_rel];
+        pos += crlf_rel + 2;
+        // Split on the first ':'.
+        let colon =
+            memchr(b':', line).ok_or_else(|| Error::body("malformed chunk trailer: missing ':'"))?;
+        let name_str = std::str::from_utf8(&line[..colon])
+            .map_err(|_| Error::body("chunk trailer name is not UTF-8"))?
+            .trim();
+        let value_str = std::str::from_utf8(&line[colon + 1..])
+            .map_err(|_| Error::body("chunk trailer value is not UTF-8"))?
+            .trim();
+        let name = HeaderName::from_bytes(name_str.as_bytes())
+            .map_err(|_| Error::body("invalid chunk trailer name"))?;
+        let value = HeaderValue::from_str(value_str)
+            .map_err(|_| Error::body("invalid chunk trailer value"))?;
+        trailers.insert(name, value);
+    }
+}
+
 /// Drain ICAP chunked body until zero chunk. Returns position after final CRLF.
 pub async fn read_chunked_to_end<S>(
     stream: &mut S,
@@ -107,19 +154,39 @@ where
     loop {
         if let Some((next_pos, is_final, _)) = parse_one_chunk(buf, pos) {
             if is_final {
+                // `next_pos` is right after `0\r\n`.  Scan line-by-line until
+                // an empty `\r\n` signals the end of the (possibly empty)
+                // trailer block.  RFC 7230 §4.1.2, RFC 3507 §6.3.
                 pos = next_pos;
-                while buf.len() < pos + 2 {
-                    let mut tmp = [0u8; 4096];
-                    let n = AsyncReadExt::read(stream, &mut tmp).await?;
-                    if n == 0 {
-                        return Err(Error::body("unexpected EOF after zero chunk"));
+                loop {
+                    // Ensure at least 2 bytes are buffered at `pos`.
+                    while buf.len() < pos + 2 {
+                        let mut tmp = [0u8; 4096];
+                        let n = AsyncReadExt::read(stream, &mut tmp).await?;
+                        if n == 0 {
+                            return Err(Error::body("unexpected EOF in chunk trailer block"));
+                        }
+                        buf.extend_from_slice(&tmp[..n]);
                     }
-                    buf.extend_from_slice(&tmp[..n]);
+                    // Find the CRLF that ends the current line at `pos`.
+                    let crlf_rel = loop {
+                        if let Some(rel) = memmem::find(&buf[pos..], b"\r\n") {
+                            break rel;
+                        }
+                        let mut tmp = [0u8; 4096];
+                        let n = AsyncReadExt::read(stream, &mut tmp).await?;
+                        if n == 0 {
+                            return Err(Error::body("unexpected EOF in chunk trailer block"));
+                        }
+                        buf.extend_from_slice(&tmp[..n]);
+                    };
+                    pos += crlf_rel + 2;
+                    if crlf_rel == 0 {
+                        // Empty line — end of trailer block.
+                        return Ok(pos);
+                    }
+                    // Non-empty line — a trailer header; continue to next line.
                 }
-                if &buf[pos..pos + 2] != b"\r\n" {
-                    return Err(Error::body("invalid chunked terminator"));
-                }
-                return Ok(pos + 2);
             }
             pos = next_pos;
         } else {
@@ -162,7 +229,12 @@ where
     }
 }
 
-pub fn dechunk_icap_entity(data: &mut &[u8]) -> IcapResult<Vec<u8>> {
+/// Decode a complete ICAP chunked body.
+///
+/// Returns `(body, trailers)` where `trailers` contains any RFC 7230 §4.1.2
+/// chunk trailer headers found after the zero chunk.  When no trailers are
+/// present the map is empty.
+pub fn dechunk_icap_entity(data: &mut &[u8]) -> IcapResult<(Vec<u8>, HeaderMap)> {
     let mut out = Vec::with_capacity((*data).len());
     let mut d = *data;
 
@@ -180,11 +252,10 @@ pub fn dechunk_icap_entity(data: &mut &[u8]) -> IcapResult<Vec<u8>> {
             .map_err(|_| Error::body("chunk size not hex"))?;
 
         if size == 0 {
-            if d.starts_with(b"\r\n") {
-                d = &d[2..];
-            }
+            let (trailers, consumed) = parse_chunk_trailers(d)?;
+            d = &d[consumed..];
             *data = d;
-            break;
+            return Ok((out, trailers));
         }
 
         if d.len() < size + 2 {
@@ -199,14 +270,18 @@ pub fn dechunk_icap_entity(data: &mut &[u8]) -> IcapResult<Vec<u8>> {
 
         d = &d[size + 2..];
     }
-
-    Ok(out)
 }
 
-pub fn dechunk_icap_entity_with_ieof(data: &mut &[u8]) -> IcapResult<(Vec<u8>, bool)> {
+/// Decode a complete ICAP chunked body, also detecting the `ieof` extension.
+///
+/// Returns `(body, ieof, trailers)`.  `ieof` is `true` when the zero chunk
+/// carries the `; ieof` extension (RFC 3507 §4.5).  `trailers` contains any
+/// RFC 7230 §4.1.2 trailer headers; empty when none are present.
+pub fn dechunk_icap_entity_with_ieof(data: &mut &[u8]) -> IcapResult<(Vec<u8>, bool, HeaderMap)> {
     let mut out = Vec::with_capacity((*data).len());
     let mut d = *data;
-    let ieof = loop {
+    let ieof;
+    loop {
         let rel =
             memmem::find(d, b"\r\n").ok_or_else(|| Error::body("chunk size line without CRLF"))?;
         let line = &d[..rel];
@@ -225,13 +300,8 @@ pub fn dechunk_icap_entity_with_ieof(data: &mut &[u8]) -> IcapResult<(Vec<u8>, b
             .is_some_and(|s| s.split(';').any(|t| t.trim().eq_ignore_ascii_case("ieof")));
 
         if size == 0 {
-            if d.starts_with(b"\r\n") {
-                d = &d[2..];
-            } else {
-                return Err(Error::body("missing final CRLF after zero chunk"));
-            }
-            *data = d;
-            break has_ieof;
+            ieof = has_ieof;
+            break;
         }
 
         if d.len() < size + 2 {
@@ -242,14 +312,22 @@ pub fn dechunk_icap_entity_with_ieof(data: &mut &[u8]) -> IcapResult<(Vec<u8>, b
             return Err(Error::body("missing CRLF after chunk"));
         }
         d = &d[size + 2..];
-    };
+    }
 
-    Ok((out, ieof))
+    let (trailers, consumed) = parse_chunk_trailers(d)?;
+    d = &d[consumed..];
+    *data = d;
+    Ok((out, ieof, trailers))
 }
 
+/// Decode a complete ICAP chunked body, also extracting a `use-original-body` extension.
+///
+/// Returns `(body, use_original_body_offset, trailers)`.  `use_original_body_offset`
+/// is `Some(n)` when the zero chunk carries `; use-original-body=n` (RFC 3507 §4.7).
+/// `trailers` contains any RFC 7230 §4.1.2 trailer headers; empty when none are present.
 pub fn dechunk_icap_entity_with_use_original_body(
     data: &mut &[u8],
-) -> IcapResult<(Vec<u8>, Option<usize>)> {
+) -> IcapResult<(Vec<u8>, Option<usize>, HeaderMap)> {
     let mut out = Vec::with_capacity((*data).len());
     let mut d = *data;
 
@@ -267,13 +345,10 @@ pub fn dechunk_icap_entity_with_use_original_body(
 
         if size == 0 {
             let use_original_body = parse_use_original_body_extension(size_line)?;
-            if d.starts_with(b"\r\n") {
-                d = &d[2..];
-            } else {
-                return Err(Error::body("missing final CRLF after zero chunk"));
-            }
+            let (trailers, consumed) = parse_chunk_trailers(d)?;
+            d = &d[consumed..];
             *data = d;
-            return Ok((out, use_original_body));
+            return Ok((out, use_original_body, trailers));
         }
 
         if d.len() < size + 2 {

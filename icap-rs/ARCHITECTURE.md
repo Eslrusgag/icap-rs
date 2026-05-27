@@ -28,7 +28,7 @@ src/
 ├── response.rs          Response<D>, StatusCode (re-export)
 ├── net.rs               Conn enum (plain TCP | TLS stream)
 ├── protocol/            wire-level parsing and serialization
-│   ├── chunked.rs       ICAP chunked framing (read/write/dechunk)
+│   ├── chunked.rs       ICAP chunked framing (read/write/dechunk/trailers)
 │   ├── encapsulated.rs  Encapsulated header parsing
 │   ├── headers.rs       ICAP response head parser, serializer
 │   ├── http_embed.rs    embedded HTTP request/response serialization
@@ -95,11 +95,14 @@ Request<R, D>
   preview_size: Option<usize>
   allow_204 / allow_206: bool
   preview_ieof: bool               true → send "0; ieof" chunk
+  chunk_trailers: HeaderMap        RFC 7230 §4.1.2 trailers; populated by server on Incoming, empty on Outbound
 ```
 
 `R` is the body carrier:
 - `Vec<u8>` on the client side (buffered)
 - `Box<dyn AsyncRead + Unpin + Send>` (`BodyRead`) on the server side (streaming)
+
+`chunk_trailers` is accessible via `IncomingRequest::chunk_trailers() -> &HeaderMap`.
 
 ### Body
 
@@ -169,7 +172,7 @@ Client::send(req)
   6. read response bytes
   7. parse_icap_response(raw) → ParsedResponse
        parse_icap_response_head → status, headers
-       dechunk_response_body_if_needed → dechunked body
+       dechunk_response_body_if_needed → dechunked body + chunk trailers (RFC 7230 §4.1.2)
   8. store / release Conn based on ConnectionPolicy
 ```
 
@@ -327,7 +330,7 @@ Integration tests live in `icap-rs/tests/`:
 
 | File | Coverage |
 |---|---|
-| `rfc3507.rs` | RFC §-labelled compliance tests (request parsing, response parsing, preview, ISTag, Encapsulated) |
+| `rfc3507.rs` | RFC §-labelled compliance tests (request parsing, response parsing, preview, ISTag, Encapsulated, chunk trailers) |
 | `server.rs` | End-to-end server routing, alias/default, 404/405 |
 | `preview.rs` | Preview handshake, ieof fast-path, PreviewDecision variants |
 | `streaming_response_writer.rs` | Streaming response body from handler |
