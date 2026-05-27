@@ -178,6 +178,17 @@ impl Server {
             };
             let enc = parse_encapsulated_header(hdr_str);
             let preview_size = parse_preview_header_value(hdr_str);
+            // RFC 3507 §4.2: honour Connection: close from the client.
+            let client_wants_close = hdr_str
+                .split("\r\n")
+                .skip(1) // skip request-line
+                .filter_map(|line| line.split_once(':'))
+                .any(|(name, value)| {
+                    name.trim().eq_ignore_ascii_case("connection")
+                        && value
+                            .split(',')
+                            .any(|t| t.trim().eq_ignore_ascii_case("close"))
+                });
             // Last use of hdr_str; NLL ends the borrow here so buf can be mutated below.
             let enc = match enc {
                 Ok(enc) => enc,
@@ -277,12 +288,13 @@ impl Server {
                             match decision {
                                 PreviewDecision::Continue => {}
                                 PreviewDecision::Respond(resp) => {
-                                    let should_close = !matches!(
-                                        resp.status_code,
-                                        StatusCode::OK
-                                            | StatusCode::NO_CONTENT
-                                            | StatusCode::PARTIAL_CONTENT
-                                    );
+                                    let should_close = client_wants_close
+                                        || !matches!(
+                                            resp.status_code,
+                                            StatusCode::OK
+                                                | StatusCode::NO_CONTENT
+                                                | StatusCode::PARTIAL_CONTENT
+                                        );
                                     let resp = if should_close {
                                         resp.add_header("Connection", "close")
                                     } else {
@@ -521,10 +533,11 @@ impl Server {
                 Response::new(StatusCode::NOT_FOUND, "Service Not Found")
             };
 
-            let should_close = !matches!(
-                resp.status_code,
-                StatusCode::OK | StatusCode::NO_CONTENT | StatusCode::PARTIAL_CONTENT
-            );
+            let should_close = client_wants_close
+                || !matches!(
+                    resp.status_code,
+                    StatusCode::OK | StatusCode::NO_CONTENT | StatusCode::PARTIAL_CONTENT
+                );
             let resp = if should_close {
                 resp.add_header("Connection", "close")
             } else {

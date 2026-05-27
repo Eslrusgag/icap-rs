@@ -321,6 +321,12 @@ Integration tests live in `icap-rs/tests/`:
 | `server.rs` | End-to-end server routing, alias/default, 404/405 |
 | `preview.rs` | Preview handshake, ieof fast-path, PreviewDecision variants |
 | `streaming_response_writer.rs` | Streaming response body from handler |
+| `client_graceful_shutdown.rs` | RFC §4.2 — `Connection: close` emitted by client on `ConnectionPolicy::Close`; server closes after responding when header is present |
+| `client_keep_alive.rs` | Keep-alive connection reuse across multiple requests |
+| `client_timeout.rs` | Client-side timeout enforcement |
+| `early_response.rs` | Early 503 when server connection limit is exceeded |
+| `max_connections.rs` | Global connection limit enforcement and OPTIONS advertisement |
+| `tls.rs` | TLS (rustls) feature tests |
 
 All integration tests use `tests/common/` helpers:
 - `find_free_port()` — bind port 0 and release, return the OS-assigned port

@@ -579,6 +579,7 @@ impl Client {
             req.allow_204,
             req.allow_206,
             req.preview_size,
+            matches!(self.inner.connection_policy, ConnectionPolicy::Close),
         );
         // Encapsulated last + CRLF
         if let Some((hdr_key, hdr_len)) = enc_head_key {
@@ -933,6 +934,7 @@ const fn is_virtual_icap_header(name: &str) -> bool {
         || name.eq_ignore_ascii_case("encapsulated")
         || name.eq_ignore_ascii_case("allow")
         || name.eq_ignore_ascii_case("preview")
+        || name.eq_ignore_ascii_case("connection")
 }
 
 fn write_icap_headers(
@@ -943,6 +945,7 @@ fn write_icap_headers(
     allow_204: bool,
     allow_206: bool,
     preview_size: Option<usize>,
+    connection_close: bool,
 ) {
     // Host is always emitted; request-level Host overrides computed host.
     out.extend_from_slice(canon_icap_header("host").as_bytes());
@@ -953,6 +956,11 @@ fn write_icap_headers(
         out.extend_from_slice(host_value.as_bytes());
     }
     out.extend_from_slice(b"\r\n");
+
+    // RFC 3507 §4.2: signal graceful shutdown to the server.
+    if connection_close {
+        out.extend_from_slice(b"Connection: close\r\n");
+    }
 
     let req_names: HashSet<&str> = req_headers.keys().map(http::HeaderName::as_str).collect();
 
