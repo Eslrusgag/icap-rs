@@ -9,8 +9,8 @@ type, or data-flow invariant.
 ## Workspace layout
 
 ```
-icap-rs/               ← core library (this crate)
-rs-icap-client/        ← CLI ICAP client (thin wrapper around icap-rs)
+icap-rs/               ← Core library
+rs-icap-client/        ← CLI ICAP client (inspired by c-icap-client)
 rs-icap-server/        ← CLI ICAP server placeholder
 ```
 

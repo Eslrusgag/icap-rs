@@ -625,18 +625,24 @@ pub(crate) fn parse_icap_response(raw: &[u8]) -> IcapResult<ParsedResponse> {
     let mut body = raw[header_end..].to_vec();
     trace!(body_len = body.len(), "parsed body");
     if response.status_code.is_success() {
-        let enc_val = encapsulated_value
-            .as_deref()
-            .or_else(|| {
-                response
-                    .headers
-                    .get("Encapsulated")
-                    .and_then(|v| v.to_str().ok())
-            })
-            .ok_or(Error::missing_header("Encapsulated"))?;
+        let enc_val = encapsulated_value.as_deref().or_else(|| {
+            response
+                .headers
+                .get("Encapsulated")
+                .and_then(|v| v.to_str().ok())
+        });
 
         match response.status_code {
             StatusCode::NO_CONTENT => {
+                let Some(enc_val) = enc_val else {
+                    // Compatibility: c-icap 0.5.x may return bare 204 responses.
+                    // A 204 cannot carry an encapsulated body, so this is
+                    // equivalent to the RFC form `Encapsulated: null-body=0`.
+                    if !body.is_empty() {
+                        return Err(Error::body("204 must not carry a body"));
+                    }
+                    return Ok(response);
+                };
                 if !enc_val.trim().eq_ignore_ascii_case("null-body=0") {
                     return Err(Error::header("204 requires Encapsulated: null-body=0"));
                 }
@@ -645,6 +651,7 @@ pub(crate) fn parse_icap_response(raw: &[u8]) -> IcapResult<ParsedResponse> {
                 }
             }
             StatusCode::OK | StatusCode::PARTIAL_CONTENT => {
+                let enc_val = enc_val.ok_or(Error::missing_header("Encapsulated"))?;
                 let enc = parse_encapsulated_value(enc_val)?;
                 response.use_original_body = dechunk_response_body_if_needed(&enc, &mut body)?;
                 if response.use_original_body.is_some()
@@ -1032,6 +1039,19 @@ mod tests {
             err.to_string().to_lowercase().contains("chunked"),
             "expected chunked framing error, got: {err}"
         );
+    }
+
+    #[test]
+    fn parse_accepts_c_icap_204_without_encapsulated() {
+        let raw = b"ICAP/1.0 204 Unmodified\r\n\
+                    Server: C-ICAP/0.5.10\r\n\
+                    ISTag: \"CI0001-XXXXXXXXX\"\r\n\
+                    \r\n";
+
+        let response = parse_icap_response(raw).expect("c-icap bare 204 should parse");
+
+        assert_eq!(response.status_code, StatusCode::NO_CONTENT);
+        assert!(response.body.is_empty());
     }
 }
 

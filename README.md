@@ -46,6 +46,9 @@ support matrix and known gaps.
 
 - `OPTIONS` without `Encapsulated` is rejected by the strict request parser.
   The server can opt into a compatibility request parser for legacy peers.
+- Incoming client responses accept legacy `204 No Content` responses without
+  `Encapsulated` as equivalent to `Encapsulated: null-body=0` for c-icap
+  interoperability.
 - `Transfer-Preview`, `Transfer-Ignore`, and `Transfer-Complete` can be
   advertised by the server, but the client does not automatically apply the
   full RFC transfer policy model.
@@ -85,6 +88,21 @@ Send an `OPTIONS` request with the CLI:
 cargo run -p rs-icap-client -- -u icap://127.0.0.1:1344/respmod -m OPTIONS -v
 ```
 
+Run the Squid interoperability demo:
+
+```bash
+cargo run -p icap-rs --example squid_interop_server
+docker compose -f interop/squid/compose.yaml up
+curl -v -x http://127.0.0.1:3128 http://origin/
+```
+
+Run the c-icap interoperability demo for the Rust client:
+
+```bash
+docker compose -f interop/c-icap/compose.yaml up --build
+cargo run -p rs-icap-client -- -u icap://127.0.0.1:1345/echo -m OPTIONS -v
+```
+
 Build with TLS support:
 
 ```bash
@@ -95,6 +113,8 @@ cargo build --workspace --all-features
 
 - [`icap-rs` library guide](icap-rs/README.md)
 - [`rs-icap-client` CLI guide](rs-icap-client/README.md)
+- [`Squid interoperability demo`](interop/squid/README.md)
+- [`c-icap client interoperability demo`](interop/c-icap/README.md)
 - [`TLS and ICAPS`](icap-rs/docs/tls.md)
 - [`RFC 3507 support matrix`](icap-rs/docs/rfc3507.md)
 - [`CHANGELOG.md`](CHANGELOG.md)

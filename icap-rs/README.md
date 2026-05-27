@@ -346,6 +346,9 @@ fn comma_separated_header_example() -> IcapResult<()> {
   `ISTag: "QUJD+/8="`. Incoming response parsing is intentionally more
   permissive and accepts unquoted token/base64-like values for compatibility
   with existing ICAP servers.
+- Incoming client response parsing accepts legacy `204 No Content` responses
+  without `Encapsulated` as equivalent to `Encapsulated: null-body=0`, matching
+  c-icap behavior.
 - Server `ServiceOptions` never invents a default `ISTag`. Every route must
   configure one explicitly with `with_static_istag(...)` or
   `with_istag_provider(...)`, because the tag is service policy metadata and
@@ -582,5 +585,6 @@ cargo run -p icap-rs --example server
 cargo run -p icap-rs --example client
 cargo run -p icap-rs --example streaming_client -- Cargo.toml
 cargo run -p icap-rs --example preview_decision_server
+cargo run -p icap-rs --example squid_interop_server
 cargo run -p icap-rs --example tls_client --features tls-rustls
 ```

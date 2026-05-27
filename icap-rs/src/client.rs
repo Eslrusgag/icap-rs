@@ -88,7 +88,7 @@ impl Client {
         Ok(built.bytes)
     }
 
-    /// Send an ICAP request with an embedded HTTP message.
+    /// Send an prepared ICAP request with an embedded HTTP message.
     ///
     /// This method:
     /// - writes ICAP headers and the embedded HTTP headers/body,
@@ -109,23 +109,8 @@ impl Client {
             req.method, req.service
         );
 
-        let mut stream = match self.inner.connection_policy {
-            ConnectionPolicy::KeepAlive => {
-                let idle = self.inner.idle_conn.lock().await.take();
-                if let Some(s) = idle {
-                    s
-                } else {
-                    self.inner.connect().await?
-                }
-            }
-            ConnectionPolicy::Close => self.inner.connect().await?,
-        };
-
-        // If the server already sent a response on a kept-alive *plain* TCP socket,
-        // consume it now and return early.
-        if let Some(inner) = stream.plain_mut()
-            && let Some(resp) = Self::try_read_early_response_now(inner).await?
-        {
+        let (mut stream, early) = self.acquire_conn().await?;
+        if let Some(resp) = early {
             return Ok(resp);
         }
 
@@ -221,6 +206,78 @@ impl Client {
         Box::pin(self.send_streaming_reader(req, file)).await
     }
 
+    /// Send a pre-formatted ICAP session as raw bytes.
+    ///
+    /// The bytes are written to the server verbatim — no ICAP headers are added,
+    /// no `Encapsulated` offset is computed, and no preview negotiation takes
+    /// place. The server's response is read back and returned as a
+    /// [`ParsedResponse`] exactly like [`Client::send`].
+    ///
+    /// Use this when you want to hand-craft the wire bytes yourself, reproduce
+    /// a specific packet capture, or send an unusual request that the [`Request`]
+    /// builder does not support.
+    ///
+    /// Connection-policy (keep-alive / close) and the global operation timeout
+    /// configured on the [`ClientBuilder`] still apply.
+    ///
+    /// # Example
+    ///
+    /// The HTTP request head and body are formatted manually, including the
+    /// chunked body framing (`5\r\nHello\r\n0\r\n\r\n`) required by ICAP.
+    /// The `Encapsulated` offsets must be correct: `req-hdr=0` means the
+    /// HTTP request headers start at byte 0 of the encapsulated section, and
+    /// `req-body=N` is the byte offset where the chunked body begins (i.e.
+    /// the length of the HTTP request head block).
+    ///
+    /// ```no_run
+    /// use icap_rs::Client;
+    ///
+    /// # #[tokio::main] async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let client = Client::builder().host("127.0.0.1").port(1344).build();
+    ///
+    /// // Hand-crafted REQMOD: scan a small POST body.
+    /// // HTTP request head (39 bytes), so req-body=39.
+    /// let http_head = b"POST /upload HTTP/1.1\r\nHost: app\r\n\r\n";  // 36 bytes
+    /// let http_head_len = http_head.len();  // must match the req-body offset below
+    ///
+    /// let raw = format!(
+    ///     "REQMOD icap://127.0.0.1:1344/scan ICAP/1.0\r\n\
+    ///      Host: 127.0.0.1\r\n\
+    ///      Encapsulated: req-hdr=0, req-body={http_head_len}\r\n\r\n\
+    ///      POST /upload HTTP/1.1\r\nHost: app\r\n\r\n\
+    ///      5\r\nHello\r\n0\r\n\r\n"
+    /// );
+    ///
+    /// let resp = client.send_raw_str(&raw).await?;
+    /// println!("status: {}", resp.status_code());
+    /// # Ok(()) }
+    /// ```
+    pub async fn send_raw(&self, raw: &[u8]) -> IcapResult<ParsedResponse> {
+        let fut = async {
+            let (mut stream, early) = self.acquire_conn().await?;
+            if let Some(resp) = early {
+                return Ok(resp);
+            }
+            self.write_all(&mut stream, raw).await?;
+            self.flush(&mut stream).await?;
+            let response_buf = self.read_response_buffer(&mut stream).await?;
+            self.finalize_response(stream, response_buf).await
+        };
+        Box::pin(Self::with_timeout_as(
+            self.inner.timeouts.operation,
+            fut,
+            Error::client_total_timeout,
+        ))
+        .await
+    }
+
+    /// Convenience wrapper around [`Client::send_raw`] that accepts a `&str`.
+    ///
+    /// Equivalent to `client.send_raw(raw.as_bytes())`.
+    pub async fn send_raw_str(&self, raw: &str) -> IcapResult<ParsedResponse> {
+        self.send_raw(raw.as_bytes()).await
+    }
+
     /// Send a request and stream body bytes from any `AsyncRead` source using ICAP chunked encoding.
     ///
     /// This API avoids requiring an in-memory `Vec<u8>` body in the request object.
@@ -255,21 +312,8 @@ impl Client {
             req.method, req.service
         );
 
-        let mut stream = match self.inner.connection_policy {
-            ConnectionPolicy::KeepAlive => {
-                let idle = self.inner.idle_conn.lock().await.take();
-                if let Some(s) = idle {
-                    s
-                } else {
-                    self.inner.connect().await?
-                }
-            }
-            ConnectionPolicy::Close => self.inner.connect().await?,
-        };
-
-        if let Some(inner) = stream.plain_mut()
-            && let Some(resp) = Self::try_read_early_response_now(inner).await?
-        {
+        let (mut stream, early) = self.acquire_conn().await?;
+        if let Some(resp) = early {
             return Ok(resp);
         }
 
@@ -516,7 +560,7 @@ impl Client {
                                 orig_len,
                             )
                         } else if !hdrs.is_empty() {
-                            (hdrs, None, Some((hdr_key, 0usize)), None, orig_len)
+                            (hdrs, None, Some((hdr_key, hdr_len)), None, orig_len)
                         } else {
                             (hdrs, None, None, None, orig_len)
                         }
@@ -545,7 +589,11 @@ impl Client {
                 )
                 .map_err(Error::Io)?;
             } else {
-                write!(&mut out, "Encapsulated: {hdr_key}=0\r\n").map_err(Error::Io)?;
+                write!(
+                    &mut out,
+                    "Encapsulated: {hdr_key}=0, null-body={hdr_len}\r\n"
+                )
+                .map_err(Error::Io)?;
             }
         } else {
             out.extend_from_slice(b"Encapsulated: null-body=0\r\n");
@@ -584,6 +632,36 @@ impl Client {
 
     fn trim_leading_slash(s: &str) -> &str {
         s.strip_prefix('/').unwrap_or(s)
+    }
+
+    /// Acquire a connection according to the configured policy and check for an
+    /// early server response on keep-alive sockets.
+    ///
+    /// Returns `(conn, Some(resp))` when the server already sent a response
+    /// before the client wrote anything (e.g. a `503` on connection limit).
+    /// Returns `(conn, None)` in the normal case.
+    async fn acquire_conn(&self) -> IcapResult<(Conn, Option<ParsedResponse>)> {
+        let mut stream = match self.inner.connection_policy {
+            ConnectionPolicy::KeepAlive => {
+                let idle = self.inner.idle_conn.lock().await.take();
+                if let Some(s) = idle {
+                    s
+                } else {
+                    self.inner.connect().await?
+                }
+            }
+            ConnectionPolicy::Close => self.inner.connect().await?,
+        };
+
+        // If the server already sent a response on a kept-alive *plain* TCP
+        // socket, consume it now so callers never write into a closed pipe.
+        if let Some(inner) = stream.plain_mut()
+            && let Some(resp) = Self::try_read_early_response_now(inner).await?
+        {
+            return Ok((stream, Some(resp)));
+        }
+
+        Ok((stream, None))
     }
 
     /// Try to read an immediate ICAP response (e.g., `503 Service Unavailable`)
@@ -1417,6 +1495,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn send_raw_delivers_verbatim_bytes_and_parses_response() {
+        let port = spawn_raw_icap_server(|mut stream| async move {
+            let wire = read_until_contains(&mut stream, b"\r\n\r\n").await;
+            let text = String::from_utf8_lossy(&wire);
+            assert!(text.starts_with("OPTIONS icap://127.0.0.1:"));
+            assert!(text.contains("X-Custom: yes"));
+
+            stream
+                .write_all(
+                    b"ICAP/1.0 200 OK\r\n\
+                      ISTag: \"raw-test\"\r\n\
+                      Methods: REQMOD\r\n\
+                      Encapsulated: null-body=0\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        })
+        .await;
+
+        let client = Client::builder().host("127.0.0.1").port(port).build();
+
+        let raw = format!(
+            "OPTIONS icap://127.0.0.1:{port}/echo ICAP/1.0\r\n\
+             Host: 127.0.0.1:{port}\r\n\
+             X-Custom: yes\r\n\
+             Encapsulated: null-body=0\r\n\r\n"
+        );
+
+        let resp = timeout(Duration::from_millis(500), client.send_raw(raw.as_bytes()))
+            .await
+            .expect("send_raw timed out")
+            .expect("send_raw returned error");
+
+        assert_eq!(resp.status_code, http::StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("istag").map(|v| v.to_str().unwrap()),
+            Some("\"raw-test\"")
+        );
+    }
+
+    #[tokio::test]
+    async fn send_raw_str_is_equivalent_to_send_raw() {
+        let port = spawn_raw_icap_server(|mut stream| async move {
+            let _ = read_until_contains(&mut stream, b"\r\n\r\n").await;
+            stream
+                .write_all(
+                    b"ICAP/1.0 200 OK\r\n\
+                      ISTag: \"str-test\"\r\n\
+                      Methods: REQMOD\r\n\
+                      Encapsulated: null-body=0\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        })
+        .await;
+
+        let client = Client::builder().host("127.0.0.1").port(port).build();
+
+        let raw = format!(
+            "OPTIONS icap://127.0.0.1:{port}/echo ICAP/1.0\r\n\
+             Host: 127.0.0.1:{port}\r\n\
+             Encapsulated: null-body=0\r\n\r\n"
+        );
+
+        let resp = timeout(Duration::from_millis(500), client.send_raw_str(&raw))
+            .await
+            .expect("send_raw_str timed out")
+            .expect("send_raw_str returned error");
+
+        assert_eq!(resp.status_code, http::StatusCode::OK);
+    }
+
+    #[tokio::test]
     async fn rfc_streaming_without_preview_sends_body_before_reading_response() {
         let port = spawn_raw_icap_server(|mut stream| async move {
             let wire = read_until_contains(&mut stream, b"5\r\nHELLO\r\n0\r\n\r\n").await;
@@ -1696,6 +1847,27 @@ mod tests {
         );
         let tail_str = bytes_to_string_prefix(&wire[http_start + off_num..], 64);
         assert!(tail_str.contains("\r\n0\r\n\r\n"));
+    }
+
+    #[test]
+    fn reqmod_header_only_uses_null_body_offset() {
+        let http = HttpReq::builder()
+            .method("GET")
+            .uri("http://origin.example/")
+            .header(header::HOST, "origin.example")
+            .body(Vec::<u8>::new())
+            .unwrap();
+
+        let req = Request::reqmod("echo").with_http_request(http).unwrap();
+        let wire = client().get_request_wire(&req, false).unwrap();
+        let head = extract_headers_text(&wire);
+        let enc = find_header_line(&head, "Encapsulated").unwrap();
+
+        assert!(enc.contains("req-hdr=0"));
+        assert!(
+            enc.contains("null-body="),
+            "header-only REQMOD must delimit the embedded HTTP head for strict servers: {enc}"
+        );
     }
 
     #[rstest]
