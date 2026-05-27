@@ -18,6 +18,7 @@ use crate::request::{
 use crate::{Body, EmbeddedHttp, Method, Response, StatusCode};
 
 use super::Server;
+use super::options::OptionsResponseBuilder;
 use super::preview::{PreviewDecision, mark_request_body_as_preview};
 use super::router::{RouteEntry, resolve_service};
 use super::timeouts::ServerTimeouts;
@@ -415,7 +416,7 @@ impl Server {
                     if let (Some(n), None) = (advertised_max_conn, cfg.max_connections) {
                         cfg.with_max_connections(n);
                     }
-                    cfg.build_response_for(&req, &methods_str)?
+                    OptionsResponseBuilder::new(&cfg, &methods_str).build(&req)?
                 } else {
                     let allow_204 = req.allow_204;
                     let allow_206 = req.allow_206;

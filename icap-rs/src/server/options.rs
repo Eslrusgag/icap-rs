@@ -334,100 +334,13 @@ impl ServiceOptions {
         self
     }
 
-    /// Get the `ISTag` for a specific request (static or dynamic).
+    /// Resolve the `ISTag` for a specific request (static or dynamic).
     #[inline]
-    pub fn istag_for(&self, req: &IncomingRequest) -> IcapResult<String> {
+    pub(crate) fn istag_for(&self, req: &IncomingRequest) -> IcapResult<String> {
         self.istag
             .as_ref()
             .map(|source| source.current_for(req))
             .ok_or(Error::missing_header("ISTag"))
-    }
-
-    /// Build an ICAP `OPTIONS` response for **this specific request**.
-    ///
-    /// The response includes:
-    /// - `Methods` — from the supplied methods string (e.g. `"REQMOD, RESPMOD"`)
-    /// - `ISTag`   — resolved via the static string or dynamic provider
-    /// - Standard headers (`Encapsulated`, `Service`, `Max-Connections`, etc.)
-    ///
-    pub fn build_response_for(&self, req: &IncomingRequest, methods_str: &str) -> IcapResult<Response> {
-        let istag_now = self.istag_for(req)?;
-        let mut response = Response::ok_with_istag(&istag_now)?;
-
-        response = response.add_header("Methods", methods_str);
-
-        // Encapsulated
-        let encapsulated_value = if self.opt_body.is_some() {
-            "opt-body=0"
-        } else {
-            "null-body=0"
-        };
-        response = response.add_header("Encapsulated", encapsulated_value);
-
-        if let Some(ref service) = self.service {
-            response = response.add_header("Service", service);
-        }
-        if let Some(max_conn) = self.max_connections {
-            response = response.add_header("Max-Connections", &max_conn.to_string());
-        }
-        if let Some(ttl) = self.options_ttl {
-            response = response.add_header("Options-TTL", &ttl.to_string());
-        }
-        if let Some(ref service_id) = self.service_id {
-            response = response.add_header("Service-ID", service_id);
-        }
-        if !self.allow.is_empty() {
-            response = response.add_header("Allow", &self.allow.join(", "));
-        }
-        if let Some(preview) = self.preview {
-            response = response.add_header("Preview", &preview.to_string());
-        }
-        if let Some(ref opt_body_type) = self.opt_body_type {
-            response = response.add_header("Opt-body-type", opt_body_type);
-        }
-
-        // Transfer-* headers
-        if !self.transfer_rules.is_empty() {
-            let mut preview_extensions = Vec::new();
-            let mut ignore_extensions = Vec::new();
-            let mut complete_extensions = Vec::new();
-
-            for (ext, behavior) in &self.transfer_rules {
-                match behavior {
-                    TransferBehavior::Preview => preview_extensions.push(ext.clone()),
-                    TransferBehavior::Ignore => ignore_extensions.push(ext.clone()),
-                    TransferBehavior::Complete => complete_extensions.push(ext.clone()),
-                }
-            }
-            if let Some(ref default_behavior) = self.default_transfer_behavior {
-                match default_behavior {
-                    TransferBehavior::Preview => preview_extensions.push("*".into()),
-                    TransferBehavior::Ignore => ignore_extensions.push("*".into()),
-                    TransferBehavior::Complete => complete_extensions.push("*".into()),
-                }
-            }
-            if !preview_extensions.is_empty() {
-                response = response.add_header("Transfer-Preview", &preview_extensions.join(", "));
-            }
-            if !ignore_extensions.is_empty() {
-                response = response.add_header("Transfer-Ignore", &ignore_extensions.join(", "));
-            }
-            if !complete_extensions.is_empty() {
-                response =
-                    response.add_header("Transfer-Complete", &complete_extensions.join(", "));
-            }
-        }
-
-        // Custom headers
-        for (name, value) in &self.custom_headers {
-            response = response.add_header(name, value);
-        }
-        // Optional body
-        if let Some(ref opt_body) = self.opt_body {
-            response = response.with_body(opt_body);
-        }
-
-        Ok(response)
     }
 
     /// Validate invariants for this configuration.
@@ -457,6 +370,105 @@ impl ServiceOptions {
             self.allow.push(capability.to_string());
         }
         self
+    }
+}
+
+/// Assembles an ICAP `OPTIONS` response from a [`ServiceOptions`] config and
+/// the set of methods the router registered for the service.
+///
+/// Kept `pub(crate)` — callers outside this crate interact only with
+/// [`ServiceOptions`] and never need to construct a response directly.
+pub(crate) struct OptionsResponseBuilder<'a> {
+    options: &'a ServiceOptions,
+    methods_str: &'a str,
+}
+
+impl<'a> OptionsResponseBuilder<'a> {
+    pub(crate) fn new(options: &'a ServiceOptions, methods_str: &'a str) -> Self {
+        Self {
+            options,
+            methods_str,
+        }
+    }
+
+    /// Build the `OPTIONS` response for the given incoming request.
+    pub(crate) fn build(self, req: &IncomingRequest) -> IcapResult<Response> {
+        let istag_now = self.options.istag_for(req)?;
+        let mut response = Response::ok_with_istag(&istag_now)?;
+
+        response = response.add_header("Methods", self.methods_str);
+
+        let encapsulated_value = if self.options.opt_body.is_some() {
+            "opt-body=0"
+        } else {
+            "null-body=0"
+        };
+        response = response.add_header("Encapsulated", encapsulated_value);
+
+        if let Some(ref service) = self.options.service {
+            response = response.add_header("Service", service);
+        }
+        if let Some(max_conn) = self.options.max_connections {
+            response = response.add_header("Max-Connections", &max_conn.to_string());
+        }
+        if let Some(ttl) = self.options.options_ttl {
+            response = response.add_header("Options-TTL", &ttl.to_string());
+        }
+        if let Some(ref service_id) = self.options.service_id {
+            response = response.add_header("Service-ID", service_id);
+        }
+        if !self.options.allow.is_empty() {
+            response = response.add_header("Allow", &self.options.allow.join(", "));
+        }
+        if let Some(preview) = self.options.preview {
+            response = response.add_header("Preview", &preview.to_string());
+        }
+        if let Some(ref opt_body_type) = self.options.opt_body_type {
+            response = response.add_header("Opt-body-type", opt_body_type);
+        }
+
+        // Transfer-* headers
+        if !self.options.transfer_rules.is_empty() {
+            let mut preview_extensions = Vec::new();
+            let mut ignore_extensions = Vec::new();
+            let mut complete_extensions = Vec::new();
+
+            for (ext, behavior) in &self.options.transfer_rules {
+                match behavior {
+                    TransferBehavior::Preview => preview_extensions.push(ext.clone()),
+                    TransferBehavior::Ignore => ignore_extensions.push(ext.clone()),
+                    TransferBehavior::Complete => complete_extensions.push(ext.clone()),
+                }
+            }
+            if let Some(ref default_behavior) = self.options.default_transfer_behavior {
+                match default_behavior {
+                    TransferBehavior::Preview => preview_extensions.push("*".into()),
+                    TransferBehavior::Ignore => ignore_extensions.push("*".into()),
+                    TransferBehavior::Complete => complete_extensions.push("*".into()),
+                }
+            }
+            if !preview_extensions.is_empty() {
+                response =
+                    response.add_header("Transfer-Preview", &preview_extensions.join(", "));
+            }
+            if !ignore_extensions.is_empty() {
+                response =
+                    response.add_header("Transfer-Ignore", &ignore_extensions.join(", "));
+            }
+            if !complete_extensions.is_empty() {
+                response =
+                    response.add_header("Transfer-Complete", &complete_extensions.join(", "));
+            }
+        }
+
+        for (name, value) in &self.options.custom_headers {
+            response = response.add_header(name, value);
+        }
+        if let Some(ref opt_body) = self.options.opt_body {
+            response = response.with_body(opt_body);
+        }
+
+        Ok(response)
     }
 }
 
