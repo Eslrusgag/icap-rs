@@ -71,12 +71,14 @@ pub use router::RouteOutput;
 pub use timeouts::ServerTimeouts;
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
 #[cfg(feature = "tls-rustls")]
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, watch};
+use tokio::task::JoinSet;
 #[cfg(feature = "tls-rustls")]
 use tokio::time::timeout;
 use tracing::{error, trace, warn};
@@ -143,126 +145,175 @@ impl Server {
         self.listener.local_addr()
     }
 
-    /// Accept loop:
-    /// - Accepts TCP connections and enforces an optional global limit (semaphore).
-    ///   If the limit is reached, send an early `ICAP/1.0 503 Service Unavailable`
-    ///   with `Connection: close`; `to_raw()` auto-adds `Encapsulated: null-body=0`
-    ///   (no `ISTag` on errors). Set `SO_LINGER(1s)`, non-blocking `try_read` drain,
-    ///   then drop the socket (graceful FIN, fewer RSTs).
-    /// - Otherwise, move the permit into a spawned task and call `handle_connection(...)`
-    ///   which reads full ICAP messages (incl. chunked bodies) and dispatches to
-    ///   registered handlers (`OPTIONS`, `REQMOD`, `RESPMOD`).
-    /// - Shared routing/alias/default/max-conn state is passed via `Arc`.
+    /// Run the accept loop until the process is killed.
+    ///
+    /// This is a convenience wrapper around [`run_until`](Self::run_until) with a
+    /// `pending()` shutdown future, meaning the server runs indefinitely.
+    /// Use [`run_until`](Self::run_until) when you need graceful shutdown.
     pub async fn run(self) -> IcapResult<()> {
+        self.run_until(std::future::pending::<()>()).await
+    }
+
+    /// Run the accept loop until `shutdown` resolves, then drain active connections.
+    ///
+    /// When `shutdown` completes the server stops accepting new connections and
+    /// signals all active keep-alive connections to close after their current
+    /// in-flight request completes. Idle connections (waiting for the next
+    /// request) are closed immediately. The method returns only after every
+    /// active connection handler has finished.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use icap_rs::{IcapResult, Server};
+    ///
+    /// #[tokio::main]
+    /// async fn main() -> IcapResult<()> {
+    ///     let server = Server::builder()
+    ///         .bind("127.0.0.1:1344")
+    ///         .build()
+    ///         .await?;
+    ///
+    ///     // Shut down cleanly on Ctrl-C.
+    ///     server.run_until(tokio::signal::ctrl_c().then(|_| async {})).await
+    /// }
+    /// ```
+    pub async fn run_until<F>(self, shutdown: F) -> IcapResult<()>
+    where
+        F: Future<Output = ()>,
+    {
         let local_addr = self.listener.local_addr()?;
         trace!(addr=%local_addr, "ICAP server started");
 
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mut tasks: JoinSet<()> = JoinSet::new();
+
+        tokio::pin!(shutdown);
+
         loop {
-            let (socket, addr) = self.listener.accept().await?;
-            trace!(client=%addr, "new connection");
+            tokio::select! {
+                biased;
 
-            let (permit_opt, over_limit) = self.conn_limit.as_ref().map_or_else(
-                || (None, false),
-                |sem| {
-                    sem.clone()
-                        .try_acquire_owned()
-                        .map_or_else(|_| (None, true), |p| (Some(p), false))
-                },
-            );
+                _ = &mut shutdown => {
+                    trace!(addr=%local_addr, "shutdown signal received");
+                    // Signal all active connections to close after their current request.
+                    let _ = shutdown_tx.send(true);
+                    break;
+                }
 
-            let routes = Arc::clone(&self.routes);
-            let aliases = Arc::clone(&self.aliases);
-            let default_service = self.default_service.clone();
-            let advertised_max = self.advertised_max_conn;
-            let request_parser_mode = self.request_parser_mode;
-            let timeouts = self.timeouts.clone();
+                accept_result = self.listener.accept() => {
+                    let (socket, addr) = accept_result?;
+                    trace!(client=%addr, "new connection");
 
-            #[cfg(feature = "tls-rustls")]
-            let tls = self.tls.clone();
+                    let (permit_opt, over_limit) = self.conn_limit.as_ref().map_or_else(
+                        || (None, false),
+                        |sem| {
+                            sem.clone()
+                                .try_acquire_owned()
+                                .map_or_else(|_| (None, true), |p| (Some(p), false))
+                        },
+                    );
 
-            tokio::spawn(async move {
-                let _permit = permit_opt;
+                    let routes = Arc::clone(&self.routes);
+                    let aliases = Arc::clone(&self.aliases);
+                    let default_service = self.default_service.clone();
+                    let advertised_max = self.advertised_max_conn;
+                    let request_parser_mode = self.request_parser_mode;
+                    let timeouts = self.timeouts.clone();
+                    let conn_shutdown = shutdown_rx.clone();
 
-                if over_limit {
-                    // Reject **before** terminating TLS so a malicious or buggy
-                    // client cannot force the server to spend CPU on a
-                    // handshake just to receive 503. For TLS listeners we
-                    // simply close the TCP socket; clients re-attempt and
-                    // either fit under the limit or are rejected again.
                     #[cfg(feature = "tls-rustls")]
-                    if tls.is_some() {
-                        let mut sock = socket;
-                        let _ = sock.shutdown().await;
-                        return;
-                    }
+                    let tls = self.tls.clone();
 
-                    let resp =
-                        Response::new(StatusCode::SERVICE_UNAVAILABLE, "Service Unavailable")
-                            .add_header("Connection", "close");
-                    match resp.to_raw() {
-                        Ok(bytes) => {
-                            let mut sock = socket;
-                            if let Err(e) = sock.write_all(&bytes).await {
-                                warn!(client=%addr, error=%e, "failed to send 503");
-                            } else {
+                    tasks.spawn(async move {
+                        let _permit = permit_opt;
+
+                        if over_limit {
+                            // Reject before TLS handshake: avoids spending CPU on handshakes
+                            // just to reject. For TLS, close the raw TCP socket instead.
+                            #[cfg(feature = "tls-rustls")]
+                            if tls.is_some() {
+                                let mut sock = socket;
                                 let _ = sock.shutdown().await;
+                                return;
                             }
-                        }
-                        Err(e) => warn!(client=%addr, error=%e, "failed to serialize 503"),
-                    }
-                    return;
-                }
 
-                #[cfg(feature = "tls-rustls")]
-                if let Some((acceptor, hs_timeout)) = tls {
-                    match timeout(hs_timeout, acceptor.accept(socket)).await {
-                        Ok(Ok(stream)) => {
-                            if let Err(e) = Box::pin(Self::handle_connection(
-                                stream,
-                                routes,
-                                aliases,
-                                default_service,
-                                advertised_max,
-                                request_parser_mode,
-                                timeouts,
-                                addr,
-                            ))
-                            .await
-                            {
-                                error!(client=%addr, error=%e, "error handling TLS connection");
+                            let resp =
+                                Response::new(StatusCode::SERVICE_UNAVAILABLE, "Service Unavailable")
+                                    .add_header("Connection", "close");
+                            match resp.to_raw() {
+                                Ok(bytes) => {
+                                    let mut sock = socket;
+                                    if let Err(e) = sock.write_all(&bytes).await {
+                                        warn!(client=%addr, error=%e, "failed to send 503");
+                                    } else {
+                                        let _ = sock.shutdown().await;
+                                    }
+                                }
+                                Err(e) => warn!(client=%addr, error=%e, "failed to serialize 503"),
                             }
+                            return;
                         }
-                        Ok(Err(e)) => {
-                            warn!(client=%addr, error=%e, "TLS handshake failed");
-                        }
-                        Err(_) => {
-                            warn!(
-                                client=%addr,
-                                timeout=?hs_timeout,
-                                "TLS handshake timed out",
-                            );
-                        }
-                    }
-                    return;
-                }
 
-                // Plain TCP
-                if let Err(e) = Box::pin(Self::handle_connection(
-                    socket,
-                    routes,
-                    aliases,
-                    default_service,
-                    advertised_max,
-                    request_parser_mode,
-                    timeouts,
-                    addr,
-                ))
-                .await
-                {
-                    error!(client=%addr, error=%e, "error handling connection");
+                        #[cfg(feature = "tls-rustls")]
+                        if let Some((acceptor, hs_timeout)) = tls {
+                            match timeout(hs_timeout, acceptor.accept(socket)).await {
+                                Ok(Ok(stream)) => {
+                                    if let Err(e) = Box::pin(Self::handle_connection(
+                                        stream,
+                                        routes,
+                                        aliases,
+                                        default_service,
+                                        advertised_max,
+                                        request_parser_mode,
+                                        timeouts,
+                                        conn_shutdown,
+                                        addr,
+                                    ))
+                                    .await
+                                    {
+                                        error!(client=%addr, error=%e, "error handling TLS connection");
+                                    }
+                                }
+                                Ok(Err(e)) => {
+                                    warn!(client=%addr, error=%e, "TLS handshake failed");
+                                }
+                                Err(_) => {
+                                    warn!(
+                                        client=%addr,
+                                        timeout=?hs_timeout,
+                                        "TLS handshake timed out",
+                                    );
+                                }
+                            }
+                            return;
+                        }
+
+                        // Plain TCP
+                        if let Err(e) = Box::pin(Self::handle_connection(
+                            socket,
+                            routes,
+                            aliases,
+                            default_service,
+                            advertised_max,
+                            request_parser_mode,
+                            timeouts,
+                            conn_shutdown,
+                            addr,
+                        ))
+                        .await
+                        {
+                            error!(client=%addr, error=%e, "error handling connection");
+                        }
+                    });
                 }
-            });
+            }
         }
+
+        // Wait for all in-flight connections to complete.
+        while tasks.join_next().await.is_some() {}
+        trace!(addr=%local_addr, "ICAP server stopped");
+        Ok(())
     }
 }
 

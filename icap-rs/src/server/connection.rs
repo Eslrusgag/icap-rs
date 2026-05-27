@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::sync::watch;
 use tokio::time::timeout;
 use tracing::{trace, warn};
 
@@ -79,6 +80,11 @@ impl Server {
     ///
     /// Reads one full ICAP message (headers + chunked body if any), parses and dispatches it,
     /// writes the response, then repeats until the peer closes the connection.
+    ///
+    /// `shutdown` is a watch channel that transitions to `true` when the server begins a graceful
+    /// shutdown. Idle connections (waiting for the next request) are closed immediately on the
+    /// signal; connections with an in-flight request finish it and then add `Connection: close`
+    /// to the response before exiting the keep-alive loop.
     pub(super) async fn handle_connection<S>(
         mut socket: S,
         routes: Arc<HashMap<String, RouteEntry>>,
@@ -87,6 +93,7 @@ impl Server {
         advertised_max_conn: Option<usize>,
         request_parser_mode: RequestParserMode,
         timeouts: ServerTimeouts,
+        mut shutdown: watch::Receiver<bool>,
         addr: std::net::SocketAddr,
     ) -> IcapResult<()>
     where
@@ -135,12 +142,30 @@ impl Server {
                         )
                     };
 
-                let read_res = with_timeout_as(
-                    read_dur,
-                    async { socket.read(&mut tmp).await.map_err(Error::Io) },
-                    mk_err,
-                )
-                .await;
+                // For the first read of a new request the connection is idle.
+                // Use `select!` so a shutdown signal closes the connection immediately
+                // instead of waiting up to `idle_keepalive_timeout` for the next byte.
+                let read_res = if !request_started {
+                    tokio::select! {
+                        biased;
+                        _ = shutdown.wait_for(|v| *v) => return Ok(()),
+                        res = async {
+                            with_timeout_as(
+                                read_dur,
+                                async { socket.read(&mut tmp).await.map_err(Error::Io) },
+                                mk_err,
+                            )
+                            .await
+                        } => res,
+                    }
+                } else {
+                    with_timeout_as(
+                        read_dur,
+                        async { socket.read(&mut tmp).await.map_err(Error::Io) },
+                        mk_err,
+                    )
+                    .await
+                };
 
                 let n = match read_res {
                     Ok(n) => n,
@@ -288,7 +313,8 @@ impl Server {
                             match decision {
                                 PreviewDecision::Continue => {}
                                 PreviewDecision::Respond(resp) => {
-                                    let should_close = client_wants_close
+                                    let should_close = *shutdown.borrow()
+                                        || client_wants_close
                                         || !matches!(
                                             resp.status_code,
                                             StatusCode::OK
@@ -533,7 +559,8 @@ impl Server {
                 Response::new(StatusCode::NOT_FOUND, "Service Not Found")
             };
 
-            let should_close = client_wants_close
+            let should_close = *shutdown.borrow()
+                || client_wants_close
                 || !matches!(
                     resp.status_code,
                     StatusCode::OK | StatusCode::NO_CONTENT | StatusCode::PARTIAL_CONTENT

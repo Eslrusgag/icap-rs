@@ -181,15 +181,25 @@ body is written chunk-by-chunk from an `AsyncRead` source after the headers.
 ```
 ServerBuilder::build() → Server (binds TcpListener)
 
-Server::run()
-  loop:
+Server::run()                       — convenience wrapper: calls run_until(pending())
+Server::run_until(shutdown: F)
+  creates watch::channel(false) for shutdown signal
+  creates JoinSet to track spawned connection tasks
+  loop (select! between shutdown future and listener.accept()):
+    if shutdown resolves:
+      send true on watch channel → all connections see it
+      break
     accept TCP connection
     check connection semaphore → 503 if over limit
-    tokio::spawn(handle_connection(socket, …))
+    tasks.spawn(handle_connection(socket, shutdown_rx, …))
 
-handle_connection(socket, routes, aliases, …)
+  after break: tasks.join_next() until JoinSet is empty → return Ok(())
+
+handle_connection(socket, routes, aliases, shutdown: watch::Receiver<bool>, …)
   loop (keep-alive):
     1. read until CRLFCRLF (idle_keepalive / header_read timeouts)
+       — first read of each new request uses select! between socket.read and
+         shutdown signal; resolves immediately on shutdown (idle connection)
     2. parse_icap_request(raw, mode) → IncomingRequest
          parse_icap_request_with_mode:
            parse request line + ICAP headers
@@ -217,7 +227,7 @@ handle_connection(socket, routes, aliases, …)
     7. guard 204: if Allow:204 absent and no preview → wrap as 200 with echoed body
     8. response.to_raw() → wire bytes
     9. write response (write_timeout)
-   break on non-keep-alive or error
+   break on non-keep-alive, shutdown signal, or error
 ```
 
 ---
@@ -322,6 +332,7 @@ Integration tests live in `icap-rs/tests/`:
 | `preview.rs` | Preview handshake, ieof fast-path, PreviewDecision variants |
 | `streaming_response_writer.rs` | Streaming response body from handler |
 | `client_graceful_shutdown.rs` | RFC §4.2 — `Connection: close` emitted by client on `ConnectionPolicy::Close`; server closes after responding when header is present |
+| `server_graceful_shutdown.rs` | Server `run_until` graceful shutdown: idle connection close, in-flight request drain, `Connection: close` on shutdown responses |
 | `client_keep_alive.rs` | Keep-alive connection reuse across multiple requests |
 | `client_timeout.rs` | Client-side timeout enforcement |
 | `early_response.rs` | Early 503 when server connection limit is exceeded |
