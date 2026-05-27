@@ -33,6 +33,7 @@ pub struct ServerTimeouts {
 }
 
 impl ServerTimeouts {
+    /// Construct a `ServerTimeouts` with every deadline disabled (`None`).
     pub const fn new() -> Self {
         Self {
             header_read: None,
@@ -42,21 +43,38 @@ impl ServerTimeouts {
         }
     }
 
+    /// Set the [`header_read`](Self::header_read) deadline.
+    ///
+    /// Limits how long the server waits to receive a full ICAP header block
+    /// (`CRLFCRLF`) once the request has started arriving.
     pub const fn with_header_read(mut self, dur: Duration) -> Self {
         self.header_read = Some(dur);
         self
     }
 
+    /// Set the [`body_read`](Self::body_read) deadline.
+    ///
+    /// Bounds the time budget for reading the encapsulated body of a single
+    /// request, including chunked decoding.
     pub const fn with_body_read(mut self, dur: Duration) -> Self {
         self.body_read = Some(dur);
         self
     }
 
+    /// Set the [`write`](Self::write) deadline.
+    ///
+    /// Bounds the time to write any single response chunk to the client.
     pub const fn with_write(mut self, dur: Duration) -> Self {
         self.write = Some(dur);
         self
     }
 
+    /// Set the [`idle_keepalive`](Self::idle_keepalive) deadline.
+    ///
+    /// Bounds how long the server waits for the **first** byte of the next
+    /// request on a kept-alive connection after the previous response was
+    /// flushed. Once any byte arrives, [`with_header_read`](Self::with_header_read)
+    /// governs the rest of the header block.
     pub const fn with_idle_keepalive(mut self, dur: Duration) -> Self {
         self.idle_keepalive = Some(dur);
         self

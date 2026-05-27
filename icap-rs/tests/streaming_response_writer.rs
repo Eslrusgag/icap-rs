@@ -1,20 +1,24 @@
+mod common;
+
+use common::{find_free_port, wait_port_ready};
 use http::{Request as HttpRequest, Response as HttpResponse, Version};
 use icap_rs::error::IcapResult;
 use icap_rs::server::options::ServiceOptions;
 use icap_rs::{Client, IncomingRequest, Request, Response, Server, StatusCode};
-use tokio::time::Duration;
 
 const ISTAG: &str = "stream-writer-1";
 const ECHO_BODY: &str = "streamed-body";
 
-async fn start_server(port: u16) {
+async fn start_server() -> (String, u16) {
+    let port = find_free_port();
+    let addr = format!("127.0.0.1:{port}");
     let opts = ServiceOptions::new()
         .with_static_istag(ISTAG)
         .with_service("Streaming Writer Test")
         .add_allow("204");
 
     let server = Server::builder()
-        .bind(&format!("127.0.0.1:{port}"))
+        .bind(&addr)
         .route_reqmod(
             "scan",
             |_req: IncomingRequest| async move {
@@ -40,13 +44,13 @@ async fn start_server(port: u16) {
         let _ = server.run().await;
     });
 
-    tokio::time::sleep(Duration::from_millis(60)).await;
+    wait_port_ready(&addr).await;
+    (addr, port)
 }
 
 #[tokio::test]
 async fn streaming_response_is_buffered_in_response_body() -> IcapResult<()> {
-    let port = 13531;
-    start_server(port).await;
+    let (_addr, port) = start_server().await;
 
     let client = Client::builder().host("127.0.0.1").port(port).build();
 

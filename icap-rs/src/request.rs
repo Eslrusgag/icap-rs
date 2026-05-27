@@ -905,10 +905,21 @@ pub(crate) fn parse_icap_request_with_mode(
     let allow_204 = allow_contains_token(&icap_headers, "204");
     let allow_206 = allow_contains_token(&icap_headers, "206");
 
-    let preview_size = icap_headers
-        .get("Preview")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.trim().parse::<usize>().ok());
+    // RFC 3507 §4.5: `Preview` carries a non-negative integer count of body bytes
+    // included in the preview. Malformed values are a protocol error.
+    let preview_size = match icap_headers.get("Preview") {
+        None => None,
+        Some(v) => {
+            let s = v
+                .to_str()
+                .map_err(|_| Error::parse("Preview header has non-ASCII value"))?;
+            let trimmed = s.trim();
+            let n = trimmed.parse::<usize>().map_err(|_| {
+                Error::parse(format!("Preview header has invalid integer '{trimmed}'"))
+            })?;
+            Some(n)
+        }
+    };
 
     // Encapsulated bytes start immediately after the ICAP header terminator.
     let enc_area = &data[hdr_end..];
@@ -1642,7 +1653,9 @@ Encapsulated: req-hdr=0, req-body={req_body_off}\r\n\
     }
 
     #[test]
-    fn parse_preview_not_a_number_is_ignored() {
+    fn parse_preview_not_a_number_is_rejected() {
+        // RFC 3507 §4.5: `Preview` value must be a non-negative integer; a
+        // malformed value is a protocol error rather than "no preview".
         let raw = icap_bytes(
             "REQMOD icap://icap.example.org/icap/test ICAP/1.0\r\n\
              Host: icap.example.org\r\n\
@@ -1650,8 +1663,12 @@ Encapsulated: req-hdr=0, req-body={req_body_off}\r\n\
              Encapsulated: req-hdr=0\r\n\
              \r\n",
         );
-        let r = parse_icap_request(&raw).expect("parse");
-        assert_eq!(r.preview_size, None);
+        let err = parse_icap_request(&raw).expect_err("malformed Preview must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Preview"),
+            "error should mention Preview, got: {msg}"
+        );
     }
 
     // ---------- Embedded HTTP ----------

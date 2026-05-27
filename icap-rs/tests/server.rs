@@ -1,3 +1,6 @@
+mod common;
+
+use common::{find_free_port, wait_port_ready};
 use http::{Response as HttpResponse, StatusCode as HttpStatus, Version};
 use icap_rs::Client;
 use icap_rs::HandlerResult;
@@ -15,14 +18,16 @@ async fn always_204_handler(_req: IncomingRequest) -> HandlerResult<Response> {
         .try_set_istag("test")?)
 }
 
-async fn start_server_on(port: u16) {
+async fn start_server_on_ephemeral() -> (String, u16) {
+    let port = find_free_port();
+    let addr = format!("127.0.0.1:{port}");
     let respmod_opts = ServiceOptions::new()
         .with_static_istag("test-1.0")
         .with_service("Response Modifier")
         .with_options_ttl(60);
 
     let server = Server::builder()
-        .bind(&format!("127.0.0.1:{port}"))
+        .bind(&addr)
         .route_respmod("respmod", always_204_handler, Some(respmod_opts))
         .default_service("respmod")
         .alias("/", "respmod")
@@ -35,10 +40,13 @@ async fn start_server_on(port: u16) {
         let _ = server.run().await;
     });
 
-    tokio::time::sleep(Duration::from_millis(60)).await;
+    wait_port_ready(&addr).await;
+    (addr, port)
 }
 
-async fn start_reqmod_server_on(port: u16) {
+async fn start_reqmod_server_on_ephemeral() -> (String, u16) {
+    let port = find_free_port();
+    let addr = format!("127.0.0.1:{port}");
     let reqmod_opts = ServiceOptions::new()
         .with_static_istag("test-1.0")
         .with_service("Request Modifier")
@@ -46,7 +54,7 @@ async fn start_reqmod_server_on(port: u16) {
         .add_allow("204");
 
     let server = Server::builder()
-        .bind(&format!("127.0.0.1:{port}"))
+        .bind(&addr)
         .route_reqmod("request", always_204_handler, Some(reqmod_opts))
         .build()
         .await
@@ -56,7 +64,8 @@ async fn start_reqmod_server_on(port: u16) {
         let _ = server.run().await;
     });
 
-    tokio::time::sleep(Duration::from_millis(60)).await;
+    wait_port_ready(&addr).await;
+    (addr, port)
 }
 
 fn make_embedded_http(body: &str) -> HttpResponse<Vec<u8>> {
@@ -71,8 +80,7 @@ fn make_embedded_http(body: &str) -> HttpResponse<Vec<u8>> {
 
 #[tokio::test]
 async fn reqmod_null_body_reads_embedded_http_head() {
-    let port = 13521;
-    start_reqmod_server_on(port).await;
+    let (_addr, port) = start_reqmod_server_on_ephemeral().await;
 
     let embedded = b"GET http://baidu.com/ HTTP/1.1\r\n\
 User-Agent: curl/7.68.0\r\n\
@@ -113,8 +121,7 @@ X-Client-IP: 10.3.12.1\r\n\
 
 #[tokio::test]
 async fn alias_and_default_service_resolve() {
-    let port = 13520;
-    start_server_on(port).await;
+    let (_addr, port) = start_server_on_ephemeral().await;
 
     let client = Client::builder().host("127.0.0.1").port(port).build();
 
@@ -135,8 +142,7 @@ async fn alias_and_default_service_resolve() {
 
 #[tokio::test]
 async fn options_unknown_service_returns_404() {
-    let port = 13522;
-    start_server_on(port).await;
+    let (_addr, port) = start_server_on_ephemeral().await;
 
     let client = Client::builder().host("127.0.0.1").port(port).build();
     let req = Request::options("respmosw");
@@ -147,8 +153,7 @@ async fn options_unknown_service_returns_404() {
 
 #[tokio::test]
 async fn respmod_no_allow_with_preview_may_be_204() {
-    let port = 13512;
-    start_server_on(port).await;
+    let (_addr, port) = start_server_on_ephemeral().await;
 
     let client = Client::builder().host("127.0.0.1").port(port).build();
 

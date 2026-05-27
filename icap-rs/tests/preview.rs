@@ -1,3 +1,6 @@
+mod common;
+
+use common::{find_free_port, wait_port_ready};
 use http::{HeaderValue, Request as HttpRequest, header};
 use icap_rs::{
     Body, EmbeddedHttp, IncomingRequest, Method, PreviewDecision, Response, StatusCode,
@@ -74,9 +77,11 @@ fn dechunk_icap_entity(mut data: &[u8]) -> Result<Vec<u8>, String> {
     }
 }
 
-async fn start_server(addr: &str) {
+async fn start_server() -> String {
+    let port = find_free_port();
+    let addr = format!("127.0.0.1:{port}");
     let server = Server::builder()
-        .bind(addr)
+        .bind(&addr)
         .route(
             "scan",
             [Method::ReqMod],
@@ -147,7 +152,8 @@ async fn start_server(addr: &str) {
         server.run().await.expect("server run");
     });
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    wait_port_ready(&addr).await;
+    addr
 }
 
 async fn icap_reqmod_with_preview(
@@ -247,8 +253,7 @@ async fn icap_reqmod_with_preview(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn preview_ieof_fast204() {
-    let addr = "127.0.0.1:13440";
-    start_server(addr).await;
+    let addr = start_server().await;
 
     let body = b"ping";
     let http_head = format!(
@@ -257,7 +262,7 @@ async fn preview_ieof_fast204() {
     );
 
     let (code, _resp) =
-        icap_reqmod_with_preview(addr, "scan", body.len(), &http_head, body, None, true).await;
+        icap_reqmod_with_preview(&addr, "scan", body.len(), &http_head, body, None, true).await;
 
     assert_eq!(
         code, 204,
@@ -267,10 +272,9 @@ async fn preview_ieof_fast204() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn preview_non_ieof_full_body_roundtrip() {
-    let addr = "127.0.0.1:13441";
-    start_server(addr).await;
+    let addr = start_server().await;
 
-    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    let mut stream = TcpStream::connect(&addr).await.expect("connect");
 
     let preview = b"abcd";
     let tail = b"efghij";
@@ -283,14 +287,11 @@ async fn preview_non_ieof_full_body_roundtrip() {
 
     let req_body_off = http_head.len();
     let icap = format!(
-        "REQMOD icap://{}/scan ICAP/1.0\r\n\
-         Host: {}\r\n\
-         Encapsulated: req-hdr=0, req-body={}\r\n\
+        "REQMOD icap://{addr}/scan ICAP/1.0\r\n\
+         Host: {addr}\r\n\
+         Encapsulated: req-hdr=0, req-body={req_body_off}\r\n\
          Preview: {}\r\n\
          \r\n",
-        addr,
-        addr,
-        req_body_off,
         preview.len()
     );
 
@@ -394,10 +395,9 @@ async fn preview_non_ieof_full_body_roundtrip() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn preview_non_ieof_requires_100_continue_before_remainder() {
-    let addr = "127.0.0.1:13442";
-    start_server(addr).await;
+    let addr = start_server().await;
 
-    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    let mut stream = TcpStream::connect(&addr).await.expect("connect");
 
     let preview = b"abcd";
     let tail = b"efghij";
@@ -408,14 +408,11 @@ async fn preview_non_ieof_requires_100_continue_before_remainder() {
     let req_body_off = http_head.len();
 
     let icap = format!(
-        "REQMOD icap://{}/scan ICAP/1.0\r\n\
-         Host: {}\r\n\
-         Encapsulated: req-hdr=0, req-body={}\r\n\
+        "REQMOD icap://{addr}/scan ICAP/1.0\r\n\
+         Host: {addr}\r\n\
+         Encapsulated: req-hdr=0, req-body={req_body_off}\r\n\
          Preview: {}\r\n\
          \r\n",
-        addr,
-        addr,
-        req_body_off,
         preview.len()
     );
 
@@ -489,9 +486,10 @@ async fn preview_non_ieof_requires_100_continue_before_remainder() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn preview_handler_can_send_final_response_before_100_continue() {
-    let addr = "127.0.0.1:13443";
+    let port = find_free_port();
+    let addr = format!("127.0.0.1:{port}");
     let server = Server::builder()
-        .bind(addr)
+        .bind(&addr)
         .route_reqmod(
             "scan",
             |req: IncomingRequest| async move {
@@ -525,9 +523,9 @@ async fn preview_handler_can_send_final_response_before_100_continue() {
     tokio::spawn(async move {
         server.run().await.expect("server run");
     });
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    wait_port_ready(&addr).await;
 
-    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    let mut stream = TcpStream::connect(&addr).await.expect("connect");
     let http_head = "POST /upload HTTP/1.1\r\nHost: example.com\r\nContent-Length: 10\r\n\r\n";
     let req_body_off = http_head.len();
     let icap = format!(
@@ -582,9 +580,10 @@ async fn preview_handler_can_send_final_response_before_100_continue() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn preview_handler_continue_reads_remainder_and_calls_full_route() {
-    let addr = "127.0.0.1:13444";
+    let port = find_free_port();
+    let addr = format!("127.0.0.1:{port}");
     let server = Server::builder()
-        .bind(addr)
+        .bind(&addr)
         .route_reqmod(
             "scan",
             |req: IncomingRequest| async move {
@@ -619,9 +618,9 @@ async fn preview_handler_continue_reads_remainder_and_calls_full_route() {
     tokio::spawn(async move {
         server.run().await.expect("server run");
     });
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    wait_port_ready(&addr).await;
 
-    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    let mut stream = TcpStream::connect(&addr).await.expect("connect");
     let http_head = "POST /upload HTTP/1.1\r\nHost: example.com\r\nContent-Length: 10\r\n\r\n";
     let req_body_off = http_head.len();
     let icap = format!(

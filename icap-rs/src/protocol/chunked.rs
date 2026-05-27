@@ -326,7 +326,8 @@ where
 
 /// Write one chunk into already-assembled buffer.
 pub fn write_chunk_into(out: &mut Vec<u8>, data: &[u8]) {
-    write!(out, "{:X}\r\n", data.len()).unwrap();
+    // `io::Write` for `Vec<u8>` is infallible.
+    let _ = write!(out, "{:X}\r\n", data.len());
     if !data.is_empty() {
         out.extend_from_slice(data);
     }

@@ -413,6 +413,58 @@ mod section_4_5_preview {
 
         assert_eq!(line, "ICAP/1.0 204 No Content");
     }
+
+    // RFC 3507 §4.5: `Preview` header value MUST be a non-negative integer.
+    // Malformed values are a protocol error and the server must reject the
+    // request with `400 Bad Request` rather than silently treating it as
+    // "no preview".
+    #[tokio::test]
+    async fn supported_malformed_preview_header_is_rejected_with_400() {
+        let port = start_preview_server().await;
+
+        for bad in ["abc", "-1", " ", "12a", ""] {
+            let raw = send_raw_icap_request(
+                port,
+                &format!(
+                    "REQMOD icap://127.0.0.1:{port}/scan ICAP/1.0\r\n\
+                     Host: 127.0.0.1:{port}\r\n\
+                     Encapsulated: req-hdr=0, null-body=0\r\n\
+                     Preview: {bad}\r\n\
+                     \r\n"
+                ),
+            )
+            .await;
+            assert_eq!(
+                first_line(&raw),
+                "ICAP/1.0 400 Bad Request",
+                "Preview: {bad:?} should be rejected"
+            );
+        }
+    }
+
+    // RFC 3507 §4.5: `Preview: 0` is a valid value meaning "advertise preview
+    // capability without prefetching body bytes". It must be accepted.
+    #[tokio::test]
+    async fn supported_preview_zero_is_accepted() {
+        let port = start_preview_server().await;
+        let raw = send_raw_icap_request(
+            port,
+            &format!(
+                "REQMOD icap://127.0.0.1:{port}/scan ICAP/1.0\r\n\
+                 Host: 127.0.0.1:{port}\r\n\
+                 Encapsulated: req-hdr=0, null-body=0\r\n\
+                 Preview: 0\r\n\
+                 Allow: 204\r\n\
+                 \r\n"
+            ),
+        )
+        .await;
+        let line = first_line(&raw);
+        assert!(
+            line.starts_with("ICAP/1.0 2"),
+            "Preview: 0 must yield a 2xx response, got: {line}"
+        );
+    }
 }
 
 mod sections_4_6_and_4_7_responses {

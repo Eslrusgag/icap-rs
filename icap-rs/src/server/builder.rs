@@ -193,7 +193,16 @@ impl ServerBuilder {
         self
     }
 
-    /// Register a route for `REQMOD` only
+    /// Register a route for `REQMOD` only.
+    ///
+    /// Convenience wrapper around [`route`](Self::route) with `methods = [Method::ReqMod]`.
+    /// See [`route`](Self::route) for full semantics, including panic conditions on
+    /// duplicate (service, method) registration and `ServiceOptions` requirements.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a `REQMOD` handler for the same `service` was already registered,
+    /// or if `options` is provided more than once for the same service.
     pub fn route_reqmod<F, Fut>(
         self,
         service: &str,
@@ -209,6 +218,15 @@ impl ServerBuilder {
     }
 
     /// Register a route for `RESPMOD` only.
+    ///
+    /// Convenience wrapper around [`route`](Self::route) with `methods = [Method::RespMod]`.
+    /// See [`route`](Self::route) for full semantics, including panic conditions on
+    /// duplicate (service, method) registration and `ServiceOptions` requirements.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a `RESPMOD` handler for the same `service` was already registered,
+    /// or if `options` is provided more than once for the same service.
     pub fn route_respmod<F, Fut>(
         self,
         service: &str,
