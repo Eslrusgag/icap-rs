@@ -11,7 +11,7 @@ use icap_rs::response::Response;
 use icap_rs::server::Server;
 use icap_rs::server::options::ServiceOptions;
 use icap_rs::{Body, Method};
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 const ISTAG_REQMOD_INIT: &str = "reqmod-1.0";
 // Base64-like token with '+' and '/' demonstrates c-icap-compatible ISTag values.
@@ -101,6 +101,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     let t = Arc::clone(&t);
                     async move {
                         info!("RESPMOD called: {}", request.service());
+                        // Artificial delay — useful for manually testing graceful shutdown.
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
                         if let Some(EmbeddedHttp::Resp { head, .. }) = request.embedded() {
                             info!("HTTP status: {}", head.status());
@@ -185,10 +187,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .await?;
 
     info!("ICAP server started on 127.0.0.1:1344 (services: reqmod, respmod, blocker)");
-    if let Err(e) = server.run().await {
-        error!("server error: {e}");
-        return Err(e.into());
-    }
+    server.run_until(async { tokio::signal::ctrl_c().await.ok(); }).await?;
     Ok(())
 }
 
