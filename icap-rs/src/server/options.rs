@@ -15,7 +15,7 @@
 //! a static tag or a dynamic provider explicitly.
 //!
 //! ### Example
-//! ```no_run
+//! ```
 //! # use icap_rs::server::options::ServiceOptions;
 //! # use icap_rs::IncomingRequest;
 //! # let state = std::sync::Arc::new(std::sync::Mutex::new(String::from("respmod-1.0")));

@@ -110,13 +110,14 @@ impl ClientBuilder {
     ///     .build();
     /// ```
     ///
-    /// # Panics
-    ///
-    /// Panics if `user_agent` is not a valid HTTP header value. Use
-    /// [`ClientBuilder::try_user_agent`] for untrusted input.
-    pub fn user_agent(self, user_agent: &str) -> Self {
-        self.try_user_agent(user_agent)
-            .expect("invalid User-Agent header value")
+    /// Invalid header values are silently dropped; use
+    /// [`ClientBuilder::try_user_agent`] when validation is required.
+    pub fn user_agent(mut self, user_agent: &str) -> Self {
+        if let Ok(v) = HeaderValue::from_str(user_agent) {
+            self.default_headers
+                .insert(HeaderName::from_static("user-agent"), v);
+        }
+        self
     }
 
     /// Enable or disable connection reuse (keep-alive).
@@ -136,8 +137,17 @@ impl ClientBuilder {
     /// [`Self::continue_timeout`]. Per-field setters called *after*
     /// `with_timeouts` continue to mutate the same struct, so
     ///
-    /// ```ignore
-    /// builder.with_timeouts(tos).connect_timeout(Some(d))
+    /// ```
+    /// use std::time::Duration;
+    /// use icap_rs::{Client, ClientTimeouts};
+    ///
+    /// let tos = ClientTimeouts::default();
+    /// let d = Duration::from_secs(3);
+    /// let _client = Client::builder()
+    ///     .host("icap.example")
+    ///     .with_timeouts(tos)
+    ///     .connect_timeout(Some(d))
+    ///     .build();
     /// ```
     ///
     /// is equivalent to mutating `tos.connect` before passing it in.
@@ -224,10 +234,29 @@ impl ClientBuilder {
     }
 
     /// Build a [`Client`], returning an error when required configuration is missing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `host` was not set via [`ClientBuilder::host`] or
+    /// [`ClientBuilder::with_uri`].
     pub fn try_build(self) -> IcapResult<Client> {
         let host = self
             .host
+            .clone()
             .ok_or_else(|| Error::service("ClientBuilder: host is required"))?;
+        Ok(self.finish_with_host(host))
+    }
+
+    /// Build a [`Client`], defaulting `host` to `"127.0.0.1"` when unset.
+    ///
+    /// Use [`ClientBuilder::try_build`] when missing configuration should be
+    /// reported as an error instead of being silently defaulted.
+    pub fn build(self) -> Client {
+        let host = self.host.clone().unwrap_or_else(|| "127.0.0.1".to_string());
+        self.finish_with_host(host)
+    }
+
+    fn finish_with_host(self, host: String) -> Client {
         let port = self.port.unwrap_or(1344);
 
         #[cfg(feature = "tls-rustls")]
@@ -240,7 +269,7 @@ impl ClientBuilder {
             cfg.map(ClientTlsConfig::into_connector)
         };
 
-        Ok(Client {
+        Client {
             inner: Arc::new(ClientRef {
                 host,
                 port,
@@ -252,16 +281,6 @@ impl ClientBuilder {
                 tls,
                 idle_conn: Mutex::new(None),
             }),
-        })
-    }
-
-    /// Build a [`Client`].
-    ///
-    /// # Panics
-    ///
-    /// Panics if required configuration is missing. Use
-    /// [`ClientBuilder::try_build`] for fallible construction.
-    pub fn build(self) -> Client {
-        self.try_build().expect("ClientBuilder build failed")
+        }
     }
 }

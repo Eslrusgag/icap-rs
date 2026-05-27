@@ -37,7 +37,7 @@ async fn main() -> IcapResult<()> {
 
 To inspect the exact request bytes without sending them:
 
-```rust,no_run
+```rust
 use icap_rs::{Client, IcapResult, Request};
 
 fn main() -> IcapResult<()> {
@@ -94,7 +94,7 @@ preview-aware handlers.
 Client requests can set `Preview: N` with [`Request::preview`] and optionally
 send `ieof` for `Preview: 0` with [`Request::preview_ieof`]:
 
-```rust,no_run
+```rust
 use http::{Request as HttpRequest, Version};
 use icap_rs::{IcapResult, Request};
 
@@ -271,7 +271,7 @@ response. The ICAP serializer computes `Encapsulated` offsets and writes the
 embedded HTTP head unchunked. Only the encapsulated entity body is encoded with
 ICAP chunked framing.
 
-```rust,no_run
+```rust
 use http::{Response as HttpResponse, StatusCode as HttpStatus, Version};
 use icap_rs::{IcapResult, Response};
 
@@ -401,7 +401,7 @@ request/response, or use [`IncomingRequest::embedded_mut`] /
 
 Send an `OPTIONS` request with [`Client::send`] and [`Request::options`]:
 
-```rust,no_run
+```rust
 use icap_rs::{Client, IcapResult, Request};
 
 async fn options(client: &Client) -> IcapResult<()> {
@@ -413,7 +413,7 @@ async fn options(client: &Client) -> IcapResult<()> {
 
 Configure client-side network deadlines through [`ClientBuilder`]:
 
-```rust,no_run
+```rust
 use std::time::Duration;
 use icap_rs::Client;
 
@@ -486,7 +486,7 @@ fn dynamic_method(method: &str) -> IcapResult<Request> {
 Stream a large body by pairing [`Request::with_http_request_head`] with
 [`Client::send_streaming_reader`]:
 
-```rust,no_run
+```rust
 use http::Request as HttpRequest;
 use icap_rs::{Client, IcapResult, Request};
 
