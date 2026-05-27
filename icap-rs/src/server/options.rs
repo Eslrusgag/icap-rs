@@ -32,7 +32,7 @@
 use std::sync::{Arc, RwLock};
 
 use crate::error::{Error, IcapResult};
-use crate::request::{IncomingRequest, Method};
+use crate::request::IncomingRequest;
 use crate::response::Response;
 use std::collections::HashMap;
 
@@ -152,10 +152,6 @@ impl From<IsTagHandle> for IstagSource {
 #[derive(Clone)]
 #[must_use]
 pub struct ServiceOptions {
-    /// Supported ICAP methods (injected by the router).
-    pub(crate) methods: Vec<Method>,
-    /// Pre-formatted `"REQMOD, RESPMOD"` string, cached when `set_methods` is called.
-    pub(crate) methods_str: String,
     /// Human-readable service description (optional).
     pub(crate) service: Option<String>,
     /// `ISTag` source (static or dynamic provider).
@@ -197,8 +193,6 @@ impl ServiceOptions {
     /// this config on a server route.
     pub fn new() -> Self {
         Self {
-            methods: Vec::new(),
-            methods_str: String::new(),
             service: None,
             istag: None,
             max_connections: None,
@@ -340,20 +334,6 @@ impl ServiceOptions {
         self
     }
 
-    /// Router-only: inject the supported ICAP methods and cache their formatted string.
-    pub(crate) fn set_methods(&mut self, methods: Vec<Method>) {
-        self.methods = methods;
-        // Cache the formatted methods string to avoid repeated allocations per OPTIONS request.
-        let mut s = String::new();
-        for (i, m) in self.methods.iter().enumerate() {
-            if i > 0 {
-                s.push_str(", ");
-            }
-            s.push_str(m.as_str());
-        }
-        self.methods_str = s;
-    }
-
     /// Get the `ISTag` for a specific request (static or dynamic).
     #[inline]
     pub fn istag_for(&self, req: &IncomingRequest) -> IcapResult<String> {
@@ -366,16 +346,15 @@ impl ServiceOptions {
     /// Build an ICAP `OPTIONS` response for **this specific request**.
     ///
     /// The response includes:
-    /// - `Methods` — from the injected method set
+    /// - `Methods` — from the supplied methods string (e.g. `"REQMOD, RESPMOD"`)
     /// - `ISTag`   — resolved via the static string or dynamic provider
     /// - Standard headers (`Encapsulated`, `Service`, `Max-Connections`, etc.)
     ///
-    pub fn build_response_for(&self, req: &IncomingRequest) -> IcapResult<Response> {
+    pub fn build_response_for(&self, req: &IncomingRequest, methods_str: &str) -> IcapResult<Response> {
         let istag_now = self.istag_for(req)?;
         let mut response = Response::ok_with_istag(&istag_now)?;
 
-        // Use pre-formatted cached methods string — no allocation per request.
-        response = response.add_header("Methods", &self.methods_str);
+        response = response.add_header("Methods", methods_str);
 
         // Encapsulated
         let encapsulated_value = if self.opt_body.is_some() {

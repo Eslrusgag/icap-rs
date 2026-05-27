@@ -392,13 +392,22 @@ impl Server {
                 if method == Method::Options {
                     let mut allowed: Vec<Method> = entry.handlers.keys().copied().collect();
                     allowed.sort_unstable();
+                    let methods_str = allowed
+                        .iter()
+                        .enumerate()
+                        .fold(String::new(), |mut s, (i, m)| {
+                            if i > 0 {
+                                s.push_str(", ");
+                            }
+                            s.push_str(m.as_str());
+                            s
+                        });
                     let Some(mut cfg) = entry.options.clone() else {
                         return Err(Error::service(format!(
                             "Service '{}' has no explicit OPTIONS configuration with ISTag",
                             service_resolved.as_ref()
                         )));
                     };
-                    cfg.set_methods(allowed);
                     if cfg.service.is_none() {
                         cfg = cfg
                             .with_service(&format!("ICAP Service {}", service_resolved.as_ref()));
@@ -406,7 +415,7 @@ impl Server {
                     if let (Some(n), None) = (advertised_max_conn, cfg.max_connections) {
                         cfg.with_max_connections(n);
                     }
-                    cfg.build_response_for(&req)?
+                    cfg.build_response_for(&req, &methods_str)?
                 } else {
                     let allow_204 = req.allow_204;
                     let allow_206 = req.allow_206;
