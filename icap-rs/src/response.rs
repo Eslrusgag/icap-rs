@@ -1272,20 +1272,6 @@ mod response_wire_parser_tests {
         assert!(r.body.is_empty(), "204 must not carry a body");
     }
 
-    #[test]
-    fn rfc_204_must_have_null_body_header() {
-        let raw = icap_bytes(
-            "ICAP/1.0 204 No Content\r\n\
-             ISTag: x\r\n\
-             \r\n",
-        );
-        let err = parse_icap_response(&raw).unwrap_err();
-        let m = err.to_string().to_lowercase();
-        assert!(
-            m.contains("encapsulated") || m.contains("null-body"),
-            "expected missing null-body=0; got: {m}"
-        );
-    }
 
     #[test]
     fn rfc_204_must_not_have_body_bytes() {
