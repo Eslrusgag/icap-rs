@@ -70,6 +70,58 @@ use std::io::Write as _;
 use std::pin::Pin;
 use tokio::io::AsyncRead;
 
+/// Single public ICAP request type used by both client and server.
+///
+/// The second type parameter is a direction marker:
+/// - [`Outbound`] is the default client-side builder shape.
+/// - [`Incoming`] is the server-side handler shape.
+///
+/// Server handlers receive [`IncomingRequest`], whose ICAP metadata is read-only
+/// through accessors. Services may inspect or modify the embedded HTTP message
+/// via [`Request::embedded_mut`] or consume it via [`Request::into_embedded`],
+/// but they cannot mutate the ICAP request line, ICAP headers, preview flags,
+/// or advertised `Allow` values through public API.
+#[derive(Debug)]
+#[must_use]
+pub struct Request<R = Vec<u8>, D = Outbound> {
+    /// ICAP method: `"OPTIONS" | "REQMOD" | "RESPMOD"`.
+    pub(crate) method: Method,
+    /// Service path like `"icap/test"` or `"respmod"`. Leading slash is allowed.
+    pub(crate) service: String,
+    /// ICAP headers (case-insensitive).
+    pub(crate) icap_headers: HeaderMap,
+    /// Optional embedded HTTP message (request/response).
+    pub(crate) embedded: Option<EmbeddedHttp<R>>,
+    /// `Preview: n` (if set).
+    pub(crate) preview_size: Option<usize>,
+    /// Whether `Allow: 204` should be advertised.
+    pub(crate) allow_204: bool,
+    /// Whether `Allow: 206` should be advertised.
+    pub(crate) allow_206: bool,
+    /// If `true` and `preview_size == Some(0)`, send `0; ieof` (fast 204 hint).
+    pub(crate) preview_ieof: bool,
+    // TODO: `istag` is server-only metadata injected before handler dispatch, but lives on the
+    // shared `Request<R, D>` struct, so it also exists (always `None`) on `Outbound` requests.
+    // Consider moving it to a dedicated server-side envelope or a separate `IncomingMeta` type
+    // so that `Request` stays a pure protocol type.
+    pub(crate) istag: Option<String>,
+    pub(crate) direction: PhantomData<D>,
+}
+
+/// Request shape accepted by client send/build APIs.
+pub type OutboundRequest<R = Vec<u8>> = Request<R, Outbound>;
+
+/// Request shape received by server route handlers.
+pub type IncomingRequest<R = Vec<u8>> = Request<R, Incoming>;
+
+/// Client-side request marker.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum Outbound {}
+
+/// Server-side request marker.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum Incoming {}
+
 /// ICAP protocol methods recognized by the server/router.
 ///
 /// Defined by RFC 3507. In this crate:
@@ -482,53 +534,6 @@ fn serialize_http_response_head(head: &HttpResponse<()>) -> Vec<u8> {
     out
 }
 
-/// Single public ICAP request type used by both client and server.
-///
-/// The second type parameter is a direction marker:
-/// - [`Outbound`] is the default client-side builder shape.
-/// - [`Incoming`] is the server-side handler shape.
-///
-/// Server handlers receive [`IncomingRequest`], whose ICAP metadata is read-only
-/// through accessors. Services may inspect or modify the embedded HTTP message
-/// via [`Request::embedded_mut`] or consume it via [`Request::into_embedded`],
-/// but they cannot mutate the ICAP request line, ICAP headers, preview flags,
-/// or advertised `Allow` values through public API.
-#[derive(Debug)]
-#[must_use]
-pub struct Request<R = Vec<u8>, D = Outbound> {
-    /// ICAP method: `"OPTIONS" | "REQMOD" | "RESPMOD"`.
-    pub(crate) method: Method,
-    /// Service path like `"icap/test"` or `"respmod"`. Leading slash is allowed.
-    pub(crate) service: String,
-    /// ICAP headers (case-insensitive).
-    pub(crate) icap_headers: HeaderMap,
-    /// Optional embedded HTTP message (request/response).
-    pub(crate) embedded: Option<EmbeddedHttp<R>>,
-    /// `Preview: n` (if set).
-    pub(crate) preview_size: Option<usize>,
-    /// Whether `Allow: 204` should be advertised.
-    pub(crate) allow_204: bool,
-    /// Whether `Allow: 206` should be advertised.
-    pub(crate) allow_206: bool,
-    /// If `true` and `preview_size == Some(0)`, send `0; ieof` (fast 204 hint).
-    pub(crate) preview_ieof: bool,
-    pub(crate) direction: PhantomData<D>,
-}
-
-/// Client-side request marker.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum Outbound {}
-
-/// Server-side request marker.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum Incoming {}
-
-/// Request shape accepted by client send/build APIs.
-pub type OutboundRequest<R = Vec<u8>> = Request<R, Outbound>;
-
-/// Request shape received by server route handlers.
-pub type IncomingRequest<R = Vec<u8>> = Request<R, Incoming>;
-
 pub(crate) struct IncomingRequestParts<R> {
     method: Method,
     service: String,
@@ -538,28 +543,6 @@ pub(crate) struct IncomingRequestParts<R> {
     allow_204: bool,
     allow_206: bool,
     preview_ieof: bool,
-}
-
-impl<R> Request<R, Outbound> {
-    /// Create a new outbound ICAP request.
-    pub fn new(method: Method, service: impl Into<String>) -> Self {
-        Self {
-            method,
-            service: service.into(),
-            icap_headers: HeaderMap::new(),
-            embedded: None,
-            preview_size: None,
-            allow_204: false,
-            allow_206: false,
-            preview_ieof: false,
-            direction: PhantomData,
-        }
-    }
-
-    /// Create a new outbound ICAP request from a method token without panicking.
-    pub fn try_new(method: &str, service: impl Into<String>) -> IcapResult<Self> {
-        Ok(Self::new(Method::parse_token(method)?, service))
-    }
 }
 
 impl<R, D> Request<R, D> {
@@ -625,14 +608,37 @@ impl<R, D> Request<R, D> {
 }
 
 impl<R> Request<R, Outbound> {
+    /// Create a new outbound ICAP request.
+    pub fn new(method: Method, service: impl Into<String>) -> Self {
+        Self {
+            method,
+            service: service.into(),
+            icap_headers: HeaderMap::new(),
+            embedded: None,
+            preview_size: None,
+            allow_204: false,
+            allow_206: false,
+            preview_ieof: false,
+            istag: None,
+            direction: PhantomData,
+        }
+    }
+
+    /// Create a new outbound ICAP request from a method token without panicking.
+    pub fn try_new(method: &str, service: impl Into<String>) -> IcapResult<Self> {
+        Ok(Self::new(Method::parse_token(method)?, service))
+    }
+
     /// Construct `OPTIONS` request.
     pub fn options(service: impl Into<String>) -> Self {
         Self::new(Method::Options, service)
     }
+
     /// Construct `REQMOD` request.
     pub fn reqmod(service: impl Into<String>) -> Self {
         Self::new(Method::ReqMod, service)
     }
+
     /// Construct `RESPMOD` request.
     pub fn respmod(service: impl Into<String>) -> Self {
         Self::new(Method::RespMod, service)
@@ -665,6 +671,7 @@ impl<R> Request<R, Outbound> {
         self.preview_size = Some(n);
         self
     }
+
     /// Mark a `Preview: 0` request as complete using the `ieof` chunk extension.
     pub const fn preview_ieof(mut self) -> Self {
         self.preview_ieof = true;
@@ -676,6 +683,7 @@ impl<R> Request<R, Outbound> {
         self.allow_204 = true;
         self
     }
+
     /// Advertise `Allow: 206`.
     ///
     /// The companion server can answer eligible no-modification flows with
@@ -752,8 +760,19 @@ impl<R> Request<R, Incoming> {
             allow_204: parts.allow_204,
             allow_206: parts.allow_206,
             preview_ieof: parts.preview_ieof,
+            istag: None,
             direction: PhantomData,
         }
+    }
+
+    /// Return the `ISTag` that the server resolved from `ServiceOptions` for
+    /// this request, or `None` if no `ServiceOptions` were configured.
+    ///
+    /// This is the same value that will appear in the ICAP response's `ISTag`
+    /// header when using [`Response::no_content_with_istag`] or similar.
+    #[inline]
+    pub fn istag(&self) -> Option<&str> {
+        self.istag.as_deref()
     }
 }
 

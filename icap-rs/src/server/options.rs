@@ -29,7 +29,7 @@
 //!     .allow_204();
 //! ```
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use crate::error::{Error, IcapResult};
 use crate::request::{IncomingRequest, Method};
@@ -67,6 +67,85 @@ impl IstagSource {
             Self::Static(s) => s.clone(),
             Self::Dynamic(f) => (f)(req),
         }
+    }
+}
+
+/// A cloneable handle to a mutable `ISTag` value.
+///
+/// Create one with [`IsTagHandle::new`], pass clones to both
+/// [`ServiceOptions::with_dynamic_istag`] and your route handlers, then call
+/// [`IsTagHandle::set`] from a background task whenever the policy reloads.
+///
+/// `IsTagHandle::clone` is cheap — it clones the inner `Arc`, not the string.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use icap_rs::{IsTagHandle, IncomingRequest, Response, Server, HandlerResult};
+/// use icap_rs::server::options::ServiceOptions;
+/// use std::time::Duration;
+///
+/// #[tokio::main]
+/// async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+///     let tag = IsTagHandle::new("policy-v1");
+///
+///     // Rotate the tag from a background task on policy reload.
+///     tokio::spawn({
+///         let tag = tag.clone();
+///         async move {
+///             loop {
+///                 tokio::time::sleep(Duration::from_secs(60)).await;
+///                 tag.set("policy-v2");
+///             }
+///         }
+///     });
+///
+///     let server = Server::builder()
+///         .bind("127.0.0.1:1344")
+///         .route_reqmod(
+///             "scan",
+///             move |req: IncomingRequest| {
+///                 // req.istag() returns the tag resolved before the handler was called.
+///                 async move { Ok(Response::no_content_with_istag(req.istag().unwrap_or(""))?) }
+///             },
+///             Some(ServiceOptions::new()
+///                 .with_dynamic_istag(tag)
+///                 .with_service("Scanner")
+///                 .allow_204()),
+///         )
+///         .build()
+///         .await?;
+///
+///     server.run().await?;
+///     Ok(())
+/// }
+/// ```
+#[derive(Clone)]
+pub struct IsTagHandle(Arc<RwLock<String>>);
+
+impl IsTagHandle {
+    /// Create a new handle with the given initial tag value.
+    pub fn new(initial: impl Into<String>) -> Self {
+        Self(Arc::new(RwLock::new(initial.into())))
+    }
+
+    /// Replace the current tag value.
+    ///
+    /// All `ServiceOptions` and handlers that share this handle will see the
+    /// new value on their next request.
+    pub fn set(&self, tag: impl Into<String>) {
+        *self.0.write().expect("IsTagHandle lock poisoned") = tag.into();
+    }
+
+    /// Read the current tag value.
+    pub fn current(&self) -> String {
+        self.0.read().expect("IsTagHandle lock poisoned").clone()
+    }
+}
+
+impl From<IsTagHandle> for IstagSource {
+    fn from(h: IsTagHandle) -> Self {
+        Self::Dynamic(Arc::new(move |_: &IncomingRequest| h.current()))
     }
 }
 
@@ -172,6 +251,16 @@ impl ServiceOptions {
     /// `QUJD+/8=`. Generated ICAP responses quote it on the wire per RFC 3507.
     pub fn with_static_istag(mut self, istag: &str) -> Self {
         self.istag = Some(IstagSource::Static(istag.to_string()));
+        self
+    }
+
+    /// Use an [`IsTagHandle`] as the `ISTag` source.
+    ///
+    /// This is the preferred way to wire up a dynamically-rotating tag.
+    /// The handle can be shared with route handlers via `Clone`; call
+    /// [`IsTagHandle::set`] from anywhere to rotate the tag atomically.
+    pub fn with_dynamic_istag(mut self, handle: IsTagHandle) -> Self {
+        self.istag = Some(handle.into());
         self
     }
 

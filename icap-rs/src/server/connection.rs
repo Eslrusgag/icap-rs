@@ -257,6 +257,10 @@ impl Server {
                         {
                             let log_service = preview_service_resolved.to_string();
                             mark_request_body_as_preview(&mut preview_req, false);
+                            preview_req.istag = entry
+                                .options
+                                .as_ref()
+                                .and_then(|o| o.istag_for(&preview_req).ok());
                             let decision = match (handler_entry.handler)(preview_req).await {
                                 Ok(d) => d,
                                 Err(err) => {
@@ -365,14 +369,15 @@ impl Server {
             }
 
             // === Parse + route ===
-            let req = match parse_request_for_mode(&buf[buf_start..msg_end], request_parser_mode) {
-                Ok(req) => req,
-                Err(err) => {
-                    warn!(client=%addr, error=%err, "malformed ICAP request");
-                    Self::write_wire_parse_error_response(&mut socket, &err).await?;
-                    return Ok(());
-                }
-            };
+            let mut req =
+                match parse_request_for_mode(&buf[buf_start..msg_end], request_parser_mode) {
+                    Ok(req) => req,
+                    Err(err) => {
+                        warn!(client=%addr, error=%err, "malformed ICAP request");
+                        Self::write_wire_parse_error_response(&mut socket, &err).await?;
+                        return Ok(());
+                    }
+                };
             let method = req.method;
             let raw_service: &str = req.service.rsplit('/').next().unwrap_or(&req.service);
             let service_resolved =
@@ -474,6 +479,7 @@ impl Server {
                         }
                     } else if let Some(handler_entry) = entry.handlers.get(&method) {
                         let log_service = service_resolved.to_string();
+                        req.istag = entry.options.as_ref().and_then(|o| o.istag_for(&req).ok());
                         match (handler_entry.handler)(req).await {
                             Ok(PreviewDecision::Respond(resp)) => resp,
                             Ok(PreviewDecision::Continue) => {

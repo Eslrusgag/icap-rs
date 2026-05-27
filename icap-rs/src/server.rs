@@ -83,7 +83,7 @@ use tracing::{error, trace, warn};
 
 use crate::error::IcapResult;
 use crate::request::RequestParserMode;
-pub use crate::server::options::{ServiceOptions, TransferBehavior};
+pub use crate::server::options::{IsTagHandle, ServiceOptions, TransferBehavior};
 use crate::{Response, StatusCode};
 use router::RouteEntry;
 #[cfg(feature = "tls-rustls")]
