@@ -92,6 +92,10 @@ required-features = ["tls-rustls"]
 name = "preview_decision_server"
 path = "examples/preview_decision_server.rs"
 
+[[example]]
+name = "squid_interop_server"
+path = "examples/squid_interop_server.rs"
+
 [[bench]]
 name = "protocol_bench"
 harness = false
