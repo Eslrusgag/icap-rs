@@ -9,7 +9,7 @@
 
 use std::time::Duration;
 
-/// Aggregated server deadlines applied per connection.
+/// Aggregated server deadlines applied per connection and for graceful shutdown.
 ///
 /// - [`header_read`](Self::header_read): max time to receive a full ICAP header
 ///   block (`CRLFCRLF`) once the request has started arriving. Mitigates
@@ -23,6 +23,10 @@ use std::time::Duration;
 ///   response was flushed). Used only for the leading read; once any bytes
 ///   arrive, [`header_read`](Self::header_read) governs the rest of the header
 ///   block.
+/// - [`shutdown_drain`](Self::shutdown_drain): max time to wait for in-flight
+///   requests to finish after a shutdown signal. If the deadline expires, the
+///   remaining connections are cancelled. When `None` the server waits
+///   indefinitely.
 #[derive(Debug, Clone, Default)]
 #[must_use]
 pub struct ServerTimeouts {
@@ -30,6 +34,7 @@ pub struct ServerTimeouts {
     pub body_read: Option<Duration>,
     pub write: Option<Duration>,
     pub idle_keepalive: Option<Duration>,
+    pub shutdown_drain: Option<Duration>,
 }
 
 impl ServerTimeouts {
@@ -40,6 +45,7 @@ impl ServerTimeouts {
             body_read: None,
             write: None,
             idle_keepalive: None,
+            shutdown_drain: None,
         }
     }
 
@@ -77,6 +83,16 @@ impl ServerTimeouts {
     /// governs the rest of the header block.
     pub const fn with_idle_keepalive(mut self, dur: Duration) -> Self {
         self.idle_keepalive = Some(dur);
+        self
+    }
+
+    /// Set the [`shutdown_drain`](Self::shutdown_drain) deadline.
+    ///
+    /// Bounds how long the server waits for active connections to finish after
+    /// a shutdown signal. Connections still in flight when the deadline expires
+    /// are cancelled. When not set the drain waits indefinitely.
+    pub const fn with_shutdown_drain(mut self, dur: Duration) -> Self {
+        self.shutdown_drain = Some(dur);
         self
     }
 }

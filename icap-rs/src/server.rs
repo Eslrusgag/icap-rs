@@ -79,7 +79,6 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinSet;
-#[cfg(feature = "tls-rustls")]
 use tokio::time::timeout;
 use tracing::{error, trace, warn};
 
@@ -195,9 +194,29 @@ impl Server {
                 biased;
 
                 () = &mut shutdown => {
-                    trace!(addr=%local_addr, "shutdown signal received");
                     // Signal all active connections to close after their current request.
                     let _ = shutdown_tx.send(true);
+                    let active = tasks.len();
+                    if active > 0 {
+                        if let Some(d) = self.timeouts.shutdown_drain {
+                            warn!(
+                                addr=%local_addr,
+                                connections=%active,
+                                "shutting down; draining {active} active connection(s); \
+                                 new connections will be refused; \
+                                 force-close in {d:.1?}",
+                            );
+                        } else {
+                            warn!(
+                                addr=%local_addr,
+                                connections=%active,
+                                "shutting down; draining {active} active connection(s); \
+                                 new connections will be refused",
+                            );
+                        }
+                    } else {
+                        trace!(addr=%local_addr, "shutting down; no active connections");
+                    }
                     break;
                 }
 
@@ -311,7 +330,26 @@ impl Server {
         }
 
         // Wait for all in-flight connections to complete.
-        while tasks.join_next().await.is_some() {}
+        if let Some(drain_timeout) = self.timeouts.shutdown_drain {
+            if timeout(drain_timeout, async {
+                while tasks.join_next().await.is_some() {}
+            })
+            .await
+            .is_err()
+            {
+                let remaining = tasks.len();
+                warn!(
+                    addr=%local_addr,
+                    connections=%remaining,
+                    "shutdown drain timeout ({drain_timeout:.1?}) expired; \
+                     cancelling {remaining} remaining connection(s)",
+                );
+                tasks.abort_all();
+                while tasks.join_next().await.is_some() {}
+            }
+        } else {
+            while tasks.join_next().await.is_some() {}
+        }
         trace!(addr=%local_addr, "ICAP server stopped");
         Ok(())
     }
