@@ -62,7 +62,7 @@ impl HandlerError {
     }
 
     /// Override the ICAP status emitted to the client.
-    pub fn with_status(mut self, status: StatusCode) -> Self {
+    pub const fn with_status(mut self, status: StatusCode) -> Self {
         self.status = status;
         self
     }
@@ -81,7 +81,7 @@ impl HandlerError {
     }
 
     /// The status code the server will send.
-    pub fn status(&self) -> StatusCode {
+    pub const fn status(&self) -> StatusCode {
         self.status
     }
 

@@ -777,7 +777,7 @@ impl<R> Request<R, Incoming> {
     ///
     /// The map is empty when no trailers were present.
     #[inline]
-    pub fn chunk_trailers(&self) -> &HeaderMap {
+    pub const fn chunk_trailers(&self) -> &HeaderMap {
         &self.chunk_trailers
     }
 

@@ -937,6 +937,7 @@ const fn is_virtual_icap_header(name: &str) -> bool {
         || name.eq_ignore_ascii_case("connection")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_icap_headers(
     out: &mut Vec<u8>,
     default_headers: &HeaderMap,

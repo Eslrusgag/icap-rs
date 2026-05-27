@@ -175,7 +175,7 @@ impl Server {
     ///         .await?;
     ///
     ///     // Shut down cleanly on Ctrl-C.
-    ///     server.run_until(tokio::signal::ctrl_c().then(|_| async {})).await
+    ///     server.run_until(async { tokio::signal::ctrl_c().await.ok(); }).await
     /// }
     /// ```
     pub async fn run_until<F>(self, shutdown: F) -> IcapResult<()>
@@ -194,7 +194,7 @@ impl Server {
             tokio::select! {
                 biased;
 
-                _ = &mut shutdown => {
+                () = &mut shutdown => {
                     trace!(addr=%local_addr, "shutdown signal received");
                     // Signal all active connections to close after their current request.
                     let _ = shutdown_tx.send(true);

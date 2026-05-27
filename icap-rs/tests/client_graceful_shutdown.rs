@@ -11,11 +11,11 @@
 mod common;
 
 use common::{find_free_port, wait_port_ready};
+use icap_rs::request::IncomingRequest;
 use icap_rs::response::{Response, StatusCode};
 use icap_rs::server::Server;
 use icap_rs::server::options::ServiceOptions;
 use icap_rs::{Client, HandlerResult, Request};
-use icap_rs::request::IncomingRequest;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::time::{Duration, timeout};
@@ -85,10 +85,7 @@ Encapsulated: null-body=0\r\n\
     });
 
     // Default ConnectionPolicy is Close.
-    let client = Client::builder()
-        .host("127.0.0.1")
-        .port(port)
-        .build();
+    let client = Client::builder().host("127.0.0.1").port(port).build();
     let req = Request::options("svc");
 
     let resp = timeout(Duration::from_secs(2), client.send(&req))
@@ -189,9 +186,7 @@ fn rfc4_2_wire_bytes_omit_connection_close_for_keep_alive_policy() {
 // ---------------------------------------------------------------------------
 
 async fn passthrough_handler(_req: IncomingRequest) -> HandlerResult<Response> {
-    Ok(Response::no_content()
-        .try_set_istag("test")
-        .expect("istag"))
+    Ok(Response::no_content().try_set_istag("test").expect("istag"))
 }
 
 async fn start_test_server() -> u16 {

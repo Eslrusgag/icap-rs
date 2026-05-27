@@ -199,7 +199,7 @@ impl ParsedResponse {
     ///
     /// The map is empty when no trailers were present.
     #[inline]
-    pub fn chunk_trailers(&self) -> &HeaderMap {
+    pub const fn chunk_trailers(&self) -> &HeaderMap {
         &self.chunk_trailers
     }
 }
@@ -264,7 +264,7 @@ impl Response<Outgoing> {
     pub fn no_content_with_headers(headers: HeaderMap) -> IcapResult<Self> {
         let istag = headers
             .get("ISTag")
-            .ok_or(Error::missing_header("ISTag"))?
+            .ok_or_else(|| Error::missing_header("ISTag"))?
             .to_str()?;
         validate_istag(istag)?;
 
@@ -356,7 +356,7 @@ impl Response<Outgoing> {
             let istag = self
                 .headers
                 .get("ISTag")
-                .ok_or(Error::missing_header("ISTag"))?
+                .ok_or_else(|| Error::missing_header("ISTag"))?
                 .to_str()?;
             validate_istag(istag)?;
         } else if let Some(v) = self.headers.get("ISTag") {
@@ -448,7 +448,7 @@ impl Response<Outgoing> {
                 .headers
                 .get("Encapsulated")
                 .and_then(|v| v.to_str().ok())
-                .ok_or(Error::missing_header("Encapsulated"))?;
+                .ok_or_else(|| Error::missing_header("Encapsulated"))?;
             let enc = parse_encapsulated_value(enc_val)?;
             if enc.req_body.or(enc.res_body).or(enc.opt_body).is_none() {
                 return Err(Error::header(
@@ -669,7 +669,7 @@ pub(crate) fn parse_icap_response(raw: &[u8]) -> IcapResult<ParsedResponse> {
                 }
             }
             StatusCode::OK | StatusCode::PARTIAL_CONTENT => {
-                let enc_val = enc_val.ok_or(Error::missing_header("Encapsulated"))?;
+                let enc_val = enc_val.ok_or_else(|| Error::missing_header("Encapsulated"))?;
                 let enc = parse_encapsulated_value(enc_val)?;
                 let (use_original_body, trailers) =
                     dechunk_response_body_if_needed(&enc, &mut body)?;
@@ -1293,7 +1293,6 @@ mod response_wire_parser_tests {
         );
         assert!(r.body.is_empty(), "204 must not carry a body");
     }
-
 
     #[test]
     fn rfc_204_must_not_have_body_bytes() {

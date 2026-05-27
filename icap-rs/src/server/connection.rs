@@ -35,6 +35,7 @@ where
     F: std::future::Future<Output = IcapResult<T>>,
 {
     if let Some(d) = dur {
+        #[allow(clippy::option_if_let_else)]
         match timeout(d, fut).await {
             Ok(res) => res,
             Err(_) => Err(mk_err(d)),
@@ -87,6 +88,7 @@ impl Server {
     /// shutdown. Idle connections (waiting for the next request) are closed immediately on the
     /// signal; connections with an in-flight request finish it and then add `Connection: close`
     /// to the response before exiting the keep-alive loop.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn handle_connection<S>(
         mut socket: S,
         routes: Arc<HashMap<String, RouteEntry>>,
@@ -112,7 +114,7 @@ impl Server {
             // (it may legitimately wait a long time on a kept-alive connection);
             // subsequent reads of the same header block use the tighter
             // header_read deadline.
-            let mut request_started = !(buf_start == buf.len());
+            let mut request_started = buf_start != buf.len();
 
             // === Read headers ===
             let h_end = loop {
@@ -147,7 +149,14 @@ impl Server {
                 // For the first read of a new request the connection is idle.
                 // Use `select!` so a shutdown signal closes the connection immediately
                 // instead of waiting up to `idle_keepalive_timeout` for the next byte.
-                let read_res = if !request_started {
+                let read_res = if request_started {
+                    with_timeout_as(
+                        read_dur,
+                        async { socket.read(&mut tmp).await.map_err(Error::Io) },
+                        mk_err,
+                    )
+                    .await
+                } else {
                     tokio::select! {
                         biased;
                         _ = shutdown.wait_for(|v| *v) => return Ok(()),
@@ -160,13 +169,6 @@ impl Server {
                             .await
                         } => res,
                     }
-                } else {
-                    with_timeout_as(
-                        read_dur,
-                        async { socket.read(&mut tmp).await.map_err(Error::Io) },
-                        mk_err,
-                    )
-                    .await
                 };
 
                 let n = match read_res {
@@ -443,16 +445,17 @@ impl Server {
                 if method == Method::Options {
                     let mut allowed: Vec<Method> = entry.handlers.keys().copied().collect();
                     allowed.sort_unstable();
-                    let methods_str = allowed
-                        .iter()
-                        .enumerate()
-                        .fold(String::new(), |mut s, (i, m)| {
-                            if i > 0 {
-                                s.push_str(", ");
-                            }
-                            s.push_str(m.as_str());
-                            s
-                        });
+                    let methods_str =
+                        allowed
+                            .iter()
+                            .enumerate()
+                            .fold(String::new(), |mut s, (i, m)| {
+                                if i > 0 {
+                                    s.push_str(", ");
+                                }
+                                s.push_str(m.as_str());
+                                s
+                            });
                     let Some(mut cfg) = entry.options.clone() else {
                         return Err(Error::service(format!(
                             "Service '{}' has no explicit OPTIONS configuration with ISTag",

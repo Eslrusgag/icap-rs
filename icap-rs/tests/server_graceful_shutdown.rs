@@ -9,11 +9,11 @@
 mod common;
 
 use common::{find_free_port, wait_port_ready};
+use icap_rs::request::IncomingRequest;
 use icap_rs::response::{Response, StatusCode};
 use icap_rs::server::Server;
 use icap_rs::server::options::ServiceOptions;
 use icap_rs::{Client, HandlerResult, Request};
-use icap_rs::request::IncomingRequest;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 use tokio::sync::oneshot;
@@ -101,9 +101,13 @@ async fn server_stops_accepting_new_connections_after_shutdown() {
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // A new connection attempt should either fail or receive an EOF immediately.
-    let result = timeout(Duration::from_secs(1), TcpStream::connect(format!("127.0.0.1:{port}"))).await;
+    let result = timeout(
+        Duration::from_secs(1),
+        TcpStream::connect(format!("127.0.0.1:{port}")),
+    )
+    .await;
     match result {
-        Err(_) => {} // timeout — server no longer listening, acceptable
+        Err(_) => {}     // timeout — server no longer listening, acceptable
         Ok(Err(_)) => {} // connect error — listener closed, acceptable
         Ok(Ok(mut stream)) => {
             // Connected — server may have accepted but should close immediately.
@@ -112,7 +116,10 @@ async fn server_stops_accepting_new_connections_after_shutdown() {
                 .await
                 .expect("eof timeout")
                 .expect("eof read");
-            assert_eq!(n, 0, "new connection after shutdown should get EOF immediately");
+            assert_eq!(
+                n, 0,
+                "new connection after shutdown should get EOF immediately"
+            );
         }
     }
 }
@@ -179,10 +186,7 @@ async fn server_completes_in_flight_request_with_connection_close_on_shutdown() 
     wait_port_ready(&addr).await;
 
     // Send a request that will block in the handler.
-    let client = Client::builder()
-        .host("127.0.0.1")
-        .port(port)
-        .build();
+    let client = Client::builder().host("127.0.0.1").port(port).build();
     let http_req = http::Request::builder()
         .method("GET")
         .uri("http://example.com/")
@@ -194,9 +198,7 @@ async fn server_completes_in_flight_request_with_connection_close_on_shutdown() 
         .with_http_request(http_req)
         .expect("build request");
 
-    let client_task = tokio::spawn(async move {
-        client.send(&icap_req).await
-    });
+    let client_task = tokio::spawn(async move { client.send(&icap_req).await });
 
     // Wait for the handler to start processing, then trigger shutdown.
     timeout(Duration::from_secs(2), handler_started_rx)
@@ -223,7 +225,9 @@ async fn server_completes_in_flight_request_with_connection_close_on_shutdown() 
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     assert!(
-        conn_hdr.split(',').any(|t| t.trim().eq_ignore_ascii_case("close")),
+        conn_hdr
+            .split(',')
+            .any(|t| t.trim().eq_ignore_ascii_case("close")),
         "response must carry Connection: close during shutdown, got: {conn_hdr:?}"
     );
 

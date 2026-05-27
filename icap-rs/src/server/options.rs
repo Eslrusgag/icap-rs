@@ -340,7 +340,7 @@ impl ServiceOptions {
         self.istag
             .as_ref()
             .map(|source| source.current_for(req))
-            .ok_or(Error::missing_header("ISTag"))
+            .ok_or_else(|| Error::missing_header("ISTag"))
     }
 
     /// Validate invariants for this configuration.
@@ -384,7 +384,7 @@ pub(crate) struct OptionsResponseBuilder<'a> {
 }
 
 impl<'a> OptionsResponseBuilder<'a> {
-    pub(crate) fn new(options: &'a ServiceOptions, methods_str: &'a str) -> Self {
+    pub(crate) const fn new(options: &'a ServiceOptions, methods_str: &'a str) -> Self {
         Self {
             options,
             methods_str,
@@ -448,12 +448,10 @@ impl<'a> OptionsResponseBuilder<'a> {
                 }
             }
             if !preview_extensions.is_empty() {
-                response =
-                    response.add_header("Transfer-Preview", &preview_extensions.join(", "));
+                response = response.add_header("Transfer-Preview", &preview_extensions.join(", "));
             }
             if !ignore_extensions.is_empty() {
-                response =
-                    response.add_header("Transfer-Ignore", &ignore_extensions.join(", "));
+                response = response.add_header("Transfer-Ignore", &ignore_extensions.join(", "));
             }
             if !complete_extensions.is_empty() {
                 response =

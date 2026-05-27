@@ -8,6 +8,7 @@ use crate::{EmbeddedHttp, Response};
 /// `ICAP/1.0 100 Continue` and before the client uploads the remainder.
 #[derive(Debug)]
 #[must_use]
+#[allow(clippy::large_enum_variant)]
 pub enum PreviewDecision {
     /// Continue the normal Preview flow.
     ///

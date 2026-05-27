@@ -107,7 +107,6 @@ pub fn parse_one_chunk_meta(buf: &[u8], from: usize) -> IcapResult<Option<ChunkM
 /// Returns `(trailers, bytes_consumed)` where `bytes_consumed` includes the
 /// final empty `\r\n`.  When there are no trailers (`data` starts with `\r\n`)
 /// the returned `HeaderMap` is empty and `bytes_consumed` is 2.
-#[must_use]
 pub fn parse_chunk_trailers(data: &[u8]) -> IcapResult<(HeaderMap, usize)> {
     let mut trailers = HeaderMap::new();
     let mut pos = 0;
@@ -126,8 +125,8 @@ pub fn parse_chunk_trailers(data: &[u8]) -> IcapResult<(HeaderMap, usize)> {
         let line = &data[pos..pos + crlf_rel];
         pos += crlf_rel + 2;
         // Split on the first ':'.
-        let colon =
-            memchr(b':', line).ok_or_else(|| Error::body("malformed chunk trailer: missing ':'"))?;
+        let colon = memchr(b':', line)
+            .ok_or_else(|| Error::body("malformed chunk trailer: missing ':'"))?;
         let name_str = std::str::from_utf8(&line[..colon])
             .map_err(|_| Error::body("chunk trailer name is not UTF-8"))?
             .trim();

@@ -71,28 +71,28 @@ pub enum Error {
 
 impl Error {
     /// True if the error originates from an I/O failure on the transport.
-    pub fn is_io(&self) -> bool {
+    pub const fn is_io(&self) -> bool {
         matches!(self, Self::Io(_))
     }
 
     /// True if the error originates from a deadline (any [`TimeoutKind`]).
-    pub fn is_timeout(&self) -> bool {
+    pub const fn is_timeout(&self) -> bool {
         matches!(self, Self::Timeout(_))
     }
 
     /// True if the error came from the wire protocol layer.
-    pub fn is_protocol(&self) -> bool {
+    pub const fn is_protocol(&self) -> bool {
         matches!(self, Self::Protocol(_))
     }
 
     /// True if the error came from builder / configuration validation.
-    pub fn is_config(&self) -> bool {
+    pub const fn is_config(&self) -> bool {
         matches!(self, Self::Config(_))
     }
 
     /// True for the "peer closed before headers" case — common on
     /// kept-alive connections that the server has idle-closed.
-    pub fn is_early_close(&self) -> bool {
+    pub const fn is_early_close(&self) -> bool {
         matches!(self, Self::Protocol(ProtocolError::EarlyClose))
     }
 
@@ -102,7 +102,7 @@ impl Error {
     /// closure, and `EarlyClose` are considered retryable. Application-level
     /// protocol errors are *not* retryable — the peer will reject the same
     /// bytes again.
-    pub fn is_retryable(&self) -> bool {
+    pub const fn is_retryable(&self) -> bool {
         if self.is_early_close() {
             return true;
         }
@@ -143,11 +143,11 @@ impl Error {
     }
 
     /// Build a "missing required header" protocol error.
-    pub fn missing_header(name: &'static str) -> Self {
+    pub const fn missing_header(name: &'static str) -> Self {
         Self::Protocol(ProtocolError::MissingHeader(name))
     }
 
-    /// Build an "invalid ISTag" protocol error.
+    /// Build an "invalid `ISTag`" protocol error.
     pub fn invalid_istag(value: impl Into<String>) -> Self {
         Self::Protocol(ProtocolError::InvalidISTag(value.into()))
     }
@@ -186,32 +186,32 @@ impl Error {
     }
 
     /// Build a `Timeout` from a kind + duration.
-    pub fn timeout(kind: TimeoutKind, duration: Duration) -> Self {
+    pub const fn timeout(kind: TimeoutKind, duration: Duration) -> Self {
         Self::Timeout(TimeoutError { kind, duration })
     }
 
-    pub fn client_total_timeout(d: Duration) -> Self {
+    pub const fn client_total_timeout(d: Duration) -> Self {
         Self::timeout(TimeoutKind::ClientTotal, d)
     }
-    pub fn client_connect_timeout(d: Duration) -> Self {
+    pub const fn client_connect_timeout(d: Duration) -> Self {
         Self::timeout(TimeoutKind::ClientConnect, d)
     }
-    pub fn client_write_timeout(d: Duration) -> Self {
+    pub const fn client_write_timeout(d: Duration) -> Self {
         Self::timeout(TimeoutKind::ClientWrite, d)
     }
-    pub fn client_continue_timeout(d: Duration) -> Self {
+    pub const fn client_continue_timeout(d: Duration) -> Self {
         Self::timeout(TimeoutKind::ClientContinue, d)
     }
-    pub fn server_header_read_timeout(d: Duration) -> Self {
+    pub const fn server_header_read_timeout(d: Duration) -> Self {
         Self::timeout(TimeoutKind::ServerHeaderRead, d)
     }
-    pub fn server_body_read_timeout(d: Duration) -> Self {
+    pub const fn server_body_read_timeout(d: Duration) -> Self {
         Self::timeout(TimeoutKind::ServerBodyRead, d)
     }
-    pub fn server_write_timeout(d: Duration) -> Self {
+    pub const fn server_write_timeout(d: Duration) -> Self {
         Self::timeout(TimeoutKind::ServerWrite, d)
     }
-    pub fn server_idle_timeout(d: Duration) -> Self {
+    pub const fn server_idle_timeout(d: Duration) -> Self {
         Self::timeout(TimeoutKind::ServerIdle, d)
     }
 }
@@ -403,7 +403,7 @@ pub enum ConfigError {
     #[error("service '{service}' has no handlers")]
     ServiceWithoutHandlers { service: String },
 
-    /// A service was registered without `ServiceOptions` carrying an ISTag.
+    /// A service was registered without `ServiceOptions` carrying an `ISTag`.
     #[error("service '{service}' must configure ServiceOptions with an explicit ISTag")]
     MissingServiceOptions { service: String },
 

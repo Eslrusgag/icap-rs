@@ -102,7 +102,7 @@ impl ServerBuilder {
     /// See [`ServerTimeouts`] for the meaning of each field. Defaults are
     /// `None` (no timeout); fields not set on the supplied value disable the
     /// corresponding deadline.
-    pub fn with_timeouts(mut self, timeouts: ServerTimeouts) -> Self {
+    pub const fn with_timeouts(mut self, timeouts: ServerTimeouts) -> Self {
         self.timeouts = timeouts;
         self
     }
@@ -354,7 +354,7 @@ fn validate_builder_config(
         if let Err(err) = options.validate() {
             return Err(ConfigError::InvalidServiceOptions {
                 service: service.clone(),
-                reason: err.to_string(),
+                reason: err,
             }
             .into());
         }

@@ -151,7 +151,7 @@ impl ClientBuilder {
     /// ```
     ///
     /// is equivalent to mutating `tos.connect` before passing it in.
-    pub fn with_timeouts(mut self, timeouts: ClientTimeouts) -> Self {
+    pub const fn with_timeouts(mut self, timeouts: ClientTimeouts) -> Self {
         self.timeouts = timeouts;
         self
     }

@@ -706,9 +706,7 @@ mod section_6_3_chunk_trailers {
                 if let Some(tx) = tx {
                     let _ = tx.send(req.chunk_trailers().clone());
                 }
-                Ok::<Response, icap_rs::HandlerError>(
-                    Response::no_content().try_set_istag(ISTAG)?,
-                )
+                Ok::<Response, icap_rs::HandlerError>(Response::no_content().try_set_istag(ISTAG)?)
             }
         };
 
@@ -717,13 +715,19 @@ mod section_6_3_chunk_trailers {
             .route_reqmod(
                 "svc",
                 handler,
-                Some(ServiceOptions::new().with_static_istag(ISTAG).with_service("Trailer test")),
+                Some(
+                    ServiceOptions::new()
+                        .with_static_istag(ISTAG)
+                        .with_service("Trailer test"),
+                ),
             )
             .build()
             .await
             .expect("build server");
 
-        tokio::spawn(async move { let _ = server.run().await; });
+        tokio::spawn(async move {
+            let _ = server.run().await;
+        });
         tokio::time::sleep(Duration::from_millis(50)).await;
         port
     }
@@ -740,8 +744,7 @@ mod section_6_3_chunk_trailers {
         // Build the embedded HTTP request head (unchunked).
         let http_req_head = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
         // Chunked body: one data chunk + zero chunk + trailer + empty line.
-        let http_body_chunked =
-            b"5\r\nhello\r\n0\r\nX-Checksum: abc123\r\n\r\n";
+        let http_body_chunked = b"5\r\nhello\r\n0\r\nX-Checksum: abc123\r\n\r\n";
 
         let req_body_offset = http_req_head.len();
         let encapsulated = format!("req-hdr=0, req-body={req_body_offset}");
@@ -759,9 +762,18 @@ mod section_6_3_chunk_trailers {
         let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
             .await
             .expect("connect");
-        stream.write_all(icap_headers.as_bytes()).await.expect("write headers");
-        stream.write_all(http_req_head).await.expect("write http head");
-        stream.write_all(http_body_chunked).await.expect("write chunked body");
+        stream
+            .write_all(icap_headers.as_bytes())
+            .await
+            .expect("write headers");
+        stream
+            .write_all(http_req_head)
+            .await
+            .expect("write http head");
+        stream
+            .write_all(http_body_chunked)
+            .await
+            .expect("write chunked body");
         stream.flush().await.expect("flush");
 
         // Read and discard the 204 response (handler returned no-content).
@@ -778,7 +790,10 @@ mod section_6_3_chunk_trailers {
             .get("x-checksum")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
-        assert_eq!(checksum, "abc123", "X-Checksum trailer must be present and equal abc123");
+        assert_eq!(
+            checksum, "abc123",
+            "X-Checksum trailer must be present and equal abc123"
+        );
     }
 
     /// RFC 3507 §6.3 — server handles requests with no chunk trailers normally.
@@ -808,9 +823,18 @@ mod section_6_3_chunk_trailers {
         let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
             .await
             .expect("connect");
-        stream.write_all(icap_headers.as_bytes()).await.expect("write headers");
-        stream.write_all(http_req_head).await.expect("write http head");
-        stream.write_all(http_body_chunked).await.expect("write chunked body");
+        stream
+            .write_all(icap_headers.as_bytes())
+            .await
+            .expect("write headers");
+        stream
+            .write_all(http_req_head)
+            .await
+            .expect("write http head");
+        stream
+            .write_all(http_body_chunked)
+            .await
+            .expect("write chunked body");
         stream.flush().await.expect("flush");
 
         let mut buf = vec![0u8; 4096];
@@ -820,7 +844,10 @@ mod section_6_3_chunk_trailers {
             .await
             .expect("timeout")
             .expect("recv");
-        assert!(trailers.is_empty(), "chunk_trailers() must be empty when no trailers are present");
+        assert!(
+            trailers.is_empty(),
+            "chunk_trailers() must be empty when no trailers are present"
+        );
     }
 
     /// RFC 3507 §6.3 — client receives and parses chunk trailers in ICAP response.
@@ -847,7 +874,8 @@ mod section_6_3_chunk_trailers {
             let res_hdr_offset = 0usize;
             let res_body_offset = http_resp_head.len();
             let enc = format!("res-hdr={res_hdr_offset}, res-body={res_body_offset}");
-            let body_bytes: Vec<u8> = [http_resp_head.as_ref(), http_body_chunked.as_ref()].concat();
+            let body_bytes: Vec<u8> =
+                [http_resp_head.as_ref(), http_body_chunked.as_ref()].concat();
             let icap_resp = format!(
                 "ICAP/1.0 200 OK\r\n\
                  ISTag: \"rfc3507\"\r\n\
@@ -855,7 +883,9 @@ mod section_6_3_chunk_trailers {
                  \r\n"
             );
 
-            sock.write_all(icap_resp.as_bytes()).await.expect("write resp head");
+            sock.write_all(icap_resp.as_bytes())
+                .await
+                .expect("write resp head");
             sock.write_all(&body_bytes).await.expect("write resp body");
             sock.flush().await.expect("flush");
         });
@@ -872,14 +902,19 @@ mod section_6_3_chunk_trailers {
              Encapsulated: null-body=0\r\n\
              \r\n"
         );
-        stream.write_all(req.as_bytes()).await.expect("write request");
+        stream
+            .write_all(req.as_bytes())
+            .await
+            .expect("write request");
         stream.flush().await.expect("flush");
 
         let mut raw = Vec::new();
         let mut tmp = [0u8; 4096];
         loop {
             let n = stream.read(&mut tmp).await.expect("read");
-            if n == 0 { break; }
+            if n == 0 {
+                break;
+            }
             raw.extend_from_slice(&tmp[..n]);
             if raw.windows(4).any(|w| w == b"\r\n\r\n") && raw.ends_with(b"\r\n") {
                 break;
