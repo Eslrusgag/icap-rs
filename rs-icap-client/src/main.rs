@@ -461,13 +461,12 @@ async fn main() -> IcapResult<()> {
                 .status(StatusCode::OK)
                 .version(Version::HTTP_10);
 
-            // Simple `Date` and `Last-Modified` similar to c-icap-client output (local time)
-            let now_local = Local::now();
-            let http_date_simple = now_local.format("%a %b %d %H:%M:%S %Y").to_string();
+            // RFC 2822 date with local timezone offset (required by RFC 3507 §4.10.2)
+            let http_date_rfc2822 = Local::now().to_rfc2822();
 
             httpb = httpb
-                .header("Date", http_date_simple.as_str())
-                .header("Last-Modified", http_date_simple.as_str());
+                .header("Date", http_date_rfc2822.as_str())
+                .header("Last-Modified", http_date_rfc2822.as_str());
 
             if let Some(len) = file_len_opt {
                 httpb = httpb.header("Content-Length", len.to_string());
