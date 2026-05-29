@@ -6,9 +6,12 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 
+use tokio_util::task::TaskTracker;
+
 use crate::error::IcapResult;
 use crate::request::{IncomingRequest, RequestParserMode};
 use crate::server::timeouts::ServerTimeouts;
+use crate::server::{ShutdownEvent, default_shutdown_handler};
 #[cfg(feature = "tls-rustls")]
 use crate::tls::ServerTlsConfig;
 use crate::{Method, ServiceOptions};
@@ -22,7 +25,6 @@ use super::router::{HandlerEntry, RequestHandler, RouteEntry, RouteOutput, resol
 ///
 /// Duplicate registration of the **same (service, method)** panics with a clear error,
 /// like axum.
-#[derive(Default)]
 #[must_use]
 pub struct ServerBuilder {
     bind_addr: Option<String>,
@@ -32,8 +34,28 @@ pub struct ServerBuilder {
     default_service: Option<String>,
     request_parser_mode: RequestParserMode,
     timeouts: ServerTimeouts,
+    shutdown_handler: Arc<dyn Fn(ShutdownEvent) + Send + Sync>,
+    task_tracker: Option<TaskTracker>,
     #[cfg(feature = "tls-rustls")]
     tls: Option<ServerTlsConfig>,
+}
+
+impl Default for ServerBuilder {
+    fn default() -> Self {
+        Self {
+            bind_addr: None,
+            routes: HashMap::new(),
+            max_connections_global: None,
+            aliases: HashMap::new(),
+            default_service: None,
+            request_parser_mode: RequestParserMode::default(),
+            timeouts: ServerTimeouts::default(),
+            shutdown_handler: Arc::new(default_shutdown_handler),
+            task_tracker: None,
+            #[cfg(feature = "tls-rustls")]
+            tls: None,
+        }
+    }
 }
 
 impl ServerBuilder {
@@ -104,6 +126,47 @@ impl ServerBuilder {
     /// corresponding deadline.
     pub const fn with_timeouts(mut self, timeouts: ServerTimeouts) -> Self {
         self.timeouts = timeouts;
+        self
+    }
+
+    /// Register a callback that is called with [`ShutdownEvent`] during graceful shutdown.
+    ///
+    /// The handler runs synchronously inside the accept loop task — keep it fast.
+    /// Use it for custom logging, metrics, or alerting. When not set, the server
+    /// logs via [`tracing::warn`] by default.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use icap_rs::{IcapResult, Server, ShutdownEvent};
+    ///
+    /// #[tokio::main]
+    /// async fn main() -> IcapResult<()> {
+    ///     let server = Server::builder()
+    ///         .bind("127.0.0.1:1344")
+    ///         .on_shutdown_event(|event| match event {
+    ///             ShutdownEvent::Draining { active_connections, drain_timeout } => {
+    ///                 eprintln!("[shutdown] {active_connections} connection(s) still active");
+    ///                 if let Some(d) = drain_timeout {
+    ///                     eprintln!("[shutdown] force-close in {d:.1?}");
+    ///                 }
+    ///             }
+    ///             ShutdownEvent::DrainTimedOut { remaining_connections } => {
+    ///                 eprintln!("[shutdown] timed out, cancelling {remaining_connections}");
+    ///             }
+    ///             _ => {}
+    ///         })
+    ///         .build()
+    ///         .await?;
+    ///
+    ///     server.run_until(async { tokio::signal::ctrl_c().await.ok(); }).await
+    /// }
+    /// ```
+    pub fn on_shutdown_event<F>(mut self, handler: F) -> Self
+    where
+        F: Fn(ShutdownEvent) + Send + Sync + 'static,
+    {
+        self.shutdown_handler = Arc::new(handler);
         self
     }
 
@@ -275,6 +338,45 @@ impl ServerBuilder {
         self
     }
 
+    /// Register a [`TaskTracker`] for user-owned background tasks.
+    ///
+    /// After all active connections drain following a shutdown signal, the server
+    /// calls [`TaskTracker::close`] on the tracker and waits for all tracked tasks
+    /// to finish before returning from [`Server::run_until`].
+    ///
+    /// If a drain timeout is configured via [`ServerTimeouts::with_shutdown_drain`],
+    /// the remaining budget is shared: once the drain deadline fires the tracker
+    /// wait is skipped and the server returns immediately.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use icap_rs::{IcapResult, Server};
+    /// use tokio_util::task::TaskTracker;
+    ///
+    /// #[tokio::main]
+    /// async fn main() -> IcapResult<()> {
+    ///     let tracker = TaskTracker::new();
+    ///
+    ///     // Spawn a background task and track it so the server waits for it on shutdown.
+    ///     tracker.spawn(async {
+    ///         // background work ...
+    ///     });
+    ///
+    ///     let server = Server::builder()
+    ///         .bind("127.0.0.1:1344")
+    ///         .with_task_tracker(tracker)
+    ///         .build()
+    ///         .await?;
+    ///
+    ///     server.run_until(async { tokio::signal::ctrl_c().await.ok(); }).await
+    /// }
+    /// ```
+    pub fn with_task_tracker(mut self, tracker: TaskTracker) -> Self {
+        self.task_tracker = Some(tracker);
+        self
+    }
+
     /// Finalize the builder and create a [`Server`].
     pub async fn build(self) -> IcapResult<Server> {
         validate_builder_config(&self.routes, &self.aliases, self.default_service.as_deref())?;
@@ -302,6 +404,8 @@ impl ServerBuilder {
             default_service: self.default_service,
             request_parser_mode: self.request_parser_mode,
             timeouts: self.timeouts,
+            shutdown_handler: self.shutdown_handler,
+            task_tracker: self.task_tracker,
 
             #[cfg(feature = "tls-rustls")]
             tls,

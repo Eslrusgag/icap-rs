@@ -21,7 +21,7 @@ pub use request::{
 pub use response::{Outgoing, OutgoingResponse, Parsed, ParsedResponse, Response, StatusCode};
 pub use server::{
     BoxError, HandlerError, HandlerResult, IsTagHandle, PreviewDecision, RouteOutput, Server,
-    ServerBuilder, ServerTimeouts, ServiceOptions, TransferBehavior,
+    ServerBuilder, ServerTimeouts, ServiceOptions, ShutdownEvent, TransferBehavior,
 };
 #[cfg(feature = "tls-rustls")]
 pub use tls::{ClientTlsConfig, ServerTlsConfig, TlsError};

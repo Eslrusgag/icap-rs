@@ -40,6 +40,7 @@ http = { workspace = true }
 async-trait = { workspace = true }
 memchr = { workspace = true }
 pin-project-lite = { workspace = true }
+tokio-util = { workspace = true, features = ["rt"] }
 
 # TLS
 rustls = { workspace = true, features = ["std"], optional = true }

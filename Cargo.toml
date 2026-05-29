@@ -20,6 +20,7 @@ icap-rs = { path = "icap-rs" }
 # Async runtime and I/O
 tokio = "1.52.3"
 tokio-rustls = "0.26.4"
+tokio-util = "0.7"
 
 # Protocol/data types
 http = "1.4.0"

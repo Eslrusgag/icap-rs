@@ -1,5 +1,13 @@
 # Architecture
 
+> **For AI agents and new contributors — start here.**
+> This document is the authoritative map of the `icap-rs` codebase.
+> Before reading any source file, read this document in full to understand
+> module ownership, key types, and data-flow invariants. It is intentionally
+> kept concise; every section is load-bearing. The CLAUDE.md files record
+> project principles and contribution rules; this file records *what is actually
+> built and how it fits together*.
+
 This document describes the internal structure of the `icap-rs` crate. Keep it
 up-to-date whenever you add, remove, or materially change a module, public
 type, or data-flow invariant.
@@ -188,15 +196,37 @@ Server::run()                       — convenience wrapper: calls run_until(pen
 Server::run_until(shutdown: F)
   creates watch::channel(false) for shutdown signal
   creates JoinSet to track spawned connection tasks
-  loop (select! between shutdown future and listener.accept()):
-    if shutdown resolves:
-      send true on watch channel → all connections see it
-      break
-    accept TCP connection
-    check connection semaphore → 503 if over limit
-    tasks.spawn(handle_connection(socket, shutdown_rx, …))
+  shutting_down = false
+  drain_timer = sleep(sentinel)     — re-armed when drain starts
 
-  after break: tasks.join_next() until JoinSet is empty → return Ok(())
+  integrated loop (biased select! with four arms):
+
+    arm 1: shutdown future fires (only if !shutting_down)
+      → send true on watch channel (all keep-alive connections close after current request)
+      → shutting_down = true
+      → emit ShutdownEvent::Draining via on_shutdown_event callback
+      → if shutdown_drain timeout configured: reset drain_timer to now + timeout
+
+    arm 2: drain_timer fires (only if drain_timer_armed)
+      → emit ShutdownEvent::DrainTimedOut via on_shutdown_event callback
+      → tasks.abort_all()
+      → return Ok(())   ← skips TaskTracker wait
+
+    arm 3: tasks.join_next() (only if tasks is non-empty)
+      → cleans up finished tasks; tasks.len() stays accurate
+
+    arm 4: listener.accept()
+      → if shutting_down:
+           TLS: graceful TCP close (no TLS handshake before rejecting)
+           plain: fire-and-forget task → write 503 "Service Shutting Down"
+      → if over connection limit: 503 (same as above, inside spawned task)
+      → else: tasks.spawn(handle_connection(socket, shutdown_rx, …))
+
+  loop breaks when shutting_down && tasks.is_empty()
+
+  after loop: if task_tracker registered:
+    tracker.close()
+    tracker.wait() with remaining drain budget (or indefinitely if no timeout)
 
 handle_connection(socket, routes, aliases, shutdown: watch::Receiver<bool>, …)
   loop (keep-alive):
@@ -297,6 +327,53 @@ Route lookup returns a `RouteEntry` containing:
 `RouteOutput` is a sealed trait implemented for:
 - `HandlerResult<Response>` — `PREVIEW_AWARE = false`
 - `HandlerResult<PreviewDecision>` — `PREVIEW_AWARE = true`
+
+---
+
+## Graceful shutdown
+
+Graceful shutdown is triggered by the future passed to `Server::run_until`.
+The shutdown sequence has two phases that run inside the **same** accept loop
+(not two separate loops):
+
+### Phase 1 — drain
+
+When the shutdown future resolves:
+- A `watch::channel` broadcasts `true`; every keep-alive connection loop sees
+  this and closes after completing its current in-flight request.
+- The accept loop keeps running. New TCP connections receive a fire-and-forget
+  `503 Service Shutting Down` response. For TLS, only a TCP FIN is sent (no
+  handshake before rejecting).
+- `ShutdownEvent::Draining` is delivered to the user callback registered via
+  `ServerBuilder::on_shutdown_event`. If no callback is registered, the default
+  handler logs via `tracing::warn`.
+- If `ServerTimeouts::shutdown_drain` is set, a re-armable `tokio::time::Sleep`
+  timer is activated. When it fires, `ShutdownEvent::DrainTimedOut` is delivered,
+  all tasks are aborted, and `run_until` returns immediately.
+
+The loop exits (normally) when `shutting_down == true && tasks.is_empty()`.
+
+### Phase 2 — user background tasks
+
+After all ICAP connections drain, if a `TaskTracker` was registered via
+`ServerBuilder::with_task_tracker`:
+1. `tracker.close()` is called — this prevents new spawns on the tracker.
+2. `tracker.wait()` blocks until all tracked tasks complete.
+3. If a drain timeout was configured, the **remaining** budget from phase 1 is
+   used as the deadline for this wait. If the budget is already exhausted the
+   wait is skipped.
+
+This lets applications that spawn background work (queue consumers, flush loops,
+metrics emitters) guarantee their tasks finish before the process exits, without
+coordinating a separate shutdown channel.
+
+### Key types for shutdown
+
+| Type | Where defined | Purpose |
+|---|---|---|
+| `ShutdownEvent` | `server.rs` | `#[non_exhaustive]` enum delivered to user callback; variants `Draining`, `DrainTimedOut` |
+| `ServerTimeouts::shutdown_drain` | `server/timeouts.rs` | `Option<Duration>` — how long to wait before aborting in-flight connections |
+| `TaskTracker` | `tokio_util::task` | Third-party type; registered via `ServerBuilder::with_task_tracker` |
 
 ---
 

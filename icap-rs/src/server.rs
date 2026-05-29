@@ -73,13 +73,13 @@ pub use timeouts::ServerTimeouts;
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
-#[cfg(feature = "tls-rustls")]
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinSet;
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
+use tokio_util::task::TaskTracker;
 use tracing::{error, trace, warn};
 
 use crate::error::IcapResult;
@@ -89,6 +89,87 @@ use crate::{Response, StatusCode};
 use router::RouteEntry;
 #[cfg(feature = "tls-rustls")]
 use tokio_rustls::TlsAcceptor;
+
+/// An event emitted during graceful shutdown.
+///
+/// Register a handler with [`ServerBuilder::on_shutdown_event`] to receive these.
+/// When no handler is registered, the server logs via [`tracing::warn`] by default.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use icap_rs::{IcapResult, Server, ShutdownEvent};
+///
+/// #[tokio::main]
+/// async fn main() -> IcapResult<()> {
+///     let server = Server::builder()
+///         .bind("127.0.0.1:1344")
+///         .on_shutdown_event(|event| match event {
+///             ShutdownEvent::Draining { active_connections, drain_timeout } => {
+///                 eprintln!("shutting down: {active_connections} connections in flight");
+///                 if let Some(d) = drain_timeout {
+///                     eprintln!("force-close in {d:.1?}");
+///                 }
+///             }
+///             ShutdownEvent::DrainTimedOut { remaining_connections } => {
+///                 eprintln!("drain timed out, cancelling {remaining_connections} connections");
+///             }
+///             _ => {}
+///         })
+///         .build()
+///         .await?;
+///
+///     server.run_until(async { tokio::signal::ctrl_c().await.ok(); }).await
+/// }
+/// ```
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub enum ShutdownEvent {
+    /// Shutdown signal received; drain phase starting.
+    ///
+    /// New connections are refused with `503 Service Unavailable`.
+    /// `active_connections` are still processing requests.
+    /// If `drain_timeout` is set, remaining connections will be force-cancelled after it expires.
+    Draining {
+        /// Number of connections still in flight.
+        active_connections: usize,
+        /// How long until in-flight connections are force-cancelled, if configured.
+        drain_timeout: Option<Duration>,
+    },
+    /// Drain deadline expired; remaining connections are being cancelled.
+    DrainTimedOut {
+        /// Number of connections that are being cancelled.
+        remaining_connections: usize,
+    },
+}
+
+fn default_shutdown_handler(event: ShutdownEvent) {
+    match event {
+        ShutdownEvent::Draining {
+            active_connections,
+            drain_timeout: Some(d),
+        } => warn!(
+            connections = %active_connections,
+            "shutting down; draining {active_connections} active connection(s); \
+             new connections will be refused; force-close in {d:.1?}",
+        ),
+        ShutdownEvent::Draining {
+            active_connections,
+            drain_timeout: None,
+        } => warn!(
+            connections = %active_connections,
+            "shutting down; draining {active_connections} active connection(s); \
+             new connections will be refused",
+        ),
+        ShutdownEvent::DrainTimedOut {
+            remaining_connections,
+        } => warn!(
+            connections = %remaining_connections,
+            "shutdown drain timeout expired; \
+             cancelling {remaining_connections} remaining connection(s)",
+        ),
+    }
+}
 
 /// ICAP server.
 ///
@@ -128,6 +209,8 @@ pub struct Server {
     default_service: Option<String>,
     request_parser_mode: RequestParserMode,
     timeouts: ServerTimeouts,
+    shutdown_handler: Arc<dyn Fn(ShutdownEvent) + Send + Sync>,
+    task_tracker: Option<TaskTracker>,
     #[cfg(feature = "tls-rustls")]
     tls: Option<(TlsAcceptor, Duration)>,
 }
@@ -186,42 +269,84 @@ impl Server {
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let mut tasks: JoinSet<()> = JoinSet::new();
+        let mut shutting_down = false;
+        let mut drain_timer_armed = false;
+        let mut drain_deadline: Option<tokio::time::Instant> = None;
 
-        tokio::pin!(shutdown);
+        // Sentinel timer far in the future; reset to a real deadline when drain begins.
+        let drain_timer = sleep(Duration::from_secs(365 * 24 * 3600));
+        tokio::pin!(shutdown, drain_timer);
 
         loop {
+            // Break as soon as the shutdown is complete and all connections have finished.
+            if shutting_down && tasks.is_empty() {
+                break;
+            }
+
             tokio::select! {
                 biased;
 
-                () = &mut shutdown => {
-                    // Signal all active connections to close after their current request.
+                () = &mut shutdown, if !shutting_down => {
                     let _ = shutdown_tx.send(true);
+                    shutting_down = true;
                     let active = tasks.len();
-                    if active > 0 {
-                        if let Some(d) = self.timeouts.shutdown_drain {
-                            warn!(
-                                addr=%local_addr,
-                                connections=%active,
-                                "shutting down; draining {active} active connection(s); \
-                                 new connections will be refused; \
-                                 force-close in {d:.1?}",
-                            );
-                        } else {
-                            warn!(
-                                addr=%local_addr,
-                                connections=%active,
-                                "shutting down; draining {active} active connection(s); \
-                                 new connections will be refused",
-                            );
-                        }
-                    } else {
-                        trace!(addr=%local_addr, "shutting down; no active connections");
+                    if active == 0 {
+                        break;
                     }
-                    break;
+                    (self.shutdown_handler)(ShutdownEvent::Draining {
+                        active_connections: active,
+                        drain_timeout: self.timeouts.shutdown_drain,
+                    });
+                    if let Some(d) = self.timeouts.shutdown_drain {
+                        let deadline = tokio::time::Instant::now() + d;
+                        drain_timer.as_mut().reset(deadline);
+                        drain_deadline = Some(deadline);
+                        drain_timer_armed = true;
+                    }
                 }
+
+                () = &mut drain_timer, if drain_timer_armed => {
+                    let remaining = tasks.len();
+                    (self.shutdown_handler)(ShutdownEvent::DrainTimedOut {
+                        remaining_connections: remaining,
+                    });
+                    tasks.abort_all();
+                    while tasks.join_next().await.is_some() {}
+                    trace!(addr=%local_addr, "ICAP server stopped");
+                    return Ok(());
+                }
+
+                // Poll finished tasks continuously so tasks.len() stays accurate and
+                // we detect when the last in-flight connection completes during drain.
+                Some(_) = tasks.join_next(), if !tasks.is_empty() => {}
 
                 accept_result = self.listener.accept() => {
                     let (socket, addr) = accept_result?;
+
+                    if shutting_down {
+                        // Refuse new connections during drain with 503.
+                        // For TLS, close the raw TCP socket — no handshake before rejecting.
+                        trace!(client=%addr, "refusing connection: server is shutting down");
+                        #[cfg(feature = "tls-rustls")]
+                        if self.tls.is_some() {
+                            tokio::spawn(async move {
+                                let mut s = socket;
+                                let _ = s.shutdown().await;
+                            });
+                            continue;
+                        }
+                        tokio::spawn(async move {
+                            let mut s = socket;
+                            let _ = Self::write_wire_error_response(
+                                &mut s,
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                "Service Shutting Down",
+                            )
+                            .await;
+                        });
+                        continue;
+                    }
+
                     trace!(client=%addr, "new connection");
 
                     let (permit_opt, over_limit) = self.conn_limit.as_ref().map_or_else(
@@ -329,27 +454,21 @@ impl Server {
             }
         }
 
-        // Wait for all in-flight connections to complete.
-        if let Some(drain_timeout) = self.timeouts.shutdown_drain {
-            if timeout(drain_timeout, async {
-                while tasks.join_next().await.is_some() {}
-            })
-            .await
-            .is_err()
-            {
-                let remaining = tasks.len();
-                warn!(
-                    addr=%local_addr,
-                    connections=%remaining,
-                    "shutdown drain timeout ({drain_timeout:.1?}) expired; \
-                     cancelling {remaining} remaining connection(s)",
-                );
-                tasks.abort_all();
-                while tasks.join_next().await.is_some() {}
+        // After all connections drain, wait for any user-registered background tasks.
+        if let Some(ref tracker) = self.task_tracker {
+            tracker.close();
+            match drain_deadline {
+                Some(deadline) => {
+                    let remaining =
+                        deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if !remaining.is_zero() {
+                        let _ = timeout(remaining, tracker.wait()).await;
+                    }
+                }
+                None => tracker.wait().await,
             }
-        } else {
-            while tasks.join_next().await.is_some() {}
         }
+
         trace!(addr=%local_addr, "ICAP server stopped");
         Ok(())
     }

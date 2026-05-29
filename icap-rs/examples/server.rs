@@ -4,13 +4,16 @@
 // - blocker:   returns ICAP 200 with an encapsulated HTTP 403 "Blocked!" page (for REQMOD & RESPMOD)
 
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use http::{HeaderMap, Response as HttpResponse, StatusCode as HttpStatus, Version};
 use icap_rs::request::{EmbeddedHttp, IncomingRequest};
 use icap_rs::response::Response;
 use icap_rs::server::Server;
 use icap_rs::server::options::ServiceOptions;
-use icap_rs::{Body, Method};
+use icap_rs::server::timeouts::ServerTimeouts;
+use icap_rs::{Body, Method, ShutdownEvent};
+use tokio_util::task::TaskTracker;
 use tracing::{info, warn};
 
 const ISTAG_REQMOD_INIT: &str = "reqmod-1.0";
@@ -23,6 +26,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::TRACE)
         .init();
+
+    // Background task tracker: tracks tasks the application wants to finish before exit.
+    // Pass it to the server so run_until() waits for them after connections drain.
+    let tracker = TaskTracker::new();
+
+    // Example: a background task that keeps running until the tracker is closed.
+    tracker.spawn({
+        async move {
+            info!("background task started");
+            // In a real application this might be a queue consumer, metrics flusher, etc.
+            // TaskTracker::wait() returns only after close() is called AND all spawned
+            // tasks complete, so this task will be awaited during graceful shutdown.
+            tokio::time::sleep(Duration::from_millis(10000)).await;
+            info!("background task finished");
+        }
+    });
 
     // Shared, mutable ISTag sources per service
     let req_tag = Arc::new(RwLock::new(String::from(ISTAG_REQMOD_INIT)));
@@ -183,10 +202,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             },
             Some(blocker_opts),
         )
+        .with_timeouts(
+            ServerTimeouts::new().with_shutdown_drain(Duration::from_secs(30)),
+        )
+        .with_task_tracker(tracker)
+        .on_shutdown_event(|event| match event {
+            ShutdownEvent::Draining {
+                active_connections,
+                drain_timeout,
+            } => {
+                warn!(
+                    "server shutting down — {active_connections} connection(s) still active; \
+                     new connections will be refused"
+                );
+                if let Some(d) = drain_timeout {
+                    warn!("force-close in {d:.1?}");
+                } else {
+                    warn!("no drain timeout — waiting indefinitely");
+                }
+            }
+            ShutdownEvent::DrainTimedOut {
+                remaining_connections,
+            } => {
+                warn!(
+                    "drain timeout expired — cancelling {remaining_connections} \
+                     remaining connection(s)"
+                );
+            }
+            _ => {}
+        })
         .build()
         .await?;
 
     info!("ICAP server started on 127.0.0.1:1344 (services: reqmod, respmod, blocker)");
+    info!("press Ctrl-C to shut down gracefully (30s drain timeout)");
     server.run_until(async { tokio::signal::ctrl_c().await.ok(); }).await?;
     Ok(())
 }
