@@ -202,9 +202,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             },
             Some(blocker_opts),
         )
-        .with_timeouts(
-            ServerTimeouts::new().with_shutdown_drain(Duration::from_secs(30)),
-        )
+        .with_timeouts(ServerTimeouts::new().with_shutdown_drain(Duration::from_secs(30)))
         .with_task_tracker(tracker)
         .on_shutdown_event(|event| match event {
             ShutdownEvent::Draining {
@@ -236,7 +234,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     info!("ICAP server started on 127.0.0.1:1344 (services: reqmod, respmod, blocker)");
     info!("press Ctrl-C to shut down gracefully (30s drain timeout)");
-    server.run_until(async { tokio::signal::ctrl_c().await.ok(); }).await?;
+    server
+        .run_until(async {
+            tokio::signal::ctrl_c().await.ok();
+        })
+        .await?;
     Ok(())
 }
 

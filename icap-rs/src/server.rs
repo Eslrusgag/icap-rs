@@ -459,8 +459,7 @@ impl Server {
             tracker.close();
             match drain_deadline {
                 Some(deadline) => {
-                    let remaining =
-                        deadline.saturating_duration_since(tokio::time::Instant::now());
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
                     if !remaining.is_zero() {
                         let _ = timeout(remaining, tracker.wait()).await;
                     }
