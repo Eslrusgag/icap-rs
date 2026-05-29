@@ -283,13 +283,8 @@ impl Server {
                             }
                         };
                         let preview_method = preview_req.method;
-                        let preview_raw_service = preview_req
-                            .service
-                            .rsplit('/')
-                            .next()
-                            .unwrap_or(&preview_req.service);
                         let preview_service_resolved = resolve_service(
-                            preview_raw_service,
+                            &preview_req.service,
                             &aliases,
                             default_service.as_deref(),
                         );
@@ -431,9 +426,8 @@ impl Server {
                 req.chunk_trailers = trailers;
             }
             let method = req.method;
-            let raw_service: &str = req.service.rsplit('/').next().unwrap_or(&req.service);
             let service_resolved =
-                resolve_service(raw_service, &aliases, default_service.as_deref());
+                resolve_service(&req.service, &aliases, default_service.as_deref());
             trace!(
                 client = %addr,
                 method = ?method,

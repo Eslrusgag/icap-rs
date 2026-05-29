@@ -16,6 +16,7 @@
 //!   via `ClientBuilder::with_tls` to override.
 
 pub mod builder;
+pub mod options_cache;
 pub mod timeouts;
 
 #[cfg(test)]
@@ -25,7 +26,7 @@ use crate::protocol::{
     canon_icap_header, find_double_crlf, parse_encapsulated_header, read_chunked_to_end,
     write_chunk, write_chunk_into,
 };
-use crate::request::{Request, serialize_embedded_http};
+use crate::request::{Request, normalize_service_path, serialize_embedded_http};
 use crate::response::{ParsedResponse, parse_icap_response};
 
 use crate::Method;
@@ -40,6 +41,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::client::builder::{ClientBuilder, ConnectionPolicy};
+use crate::client::options_cache::{CachedOptions, OptionsCache};
 use crate::client::timeouts::ClientTimeouts;
 use crate::net::Conn;
 use tokio::fs::File as TokioFile;
@@ -72,6 +74,7 @@ struct ClientRef {
     #[cfg(feature = "tls-rustls")]
     tls: Option<ClientTlsConnector>,
     idle_conn: Mutex<Option<Conn>>,
+    options_cache: Option<OptionsCache>,
 }
 
 impl Client {
@@ -95,12 +98,69 @@ impl Client {
     /// - handles `Preview` and `100 Continue` negotiation when applicable,
     /// - and returns the parsed ICAP [`ParsedResponse`].
     pub async fn send(&self, req: &Request) -> IcapResult<ParsedResponse> {
-        Box::pin(Self::with_timeout_as(
+        if self.inner.options_cache.is_some() && req.is_mod() {
+            self.ensure_options_cached(req).await;
+        }
+
+        let response = Box::pin(Self::with_timeout_as(
             self.inner.timeouts.operation,
             self.send_inner(req),
             Error::client_total_timeout,
         ))
-        .await
+        .await?;
+
+        if let Some(cache) = &self.inner.options_cache
+            && req.is_mod()
+        {
+            let path = normalize_service_path(&req.service);
+            let observed = response.get_header("ISTag").and_then(|v| v.to_str().ok());
+            cache
+                .reconcile_istag(&self.inner.host, self.inner.port, &path, observed)
+                .await;
+        }
+
+        Ok(response)
+    }
+
+    /// Drop all cached `OPTIONS` results, forcing a re-fetch on the next request.
+    ///
+    /// No-op when the OPTIONS cache (see
+    /// [`ClientBuilder::with_options_cache`](crate::ClientBuilder::with_options_cache))
+    /// is not enabled.
+    pub async fn invalidate_options_cache(&self) {
+        if let Some(cache) = &self.inner.options_cache {
+            cache.clear().await;
+        }
+    }
+
+    /// Fetch and cache `OPTIONS` for a modification request's service when the
+    /// cache is enabled and no fresh entry exists.
+    ///
+    /// Failures to obtain or cache `OPTIONS` are non-fatal: the caller proceeds
+    /// with the modification request regardless.
+    async fn ensure_options_cached(&self, req: &Request) {
+        let Some(cache) = &self.inner.options_cache else {
+            return;
+        };
+        let path = normalize_service_path(&req.service);
+        if cache
+            .has_fresh(&self.inner.host, self.inner.port, &path)
+            .await
+        {
+            return;
+        }
+        let options_req = Request::options(path.as_str());
+        let Ok(response) = Box::pin(self.send(&options_req)).await else {
+            return;
+        };
+        if !response.is_success() {
+            return;
+        }
+        if let Some(entry) = CachedOptions::from_response(&response, cache.config()) {
+            cache
+                .store(&self.inner.host, self.inner.port, &path, entry)
+                .await;
+        }
     }
 
     async fn send_inner(&self, req: &Request) -> IcapResult<ParsedResponse> {
@@ -514,14 +574,13 @@ impl Client {
 
         let mut out = Vec::with_capacity(512);
 
-        // Start-line
+        // Start-line. `normalize_service_path` yields a leading-slash path
+        // (e.g. `/v1/scan`), matching the form the server parses and routes by.
+        let service_path = normalize_service_path(&req.service);
         write!(
             &mut out,
-            "{} icap://{}:{}/{} ICAP/1.0\r\n",
-            req.method,
-            self.inner.host,
-            self.inner.port,
-            Self::trim_leading_slash(&req.service)
+            "{} icap://{}:{}{} ICAP/1.0\r\n",
+            req.method, self.inner.host, self.inner.port, service_path
         )
         .map_err(Error::Io)?;
 
@@ -629,10 +688,6 @@ impl Client {
             expect_continue: false,
             remaining_body: None,
         })
-    }
-
-    fn trim_leading_slash(s: &str) -> &str {
-        s.strip_prefix('/').unwrap_or(s)
     }
 
     /// Acquire a connection according to the configured policy and check for an

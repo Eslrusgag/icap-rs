@@ -32,7 +32,7 @@ The two CLI crates are thin shells. All protocol logic lives in `icap-rs`.
 src/
 ├── lib.rs               re-exports, public constants
 ├── error.rs             hierarchical error types
-├── request.rs           Request<R,D>, Body<R>, EmbeddedHttp<R>, Method
+├── request.rs           Request<R,D>, Body<R>, EmbeddedHttp<R>, Method, normalize_service_path
 ├── response.rs          Response<D>, StatusCode (re-export)
 ├── net.rs               Conn enum (plain TCP | TLS stream)
 ├── protocol/            wire-level parsing and serialization
@@ -43,6 +43,7 @@ src/
 │   └── istag.rs         ISTag validation and quoting
 ├── client/
 │   ├── builder.rs       ClientBuilder, ConnectionPolicy
+│   ├── options_cache.rs OptionsCacheConfig, OptionsCache (client OPTIONS cache)
 │   ├── timeouts.rs      ClientTimeouts
 │   └── client.rs        Client — send / streaming / get_request
 ├── server/
@@ -97,7 +98,7 @@ from client code, or to mutate ICAP request metadata inside a handler.
 ```
 Request<R, D>
   method: Method                   REQMOD | RESPMOD | OPTIONS
-  service: String                  last path segment of the ICAP URI
+  service: String                  full normalized request-URI path (RFC 3507 §6.4)
   icap_headers: HeaderMap
   embedded: Option<EmbeddedHttp<R>>
   preview_size: Option<usize>
@@ -157,6 +158,23 @@ wait, header read, body read, TLS handshake.
 Classifier helpers on `Error`: `is_io()`, `is_timeout()`, `is_protocol()`,
 `is_config()`, `is_early_close()`, `is_retryable()`.
 
+### Client OPTIONS cache (RFC 3507 §4.10 / §5)
+
+Opt-in via `ClientBuilder::with_options_cache(OptionsCacheConfig)`. When enabled,
+`Client` fetches an OPTIONS response per service path once and reuses it for
+later REQMOD/RESPMOD requests until it expires.
+
+| Type | Where | Purpose |
+|---|---|---|
+| `OptionsCacheConfig` | `client/options_cache.rs` | Public config; `default_ttl` is the fallback lifetime used when a response has no `Options-TTL` |
+| `OptionsCache` | `client/options_cache.rs` | `pub(crate)` store — `RwLock<HashMap<(host, port, path), CachedOptions>>`; held as `ClientRef::options_cache: Option<OptionsCache>` |
+| `CachedOptions` | `client/options_cache.rs` | `pub(crate)` entry — captured `ISTag` + `expires_at` |
+
+Lifetime = `Options-TTL` header (seconds) when present, else
+`OptionsCacheConfig::default_ttl`; with neither, the response is not cached. A
+changed `ISTag` observed on a later REQMOD/RESPMOD response invalidates the
+entry; `Client::invalidate_options_cache()` clears every entry on demand.
+
 ---
 
 ## Data flows
@@ -167,6 +185,10 @@ Classifier helpers on `Error`: `is_io()`, `is_timeout()`, `is_protocol()`,
 ClientBuilder::build() → Client
 
 Client::send(req)
+  0. if OPTIONS cache enabled and req.is_mod():            (RFC 3507 §4.10 / §5)
+       if no fresh CachedOptions for (host, port, normalize_service_path(service)):
+         send an OPTIONS for that path, parse Options-TTL / ISTag,
+         store a CachedOptions entry (skipped silently on any failure)
   1. acquire / create Conn (plain TCP or TLS via ClientTlsConnector)
   2. build_icap_request_bytes(req)
        → compute Encapsulated offsets
@@ -182,7 +204,14 @@ Client::send(req)
        parse_icap_response_head → status, headers
        dechunk_response_body_if_needed → dechunked body + chunk trailers (RFC 7230 §4.1.2)
   8. store / release Conn based on ConnectionPolicy
+  9. if OPTIONS cache enabled and req.is_mod():            (RFC 3507 §5)
+       if response ISTag differs from the cached one: invalidate the entry
 ```
+
+The OPTIONS cache is opt-in via `ClientBuilder::with_options_cache`; when it is
+not configured, steps 0 and 9 are skipped and `send` behaves exactly as before
+(no automatic OPTIONS). `Client::invalidate_options_cache()` drops every cached
+entry on demand.
 
 Streaming variant (`send_streaming_reader`) skips step 2 body buffering — the
 body is written chunk-by-chunk from an `AsyncRead` source after the headers.
@@ -310,11 +339,26 @@ allowing a `204 No Content` response without `100 Continue`. Validated by
 
 ## Service routing
 
+Services are identified by the **full request-URI path** (RFC 3507 §6.4), the
+same way HTTP distinguishes resources: `/v1/scan` and `/v2/scan` are distinct
+services, and the trailing segment alone (`/scan`) is not a fallback. The path
+form is canonicalized in exactly one place — `normalize_service_path` in
+`request.rs` — which is applied on three sides so they always agree on the key:
+
+- the request parser, when extracting `Request.service` from the request line
+  (`icap://host:port/v1/scan` → `/v1/scan`);
+- the client, when building the outgoing request-URI from `Request.service`;
+- the server builder, when registering `route`/`alias`/`default_service` keys.
+
+Normalization: strips an `icap[s]://authority` prefix to the path, forces a
+single leading `/`, drops the trailing `/` (except root), and maps `*`/empty to
+the root `/`.
+
 ```
-resolve_service(raw_path, aliases, default_service)
-  1. if path is "" or "/" and default_service is set → use default
+resolve_service(path, aliases, default_service)   // path already normalized
+  1. if path is "/" and default_service is set → use default
   2. apply alias table (up to 4 rewrites to break cycles)
-  3. return resolved name (borrowed from input or owned alias target)
+  3. return resolved path (borrowed from input or owned alias target)
 ```
 
 Route lookup returns a `RouteEntry` containing:

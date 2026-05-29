@@ -1,3 +1,4 @@
+use crate::client::options_cache::{OptionsCache, OptionsCacheConfig};
 use crate::client::timeouts::ClientTimeouts;
 use crate::client::{Client, ClientRef, parse_authority_with_scheme};
 #[cfg(feature = "tls-rustls")]
@@ -36,6 +37,9 @@ pub struct ClientBuilder {
     default_headers: HeaderMap,
     connection_policy: ConnectionPolicy,
     timeouts: ClientTimeouts,
+
+    // OPTIONS cache. `None` keeps the legacy behavior (no automatic OPTIONS).
+    options_cache: Option<OptionsCacheConfig>,
 
     // TLS state. `tls` is the user-supplied config (explicit `with_tls`),
     // `auto_tls` records whether `with_uri("icaps://...")` requested TLS.
@@ -195,6 +199,34 @@ impl ClientBuilder {
         self
     }
 
+    /// Enable client-side caching of `OPTIONS` responses (RFC 3507 §4.10 / §5).
+    ///
+    /// When enabled, the client fetches `OPTIONS` for a service once and reuses
+    /// it for subsequent `REQMOD`/`RESPMOD` requests until it expires. The
+    /// lifetime comes from the server's `Options-TTL` header, falling back to
+    /// [`OptionsCacheConfig::default_ttl`] when the header is absent; with
+    /// neither, the response is not cached. A changed `ISTag` on a later
+    /// modification response invalidates the cached entry.
+    ///
+    /// Caching is opt-in: without this call the client never sends `OPTIONS`
+    /// automatically.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use icap_rs::{Client, OptionsCacheConfig};
+    ///
+    /// let client = Client::builder()
+    ///     .host("127.0.0.1")
+    ///     .with_options_cache(OptionsCacheConfig::new().with_default_ttl(Duration::from_secs(60)))
+    ///     .build();
+    /// ```
+    pub const fn with_options_cache(mut self, config: OptionsCacheConfig) -> Self {
+        self.options_cache = Some(config);
+        self
+    }
+
     /// Configure the builder from an ICAP URI (`icap://...` or `icaps://...`).
     ///
     /// This extracts `host` and `port` for use in the TCP connection. The service
@@ -269,6 +301,8 @@ impl ClientBuilder {
             cfg.map(ClientTlsConfig::into_connector)
         };
 
+        let options_cache = self.options_cache.map(OptionsCache::new);
+
         Client {
             inner: Arc::new(ClientRef {
                 host,
@@ -280,6 +314,7 @@ impl ClientBuilder {
                 #[cfg(feature = "tls-rustls")]
                 tls,
                 idle_conn: Mutex::new(None),
+                options_cache,
             }),
         }
     }

@@ -11,7 +11,7 @@ use icap_rs::request::{IncomingRequest, Request};
 use icap_rs::response::{ParsedResponse, Response, StatusCode};
 use icap_rs::server::options::{ServiceOptions, TransferBehavior};
 use icap_rs::server::{PreviewDecision, Server};
-use icap_rs::{Client, Method};
+use icap_rs::{Client, Method, OptionsCacheConfig};
 use std::net::TcpListener as StdTcpListener;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -665,16 +665,8 @@ mod unsupported_rfc3507_gaps {
     fn unsupported_section_7_1_builtin_authentication() {}
 
     #[test]
-    #[ignore = "partial support only: headers exist, but client-side OPTIONS/cache invalidation model is not implemented"]
-    fn unsupported_section_5_client_cache_semantics() {}
-
-    #[test]
     #[ignore = "partial support only: server advertises Transfer-* but client does not automatically apply transfer policy"]
     fn unsupported_section_4_10_2_automatic_transfer_policy_consumption() {}
-
-    #[test]
-    #[ignore = "partial support only: server routes by final path segment, not full RFC service URI identity"]
-    fn unsupported_section_6_4_full_service_uri_model() {}
 }
 
 // ---------------------------------------------------------------------------
@@ -930,6 +922,290 @@ mod section_6_3_chunk_trailers {
         assert_eq!(
             integrity, "sha256=deadbeef",
             "X-Integrity trailer must be present in client-parsed response"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RFC 3507 §6.4 — Service identity is the full request-URI path
+// ---------------------------------------------------------------------------
+//
+// RFC 3507 §6.4 identifies an ICAP service by its request URI. Two services
+// that differ only in a leading path segment (`/a/scan` vs `/b/scan`) are
+// distinct services, exactly like distinct HTTP resources. These tests verify
+// that the server routes by the full normalized path, not by the final path
+// segment, so the shared trailing segment (`scan`) does not collapse them.
+
+mod section_6_4_service_uri_routing {
+    use super::*;
+
+    fn embedded_http_get() -> HttpRequest<Vec<u8>> {
+        HttpRequest::builder()
+            .method("GET")
+            .uri("http://origin.example/")
+            .version(Version::HTTP_11)
+            .header("Host", "origin.example")
+            .body(Vec::new())
+            .expect("http request")
+    }
+
+    // Two REQMOD services that share the final path segment `scan` but live at
+    // different full paths. Each handler stamps a distinct ISTag so the caller
+    // can tell which route handled the request.
+    async fn start_full_path_routing_server() -> u16 {
+        let port = unused_port();
+        let server = Server::builder()
+            .bind(&format!("127.0.0.1:{port}"))
+            .route_reqmod(
+                "/a/scan",
+                |_req: IncomingRequest| async {
+                    Ok::<Response, icap_rs::HandlerError>(
+                        Response::no_content().try_set_istag("svc-a")?,
+                    )
+                },
+                Some(
+                    ServiceOptions::new()
+                        .with_static_istag("svc-a")
+                        .with_service("Service A"),
+                ),
+            )
+            .route_reqmod(
+                "/b/scan",
+                |_req: IncomingRequest| async {
+                    Ok::<Response, icap_rs::HandlerError>(
+                        Response::no_content().try_set_istag("svc-b")?,
+                    )
+                },
+                Some(
+                    ServiceOptions::new()
+                        .with_static_istag("svc-b")
+                        .with_service("Service B"),
+                ),
+            )
+            .build()
+            .await
+            .expect("build full-path routing server");
+
+        tokio::spawn(async move {
+            let _ = server.run().await;
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        port
+    }
+
+    /// RFC 3507 §6.4 — REQMOD requests to `/a/scan` and `/b/scan` reach distinct
+    /// services even though they share the final path segment `scan`.
+    #[tokio::test]
+    async fn rfc6_4_routes_by_full_path_not_last_segment() {
+        let port = start_full_path_routing_server().await;
+        let client = Client::builder().host("127.0.0.1").port(port).build();
+
+        let resp_a = client
+            .send(
+                &Request::reqmod("/a/scan")
+                    .allow_204()
+                    .with_http_request(embedded_http_get())
+                    .expect("build reqmod /a/scan"),
+            )
+            .await
+            .expect("send /a/scan");
+        let resp_b = client
+            .send(
+                &Request::reqmod("/b/scan")
+                    .allow_204()
+                    .with_http_request(embedded_http_get())
+                    .expect("build reqmod /b/scan"),
+            )
+            .await
+            .expect("send /b/scan");
+
+        assert_eq!(resp_a.status_code(), StatusCode::NO_CONTENT);
+        assert_eq!(resp_b.status_code(), StatusCode::NO_CONTENT);
+
+        let istag_a = resp_a
+            .get_header("ISTag")
+            .expect("ISTag /a/scan")
+            .to_str()
+            .expect("ISTag /a/scan utf8");
+        let istag_b = resp_b
+            .get_header("ISTag")
+            .expect("ISTag /b/scan")
+            .to_str()
+            .expect("ISTag /b/scan utf8");
+
+        assert!(
+            istag_a.contains("svc-a"),
+            "expected /a/scan handler (svc-a), got ISTag {istag_a:?}"
+        );
+        assert!(
+            istag_b.contains("svc-b"),
+            "expected /b/scan handler (svc-b), got ISTag {istag_b:?}"
+        );
+        assert_ne!(
+            istag_a, istag_b,
+            "distinct full paths must resolve to distinct services"
+        );
+    }
+
+    /// RFC 3507 §6.4 — the shared final segment `/scan` is NOT a registered
+    /// service, proving the server no longer falls back to last-segment routing.
+    #[tokio::test]
+    async fn rfc6_4_last_segment_alone_is_not_a_service() {
+        let port = start_full_path_routing_server().await;
+        let client = Client::builder().host("127.0.0.1").port(port).build();
+
+        let resp = client
+            .send(
+                &Request::reqmod("/scan")
+                    .allow_204()
+                    .with_http_request(embedded_http_get())
+                    .expect("build reqmod /scan"),
+            )
+            .await
+            .expect("send /scan");
+
+        assert_eq!(
+            resp.status_code(),
+            StatusCode::NOT_FOUND,
+            "last-segment-only path must not resolve to /a/scan or /b/scan"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RFC 3507 §5 / §4.10 — Client-side OPTIONS caching and ISTag invalidation
+// ---------------------------------------------------------------------------
+//
+// RFC 3507 §4.10 lets a client cache an OPTIONS response and reuse it for
+// subsequent REQMOD/RESPMOD requests until it expires. RFC 3507 §5 requires the
+// client to discard that cached entry when the ISTag observed on a later
+// modification response differs from the one captured at OPTIONS time. These
+// tests verify both behaviors via a minimal raw ICAP server that counts OPTIONS
+// requests and can change the ISTag it advertises.
+
+mod section_5_options_cache {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // Read an ICAP request head up to the first CRLFCRLF. The §5 requests carry
+    // no body (`Encapsulated: null-body=0`), so the head is the whole request.
+    async fn read_icap_head(stream: &mut TcpStream) -> Option<Vec<u8>> {
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 1024];
+        loop {
+            let n = stream.read(&mut tmp).await.ok()?;
+            if n == 0 {
+                return (!buf.is_empty()).then_some(buf);
+            }
+            buf.extend_from_slice(&tmp[..n]);
+            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                return Some(buf);
+            }
+        }
+    }
+
+    // A raw ICAP server that:
+    //   * counts how many OPTIONS requests it received (`options_count`);
+    //   * advertises an ISTag derived from `epoch`, so the test can simulate a
+    //     server configuration change by bumping `epoch`.
+    // Both OPTIONS and modification responses report the same ISTag for a given
+    // epoch, so the client only sees a change after the epoch is bumped.
+    async fn start_counting_options_server() -> (u16, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let options_count = Arc::new(AtomicUsize::new(0));
+        let epoch = Arc::new(AtomicUsize::new(0));
+
+        let oc = Arc::clone(&options_count);
+        let ep = Arc::clone(&epoch);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let oc = Arc::clone(&oc);
+                let ep = Arc::clone(&ep);
+                tokio::spawn(async move {
+                    let Some(head) = read_icap_head(&mut stream).await else {
+                        return;
+                    };
+                    let istag = format!("\"epoch-{}\"", ep.load(Ordering::SeqCst));
+                    let response = if head.starts_with(b"OPTIONS") {
+                        oc.fetch_add(1, Ordering::SeqCst);
+                        format!(
+                            "ICAP/1.0 200 OK\r\nMethods: REQMOD\r\nISTag: {istag}\r\n\
+                             Options-TTL: 3600\r\nEncapsulated: null-body=0\r\n\r\n"
+                        )
+                    } else {
+                        format!(
+                            "ICAP/1.0 204 No Content\r\nISTag: {istag}\r\n\
+                             Encapsulated: null-body=0\r\n\r\n"
+                        )
+                    };
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.flush().await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        (port, options_count, epoch)
+    }
+
+    /// RFC 3507 §5 / §4.10 — with the OPTIONS cache enabled, repeated REQMODs
+    /// reuse a single cached OPTIONS, and a server `ISTag` change forces a
+    /// re-fetch on the following request.
+    #[tokio::test]
+    async fn rfc5_client_caches_options_and_refetches_on_istag_change() {
+        let (port, options_count, epoch) = start_counting_options_server().await;
+        let client = Client::builder()
+            .host("127.0.0.1")
+            .port(port)
+            .with_options_cache(OptionsCacheConfig::new().with_default_ttl(Duration::from_secs(60)))
+            .build();
+
+        // Two REQMODs in a row must share one cached OPTIONS.
+        for _ in 0..2 {
+            let resp = client
+                .send(&Request::reqmod("/scan").allow_204())
+                .await
+                .expect("reqmod");
+            assert_eq!(resp.status_code(), StatusCode::NO_CONTENT);
+        }
+        assert_eq!(
+            options_count.load(Ordering::SeqCst),
+            1,
+            "two REQMODs must reuse a single cached OPTIONS"
+        );
+
+        // Server changes its ISTag, simulating a configuration/version change.
+        epoch.store(1, Ordering::SeqCst);
+
+        // The cached entry is still fresh, so this REQMOD does not re-fetch; it
+        // observes the new ISTag on the response and invalidates the cache.
+        let resp = client
+            .send(&Request::reqmod("/scan").allow_204())
+            .await
+            .expect("reqmod after istag change");
+        assert_eq!(resp.status_code(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            options_count.load(Ordering::SeqCst),
+            1,
+            "the still-fresh cache entry is used before the ISTag mismatch invalidates it"
+        );
+
+        // With the cache invalidated, the next REQMOD re-fetches OPTIONS.
+        let resp = client
+            .send(&Request::reqmod("/scan").allow_204())
+            .await
+            .expect("reqmod refetch");
+        assert_eq!(resp.status_code(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            options_count.load(Ordering::SeqCst),
+            2,
+            "an ISTag change must trigger a fresh OPTIONS fetch"
         );
     }
 }

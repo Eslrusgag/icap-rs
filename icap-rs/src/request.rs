@@ -867,6 +867,54 @@ impl Request<Vec<u8>, Outbound> {
     }
 }
 
+/// Normalize an ICAP service identifier to a canonical request path.
+///
+/// Accepts a full ICAP request-URI (`icap://host:port/v1/scan`), an absolute
+/// path (`/v1/scan`), or a bare service name (`scan`) and returns the canonical
+/// path used for routing: exactly one leading slash, no trailing slash (except
+/// for the root), and `*`/empty mapped to the root `/`.
+///
+/// This is the single source of truth for service-path form. It is applied when
+/// parsing an incoming request line, when a client builds a request-URI, and
+/// when the server registers and resolves routes, so all three agree on the
+/// same key.
+#[must_use]
+pub(crate) fn normalize_service_path(raw: &str) -> String {
+    let s = raw.trim();
+
+    // `*` (server-wide OPTIONS) and the empty string map to the root.
+    if s.is_empty() || s == "*" {
+        return "/".to_string();
+    }
+
+    // Reduce an absolute ICAP URI to its path component.
+    let path = strip_icap_scheme(s).map_or(s, |authority_and_path| {
+        authority_and_path
+            .find('/')
+            .map_or("/", |idx| &authority_and_path[idx..])
+    });
+
+    let trimmed = path.trim_matches('/');
+    if trimmed.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{trimmed}")
+    }
+}
+
+/// Strip an `icap://` or `icaps://` scheme prefix (case-insensitive), returning
+/// the remaining `authority[/path]` portion when a scheme is present.
+fn strip_icap_scheme(s: &str) -> Option<&str> {
+    for scheme in ["icaps://", "icap://"] {
+        if let Some(prefix) = s.get(..scheme.len())
+            && prefix.eq_ignore_ascii_case(scheme)
+        {
+            return Some(&s[scheme.len()..]);
+        }
+    }
+    None
+}
+
 /// Parse ICAP request from bytes
 ///
 /// Note: this parser constructs `IncomingRequest<Vec<u8>>`, i.e. a fully buffered
@@ -935,7 +983,7 @@ pub(crate) fn parse_icap_request_with_mode(
         return Err(Error::missing_header("Encapsulated"));
     }
 
-    let service = icap_uri.rsplit('/').next().unwrap_or("").to_string();
+    let service = normalize_service_path(icap_uri);
 
     let allow_204 = allow_contains_token(&icap_headers, "204");
     let allow_206 = allow_contains_token(&icap_headers, "206");
@@ -1444,21 +1492,43 @@ Encapsulated: req-hdr=0, req-body={req_body_off}\r\n\
         );
     }
 
+    // RFC 3507 §6.4 — the service is identified by the full request-URI path,
+    // not by the final path segment.
     #[rstest]
     #[case(
         "REQMOD icap://icap.example.org/icap/test ICAP/1.0\r\nHost: icap.example.org\r\nEncapsulated: req-hdr=0\r\n\r\n",
-        "test"
+        "/icap/test"
     )]
     #[case(
         "RESPMOD icap://icap.example.org/respmod ICAP/1.0\r\nHost: icap.example.org\r\nEncapsulated: res-hdr=0\r\n\r\n",
-        "respmod"
+        "/respmod"
     )]
-    fn service_is_last_path_segment_of_icap_uri(
-        #[case] wire: &str,
-        #[case] expected_service: &str,
-    ) {
+    #[case(
+        "REQMOD icap://icap.example.org/v1/scan/ ICAP/1.0\r\nHost: icap.example.org\r\nEncapsulated: req-hdr=0\r\n\r\n",
+        "/v1/scan"
+    )]
+    fn service_is_full_path_of_icap_uri(#[case] wire: &str, #[case] expected_service: &str) {
         let r = parse_icap_request(&icap_bytes(wire)).expect("parse");
         assert_eq!(r.service, expected_service);
+    }
+
+    // RFC 3507 §6.4 — canonical service-path normalization.
+    #[rstest]
+    #[case("scan", "/scan")]
+    #[case("/scan", "/scan")]
+    #[case("/v1/scan", "/v1/scan")]
+    #[case("v1/scan", "/v1/scan")]
+    #[case("/v1/scan/", "/v1/scan")]
+    #[case("icap://host:1344/v1/scan", "/v1/scan")]
+    #[case("ICAP://host:1344/v1/scan", "/v1/scan")]
+    #[case("icaps://host:1344/secure/scan", "/secure/scan")]
+    #[case("icap://host:1344/", "/")]
+    #[case("icap://host:1344", "/")]
+    #[case("*", "/")]
+    #[case("", "/")]
+    #[case("/", "/")]
+    fn normalize_service_path_cases(#[case] raw: &str, #[case] expected: &str) {
+        assert_eq!(normalize_service_path(raw), expected);
     }
 
     #[test]
@@ -1804,7 +1874,7 @@ Encapsulated: req-hdr=0, req-body={req_body_off}\r\n\
         );
         let r = parse_icap_request(&raw).expect("parse");
         assert_eq!(r.method, Method::Options);
-        assert_eq!(r.service, "test");
+        assert_eq!(r.service, "/icap/test");
         assert_eq!(
             r.icap_headers.get("Host").unwrap(),
             &HeaderValue::from_static("icap.example.org")

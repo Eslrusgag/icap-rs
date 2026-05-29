@@ -9,7 +9,7 @@ use tokio::sync::Semaphore;
 use tokio_util::task::TaskTracker;
 
 use crate::error::IcapResult;
-use crate::request::{IncomingRequest, RequestParserMode};
+use crate::request::{IncomingRequest, RequestParserMode, normalize_service_path};
 use crate::server::timeouts::ServerTimeouts;
 use crate::server::{ShutdownEvent, default_shutdown_handler};
 #[cfg(feature = "tls-rustls")]
@@ -206,7 +206,11 @@ impl ServerBuilder {
         Fut: Future + Send + 'static,
         Fut::Output: RouteOutput,
     {
-        let entry = match self.routes.entry(service.to_owned()) {
+        // Routing is by full request path (RFC 3507 §6.4): `/v1/scan` and
+        // `/v2/scan` are distinct services. Normalize so the registered key
+        // matches the path the parser extracts from the request line.
+        let service = normalize_service_path(service);
+        let entry = match self.routes.entry(service.clone()) {
             Entry::Occupied(o) => o.into_mut(),
             Entry::Vacant(v) => v.insert(RouteEntry {
                 handlers: HashMap::new(),
@@ -304,25 +308,31 @@ impl ServerBuilder {
         self.route(service, [Method::RespMod], handler, options)
     }
 
-    /// Add an alias for a service name: `from` → `to`.
+    /// Add an alias for a service path: `from` → `to`.
     ///
-    /// Useful to make root path behave like an existing service:
+    /// Both ends are normalized to canonical request paths, so `"scan"` and
+    /// `"/scan"` refer to the same route. Useful to make the root path behave
+    /// like an existing service:
     /// ```
     /// # use icap_rs::Server;
     /// let builder = Server::builder()
-    ///     .alias("/", "scan"); // "icap://host:1344/" will be treated as "scan"
+    ///     .alias("/", "scan"); // "icap://host:1344/" is routed to "/scan"
     /// ```
     ///
     /// Notes:
     /// - Aliases are applied *after* [`default_service`](Self::default_service) is considered
-    ///   for empty or "/" path.
+    ///   for the root ("/") path.
     /// - Up to 4 alias rewrites are applied to avoid cycles.
     pub fn alias(mut self, from: &str, to: &str) -> Self {
-        self.aliases.insert(from.to_string(), to.to_string());
+        self.aliases
+            .insert(normalize_service_path(from), normalize_service_path(to));
         self
     }
 
-    /// Set a default service for empty or "/" path (e.g. `"scan"`).
+    /// Set a default service for the root ("/") path (e.g. `"scan"`).
+    ///
+    /// The value is normalized to a canonical request path, so `"scan"` and
+    /// `"/scan"` are equivalent.
     ///
     /// Example:
     /// ```
@@ -332,9 +342,9 @@ impl ServerBuilder {
     /// ```
     ///
     /// If a client sends `icap://host:1344/` or an empty service, requests are internally
-    /// routed to the specified service name.
+    /// routed to the specified service path.
     pub fn default_service(mut self, svc: &str) -> Self {
-        self.default_service = Some(svc.to_string());
+        self.default_service = Some(normalize_service_path(svc));
         self
     }
 
