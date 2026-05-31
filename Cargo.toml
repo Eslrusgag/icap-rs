@@ -27,7 +27,7 @@ http = "1.4.0"
 
 # Parsing and async helpers
 async-trait = "0.1.89"
-memchr = "2.8.0"
+memchr = "2.8.1"
 pin-project-lite = "0.2.17"
 
 # TLS
