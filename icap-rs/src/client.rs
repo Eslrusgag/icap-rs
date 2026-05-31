@@ -1225,19 +1225,29 @@ where
             }
         }
 
-        if let Some(c) = code
-            && (400..=599).contains(&c)
-            && hdr_end.is_none()
-        {
-            if !buf.ends_with(b"\r\n\r\n") {
-                if buf.ends_with(b"\r\n") {
-                    buf.extend_from_slice(b"\r\n");
-                } else {
-                    buf.extend_from_slice(b"\r\n\r\n");
-                }
-            }
-            return Ok((c, buf));
-        }
+        // Legacy shortcut intentionally disabled.
+        //
+        // Previous behavior treated any parsed 4xx/5xx status line as a
+        // complete ICAP response, normalized the buffer to end with CRLFCRLF,
+        // and returned immediately even while the TCP connection stayed open.
+        // That makes single-line legacy errors complete quickly, but it also
+        // truncates valid error responses whose headers arrive in a later TCP
+        // read. EOF handling above is the active compatibility path for peers
+        // that actually close after a single-line error.
+        //
+        // if let Some(c) = code
+        //     && (400..=599).contains(&c)
+        //     && hdr_end.is_none()
+        // {
+        //     if !buf.ends_with(b"\r\n\r\n") {
+        //         if buf.ends_with(b"\r\n") {
+        //             buf.extend_from_slice(b"\r\n");
+        //         } else {
+        //             buf.extend_from_slice(b"\r\n\r\n");
+        //         }
+        //     }
+        //     return Ok((c, buf));
+        // }
 
         if hdr_end.is_some() {
             let c = code.ok_or_else(|| Error::parse("missing/bad status code"))?;
@@ -2040,9 +2050,9 @@ mod tests {
     }
 
     /// 1) 404 + single CRLF, connection kept open.
-    /// Expectation: `read_icap_headers` returns quickly with code=404 and buffer normalized to CRLFCRLF.
+    /// Expectation: keep reading until the full header terminator or EOF.
     #[tokio::test]
-    async fn error_404_single_crlf_kept_open_returns_quickly() {
+    async fn error_404_single_crlf_kept_open_times_out() {
         let (mut client, server) = connect_pair().await;
 
         tokio::spawn(server_write(
@@ -2051,13 +2061,8 @@ mod tests {
             true,
         ));
 
-        let (code, buf) = timeout(Duration::from_millis(300), read_icap_headers(&mut client))
-            .await
-            .expect("client hung on single-CRLF 404")
-            .expect("read_icap_headers failed");
-
-        assert_eq!(code, 404);
-        assert!(buf.ends_with(b"\r\n\r\n"));
+        let res = timeout(Duration::from_millis(50), read_icap_headers(&mut client)).await;
+        assert!(res.is_err());
     }
 
     /// 2) 404 with headers and proper CRLFCRLF.
@@ -2078,6 +2083,37 @@ mod tests {
         let text = String::from_utf8(buf).unwrap();
         assert!(text.contains("ISTag: x"));
         assert!(text.contains("Date: "));
+    }
+
+    #[tokio::test]
+    async fn error_404_split_headers_are_preserved() {
+        let (mut client, mut server) = connect_pair().await;
+
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+
+            server
+                .write_all(b"ICAP/1.0 404 ICAP Service not found\r\n")
+                .await
+                .unwrap();
+            server.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            server
+                .write_all(b"ISTag: split-test\r\nX-Late: yes\r\n\r\n")
+                .await
+                .unwrap();
+            server.flush().await.unwrap();
+        });
+
+        let (code, buf) = timeout(Duration::from_millis(300), read_icap_headers(&mut client))
+            .await
+            .expect("client hung on split 404")
+            .expect("read_icap_headers failed");
+
+        assert_eq!(code, 404);
+        let text = String::from_utf8(buf).unwrap();
+        assert!(text.contains("ISTag: split-test"));
+        assert!(text.contains("X-Late: yes"));
     }
 
     /// 3) 404 with headers but EOF before CRLFCRLF.

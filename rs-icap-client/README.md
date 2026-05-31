@@ -68,7 +68,8 @@ rs-icap-client [OPTIONS]
 - `--req <URL>`: send `REQMOD` with the given HTTP request URL.
 - `--resp <URL>`: annotate `RESPMOD` with a source URL.
 - `-w, --preview-size <N>`: force `Preview: N`.
-- `--ieof`: with `--preview-size 0`, send `0; ieof`.
+- `--ieof`: with `--preview-size 0`, send `0; ieof`. For file input this
+  is valid only when the file body is empty.
 - `--nopreview`: force `Preview: 0` without `ieof`.
 - `--no204`: do not advertise `Allow: 204` outside preview flow.
 - `--206`: advertise `Allow: 206` and accept partial-content
@@ -189,9 +190,11 @@ cargo run -p rs-icap-client -- \
 - `icaps://` defaults to port `11344`.
 - Header names are case-insensitive. Printed ICAP headers use canonical names
   such as `Encapsulated`, `ISTag`, and `Preview`.
-- With `--stream-io` or `Preview: 0`, the client sends the request head and
-  preview marker, waits for `100 Continue`, and then streams the remaining file
-  body.
+- With `--stream-io`, the client streams the file body through the ICAP Preview
+  flow. `Preview: N` sends the first `N` bytes before `100 Continue`;
+  `Preview: 0` sends only the preview marker before the remaining body.
+- A file request with `Preview: 0` uses the same streaming flow even without
+  `--stream-io`, matching `c-icap-client` compatibility behavior.
 - If neither `Allow: 204` nor Preview is used, an RFC-aware server may avoid
   `204 No Content` and return an encapsulated `200 OK` response instead.
 - `--206` allows a no-modification response to preserve the original body

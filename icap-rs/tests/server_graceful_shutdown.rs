@@ -47,7 +47,7 @@ async fn start_server_with_shutdown() -> (u16, oneshot::Sender<()>) {
                 let _ = rx.await;
             })
             .await
-            .expect("server run_until")
+            .expect("server run_until");
     });
 
     wait_port_ready(&addr).await;
@@ -107,8 +107,7 @@ async fn server_stops_accepting_new_connections_after_shutdown() {
     )
     .await;
     match result {
-        Err(_) => {}     // timeout — server no longer listening, acceptable
-        Ok(Err(_)) => {} // connect error — listener closed, acceptable
+        Err(_) | Ok(Err(_)) => {} // timeout or connect error after listener shutdown
         Ok(Ok(mut stream)) => {
             // Connected — server may have accepted but should close immediately.
             let mut buf = [0u8; 64];

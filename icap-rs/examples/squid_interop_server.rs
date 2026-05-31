@@ -63,12 +63,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 }
 
 fn handle_reqmod(request: IncomingRequest) -> HandlerResult<Response> {
-    let Some(EmbeddedHttp::Req { head, .. }) = request.embedded() else {
+    let Some(EmbeddedHttp::Req { head, .. }) = request.into_embedded() else {
         warn!("REQMOD without embedded HTTP request");
         return Ok(Response::no_content_with_istag(REQMOD_ISTAG)?);
     };
 
-    let host = request_host(head);
+    let host = request_host(&head);
     let path = head.uri().path().to_ascii_lowercase();
     let reason = block_reason(&host, &path);
 
@@ -88,14 +88,14 @@ fn handle_reqmod(request: IncomingRequest) -> HandlerResult<Response> {
 }
 
 fn handle_respmod(request: IncomingRequest) -> HandlerResult<Response> {
-    let Some(EmbeddedHttp::Resp { head, body }) = request.embedded() else {
+    let Some(EmbeddedHttp::Resp { head, body }) = request.into_embedded() else {
         warn!("RESPMOD without embedded HTTP response");
         return Ok(Response::no_content_with_istag(RESPMOD_ISTAG)?);
     };
 
     info!(
         status = %head.status(),
-        body = body_kind(body),
+        body = body_kind(&body),
         "Squid RESPMOD"
     );
 
@@ -121,7 +121,7 @@ fn handle_respmod(request: IncomingRequest) -> HandlerResult<Response> {
         headers.insert("X-ICAP-Respmod", HeaderValue::from_static("icap-rs"));
     }
 
-    let http = builder.body(reader.clone())?;
+    let http = builder.body(reader)?;
     Ok(Response::ok_with_istag(RESPMOD_ISTAG)?.with_http_response(&http)?)
 }
 
@@ -144,7 +144,11 @@ fn block_reason(host: &str, path: &str) -> Option<&'static str> {
     if path.contains("blocked") {
         return Some("blocked URL path");
     }
-    if path.ends_with(".exe") || path.ends_with(".zip") {
+    if std::path::Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("exe") || ext.eq_ignore_ascii_case("zip"))
+    {
         return Some("blocked file extension");
     }
     None
@@ -166,7 +170,7 @@ fn block_page(reason: &'static str) -> HandlerResult<HttpResponse<Vec<u8>>> {
         .body(html.into_bytes())?)
 }
 
-fn body_kind(body: &Body<Vec<u8>>) -> &'static str {
+const fn body_kind(body: &Body<Vec<u8>>) -> &'static str {
     match body {
         Body::Full { .. } => "full",
         Body::Preview { .. } => "preview",

@@ -234,6 +234,26 @@ fn bench_request_wire_streaming_build(c: &mut Criterion) {
         b.iter(|| client.get_request_wire(black_box(&req), true).unwrap());
     });
 
+    let req_head = HttpRequest::builder()
+        .method("POST")
+        .uri("http://example.local/upload")
+        .version(Version::HTTP_11)
+        .header("Host", "example.local")
+        .header("Content-Type", "application/octet-stream")
+        .header("Content-Length", (64 * 1024).to_string())
+        .body(())
+        .unwrap();
+    let req = Request::reqmod("scan")
+        .preview(1024)
+        .with_http_request_head(req_head)
+        .unwrap();
+    c.bench_function(
+        "client_get_request_wire_streaming_reqmod_preview_1024",
+        |b| {
+            b.iter(|| client.get_request_wire(black_box(&req), true).unwrap());
+        },
+    );
+
     let resp_head = HttpResponse::builder()
         .status(200)
         .version(Version::HTTP_11)

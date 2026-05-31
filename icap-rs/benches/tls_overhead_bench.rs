@@ -11,6 +11,9 @@ use std::net::TcpListener as StdTcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::net::TcpStream;
+use tokio::runtime::{Builder as RtBuilder, Runtime};
+use tokio::time::sleep;
 
 // Maximum new-connection iterations measured per Criterion sample.
 //
@@ -26,8 +29,6 @@ use std::time::{Duration, Instant};
 // assumption (constant per-connection cost) holds for this workload because
 // each new connection is independent with approximately constant handshake cost.
 const MAX_NEW_CONNECTION_ITERS_PER_SAMPLE: u64 = 32;
-use tokio::runtime::{Builder as RtBuilder, Runtime};
-use tokio::time::sleep;
 
 const CERT_PEM: &str = "certs/server.crt";
 const KEY_PEM: &str = "certs/server.key";
@@ -60,7 +61,12 @@ impl BenchEnv {
         rt.block_on(async {
             spawn_plain_server(&plain_addr).await;
             spawn_tls_server(&tls_addr).await;
-            sleep(Duration::from_millis(80)).await;
+            wait_port_ready(&plain_addr)
+                .await
+                .expect("plain benchmark server ready");
+            wait_port_ready(&tls_addr)
+                .await
+                .expect("TLS benchmark server ready");
         });
 
         let request = Request::respmod("respmod")
@@ -193,6 +199,27 @@ fn sample_http_response() -> HttpResponse<Vec<u8>> {
 fn reserve_port() -> u16 {
     let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
     listener.local_addr().expect("read local addr").port()
+}
+
+async fn wait_port_ready(addr: &str) -> std::io::Result<()> {
+    let socket = connect_with_retry(addr).await?;
+    drop(socket);
+    Ok(())
+}
+
+async fn connect_with_retry(addr: &str) -> std::io::Result<TcpStream> {
+    let mut last_err: Option<std::io::Error> = None;
+    for _ in 0..50 {
+        match TcpStream::connect(addr).await {
+            Ok(s) => return Ok(s),
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+                last_err = Some(e);
+                sleep(Duration::from_millis(2)).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| std::io::Error::other("connect retry exhausted")))
 }
 
 fn bench_keepalive(c: &mut Criterion, env: &Arc<BenchEnv>) {

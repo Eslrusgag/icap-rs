@@ -384,11 +384,12 @@ async fn main() -> IcapResult<()> {
     {
         icap_req = icap_req.preview(n);
     }
+    let effective_preview = icap_req.preview_size();
 
     // Prepare embedded HTTP and body source
     let (file_bytes, file_path_opt, file_len_opt) = if let Some(filename) = &args.filename {
         let p = PathBuf::from(filename);
-        if args.stream_io || caps.preview == Some(0) || args.nopreview {
+        if should_stream_file_body(args.stream_io, effective_preview) {
             let len = std::fs::metadata(&p).ok().map(|m| m.len());
             debug!("Using stream-io from file '{}' (len={:?})", filename, len);
             (None, Some(p), len)
@@ -408,6 +409,17 @@ async fn main() -> IcapResult<()> {
     } else {
         (None, None, None)
     };
+    let stream_file_body = file_path_opt.is_some() && file_bytes.is_none();
+    if stream_file_body && effective_preview.is_none() {
+        icap_req = icap_req.preview(0);
+    }
+    let effective_preview = icap_req.preview_size();
+    validate_ieof_body(
+        args.ieof,
+        file_path_opt.is_some(),
+        file_len_opt,
+        effective_preview,
+    )?;
 
     if icap_method == "REQMOD" || icap_method == "RESPMOD" {
         if icap_method == "REQMOD" {
@@ -433,9 +445,7 @@ async fn main() -> IcapResult<()> {
             if let Some(h) = host_hdr.as_deref() {
                 httpb = httpb.header("Host", h);
             }
-            if args.stream_io
-                && let Some(len) = file_len_opt
-            {
+            if let Some(len) = file_len_opt {
                 httpb = httpb.header("Content-Length", len.to_string());
             }
 
@@ -451,10 +461,17 @@ async fn main() -> IcapResult<()> {
                 }
             }
 
-            let http_req = httpb.body(body_vec).map_err(|e| {
-                icap_rs::Error::http_parse(format!("failed to build HTTP request: {e}"))
-            })?;
-            icap_req = icap_req.with_http_request(http_req)?;
+            if stream_file_body {
+                let http_req = httpb.body(()).map_err(|e| {
+                    icap_rs::Error::http_parse(format!("failed to build HTTP request head: {e}"))
+                })?;
+                icap_req = icap_req.with_http_request_head(http_req)?;
+            } else {
+                let http_req = httpb.body(body_vec).map_err(|e| {
+                    icap_rs::Error::http_parse(format!("failed to build HTTP request: {e}"))
+                })?;
+                icap_req = icap_req.with_http_request(http_req)?;
+            }
         } else {
             // Build embedded HTTP response (HTTP/1.0 by default, like c-icap-client)
             let mut httpb = HttpResponse::builder()
@@ -488,23 +505,22 @@ async fn main() -> IcapResult<()> {
             }
 
             let body_vec = file_bytes.clone().unwrap_or_default();
-            let http_resp = httpb.body(body_vec).map_err(|e| {
-                icap_rs::Error::http_parse(format!("failed to build HTTP response: {e}"))
-            })?;
-            icap_req = icap_req.with_http_response(http_resp)?;
+            if stream_file_body {
+                let http_resp = httpb.body(()).map_err(|e| {
+                    icap_rs::Error::http_parse(format!("failed to build HTTP response head: {e}"))
+                })?;
+                icap_req = icap_req.with_http_response_head(http_resp)?;
+            } else {
+                let http_resp = httpb.body(body_vec).map_err(|e| {
+                    icap_rs::Error::http_parse(format!("failed to build HTTP response: {e}"))
+                })?;
+                icap_req = icap_req.with_http_response(http_resp)?;
+            }
         }
 
         // Dry-run: print the exact wire bytes and exit
         if args.print_request {
-            let forced_preview = if args.nopreview {
-                Some(0)
-            } else {
-                args.preview_size
-            };
-            let streaming_mode = args.nopreview
-                || forced_preview == Some(0)
-                || (args.stream_io && forced_preview.unwrap_or(0) == 0);
-
+            let streaming_mode = stream_file_body;
             let bytes = client.get_request_wire(&icap_req, streaming_mode)?;
             println!("{}", String::from_utf8_lossy(&bytes));
             return Ok(());
@@ -514,13 +530,8 @@ async fn main() -> IcapResult<()> {
             &client,
             icap_req,
             file_path_opt.clone(),
-            file_bytes.clone(),
-            if args.preview_size.is_none() && !args.nopreview {
-                caps.preview
-            } else {
-                args.preview_size
-            },
-            args.stream_io,
+            effective_preview,
+            stream_file_body,
             args.nopreview,
         )
         .await?;
@@ -709,6 +720,31 @@ fn parse_authority_and_service(uri: &str) -> Option<(String, u16, String)> {
     Some((host, port, service))
 }
 
+const fn should_stream_file_body(cli_stream_io: bool, preview_size: Option<usize>) -> bool {
+    cli_stream_io || matches!(preview_size, Some(0))
+}
+
+fn validate_ieof_body(
+    ieof: bool,
+    has_file: bool,
+    file_len: Option<u64>,
+    preview_size: Option<usize>,
+) -> IcapResult<()> {
+    if !ieof || !has_file || preview_size != Some(0) {
+        return Ok(());
+    }
+
+    match file_len {
+        Some(0) => Ok(()),
+        Some(len) => Err(icap_rs::Error::body(format!(
+            "--ieof with Preview: 0 is only valid when the complete body is already in the preview; file has {len} byte(s)"
+        ))),
+        None => Err(icap_rs::Error::body(
+            "--ieof with Preview: 0 requires proving that the file body is empty",
+        )),
+    }
+}
+
 async fn negotiate_caps(client: &Client, service: &str) -> IcapResult<IcapCaps> {
     let opt_req = Request::options(service).allow_204();
     let resp: IcapResponse = client.send(&opt_req).await?;
@@ -751,16 +787,25 @@ async fn send_with_preview(
     client: &Client,
     mut icap_req: Request,
     file_path_opt: Option<PathBuf>,
-    _file_in_mem: Option<Vec<u8>>,
     negotiated_or_forced_preview: Option<usize>,
-    cli_stream_io: bool,
+    stream_file_body: bool,
     cli_nopreview: bool,
 ) -> IcapResult<IcapResponse> {
+    if stream_file_body && let Some(file_path) = file_path_opt {
+        if cli_nopreview || negotiated_or_forced_preview == Some(0) {
+            icap_req = icap_req.preview(0);
+        } else if let Some(n) = negotiated_or_forced_preview {
+            icap_req = icap_req.preview(n);
+        } else {
+            // c-icap-client compatibility: streaming uploads use a Preview: 0
+            // gate unless the server or caller selected a larger preview.
+            icap_req = icap_req.preview(0);
+        }
+        return client.send_streaming(&icap_req, file_path).await;
+    }
+
     if cli_nopreview || negotiated_or_forced_preview == Some(0) {
         icap_req = icap_req.preview(0);
-        if let Some(file_path) = file_path_opt {
-            return client.send_streaming(&icap_req, file_path).await;
-        }
         return client.send(&icap_req).await;
     }
 
@@ -770,17 +815,34 @@ async fn send_with_preview(
         return client.send(&icap_req).await;
     }
 
-    if cli_stream_io && let Some(file_path) = file_path_opt {
-        icap_req = icap_req.preview(0);
-        return client.send_streaming(&icap_req, file_path).await;
-    }
-
     client.send(&icap_req).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stream_body_mode_covers_preview_variants() {
+        assert!(should_stream_file_body(true, Some(4)));
+        assert!(should_stream_file_body(true, None));
+        assert!(should_stream_file_body(false, Some(0)));
+        assert!(!should_stream_file_body(false, Some(4)));
+        assert!(!should_stream_file_body(false, None));
+    }
+
+    #[test]
+    fn rejects_ieof_for_non_empty_file_body() {
+        let err = validate_ieof_body(true, true, Some(5), Some(0))
+            .expect_err("non-empty file cannot be sent as Preview: 0 ieof");
+
+        assert!(err.to_string().contains("--ieof"));
+    }
+
+    #[test]
+    fn accepts_ieof_for_empty_file_body() {
+        validate_ieof_body(true, true, Some(0), Some(0)).expect("empty body can use ieof");
+    }
 
     #[test]
     fn appends_original_body_suffix_from_offset() {
@@ -797,5 +859,89 @@ mod tests {
             .expect_err("offset past original body must fail");
 
         assert!(err.to_string().contains("exceeds original body length"));
+    }
+
+    async fn read_until_contains(stream: &mut tokio::net::TcpStream, needle: &[u8]) -> Vec<u8> {
+        use tokio::io::AsyncReadExt;
+
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 1024];
+        loop {
+            if buf.windows(needle.len()).any(|window| window == needle) {
+                return buf;
+            }
+            let n = stream.read(&mut tmp).await.expect("read from client");
+            assert!(n > 0, "connection closed before expected bytes arrived");
+            buf.extend_from_slice(&tmp[..n]);
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_io_preview_n_sends_preview_and_remainder() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "rs-icap-client-stream-{}-{unique}.txt",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"hello").expect("write temp body");
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("local addr").port();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let preview = read_until_contains(&mut socket, b"4\r\nhell\r\n0\r\n\r\n").await;
+            let preview_text = String::from_utf8_lossy(&preview);
+            assert!(preview_text.contains("\r\nPreview: 4\r\n"));
+            assert!(preview_text.contains("Encapsulated: req-hdr=0, req-body="));
+
+            socket
+                .write_all(b"ICAP/1.0 100 Continue\r\n\r\n")
+                .await
+                .expect("write continue");
+
+            let remainder = read_until_contains(&mut socket, b"1\r\no\r\n0\r\n\r\n").await;
+            assert!(
+                String::from_utf8_lossy(&remainder).contains("1\r\no\r\n0\r\n\r\n"),
+                "missing streamed remainder"
+            );
+
+            socket
+                .write_all(
+                    b"ICAP/1.0 204 No Content\r\n\
+                      ISTag: \"stream-test\"\r\n\
+                      Encapsulated: null-body=0\r\n\r\n",
+                )
+                .await
+                .expect("write response");
+        });
+
+        let client = Client::builder().host("127.0.0.1").port(port).build();
+        let http = HttpRequest::builder()
+            .method(Method::POST)
+            .uri("/")
+            .version(Version::HTTP_10)
+            .header("Host", "origin.example")
+            .header("Content-Length", "5")
+            .body(())
+            .expect("build HTTP head");
+        let req = Request::reqmod("scan")
+            .preview(4)
+            .with_http_request_head(http)
+            .expect("build ICAP request");
+
+        let response = send_with_preview(&client, req, Some(path.clone()), Some(4), true, false)
+            .await
+            .expect("send streaming preview");
+
+        assert_eq!(response.status_code(), IcapStatus::NO_CONTENT);
+        server.await.expect("server task");
+        let _ = std::fs::remove_file(path);
     }
 }

@@ -159,6 +159,23 @@ impl OptionsCache {
             return;
         };
         let key = (host.to_string(), port, path.to_string());
+
+        // Fast path (warm cache, no ISTag change): read lock only.
+        // In production the ISTag rarely changes, so the hot path must not
+        // block other readers by taking a write lock unconditionally.
+        {
+            let entries = self.entries.read().await;
+            let Some(entry) = entries.get(&key) else {
+                return; // nothing cached — nothing to invalidate
+            };
+            if entry.istag.as_deref() == Some(observed) {
+                return; // ISTag matches — no action needed
+            }
+        }
+
+        // Slow path: ISTag changed — acquire write lock and remove the entry.
+        // Re-check under the write lock to avoid a TOCTOU race if two tasks
+        // observe a new ISTag simultaneously.
         let mut entries = self.entries.write().await;
         if let Some(entry) = entries.get(&key)
             && entry.istag.as_deref() != Some(observed)

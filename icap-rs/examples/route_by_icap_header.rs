@@ -11,7 +11,7 @@
 //!   rs-icap-client -i 127.0.0.1 -p 1344 -s reqmod \
 //!       --icap-header 'X-Client-IP: 10.0.0.5' \
 //!       --icap-header 'X-Authenticated-User: alice' \
-//!       --url 'http://example.com/'
+//!       --url '<http://example.com/>'
 
 use http::{HeaderMap, Response as HttpResponse, StatusCode as HttpStatus, Version};
 use icap_rs::request::IncomingRequest;
@@ -43,7 +43,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 let user = icap_header(req.icap_headers(), "X-Authenticated-User");
                 info!(?client_ip, ?user, "REQMOD");
 
-                match decide(&client_ip, &user) {
+                match decide(client_ip.as_deref(), user.as_deref()) {
                     Decision::Allow => Ok(Response::no_content_with_istag(ISTAG)?),
                     Decision::Audit(tag) => {
                         Ok(Response::no_content_with_istag(ISTAG)?.add_header("X-Audit", tag))
@@ -78,16 +78,16 @@ enum Decision {
     Block(&'static str),
 }
 
-fn decide(client_ip: &Option<String>, user: &Option<String>) -> Decision {
+fn decide(client_ip: Option<&str>, user: Option<&str>) -> Decision {
     // Toy policy:
     // - unauthenticated requests are blocked outright
     // - a known bad subnet is blocked
     // - the "guests" user is allowed but audited
     // - everyone else passes through unchanged
-    let Some(user) = user.as_deref() else {
+    let Some(user) = user else {
         return Decision::Block("authentication required");
     };
-    if let Some(ip) = client_ip.as_deref()
+    if let Some(ip) = client_ip
         && ip.starts_with("10.6.6.")
     {
         return Decision::Block("source subnet on denylist");

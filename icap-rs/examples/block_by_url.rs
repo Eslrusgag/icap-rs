@@ -1,7 +1,7 @@
 //! REQMOD: block requests by URL extension or by host denylist.
 //!
 //! - GET .../*.exe, *.zip, *.iso  -> HTTP 403 page
-//! - Host in DENY_HOSTS           -> HTTP 403 page
+//! - Host in `DENY_HOSTS`         -> HTTP 403 page
 //! - otherwise                    -> 204 No Content
 
 use http::{Response as HttpResponse, StatusCode as HttpStatus, Version};
