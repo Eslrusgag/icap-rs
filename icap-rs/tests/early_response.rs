@@ -65,56 +65,63 @@ fn make_client(host: &str, port: u16) -> Client {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn early_503_when_conn_limit_exceeded() {
     let (addr, _handle) = spawn_server_with_limit(1).await;
-
-    let _hold = TcpStream::connect(&addr).await.expect("occupy permit");
-
     let sa: SocketAddr = addr.parse().unwrap();
-    let client = make_client("127.0.0.1", sa.port());
     let req = Request::options("svc-options");
 
-    let deadline = Instant::now() + Duration::from_secs(1);
-    let resp: ParsedResponse = loop {
-        let result = timeout(Duration::from_millis(200), client.send(&req)).await;
-        match result {
-            Ok(Ok(resp)) if resp.status_code() == StatusCode::SERVICE_UNAVAILABLE => break resp,
-            Ok(Ok(resp)) if resp.status_code() == StatusCode::OK && Instant::now() < deadline => {
+    // Deterministically occupy the single connection permit. A keep-alive client
+    // that *successfully* completes one request (200 OK) is provably the connection
+    // holding the permit, and keeps the connection open afterwards so the permit
+    // stays held. We retry because the startup readiness probe may transiently hold
+    // the only permit right after bind, which would 503 our first attempt.
+    let hold_client = Client::builder()
+        .host("127.0.0.1")
+        .port(sa.port())
+        .keep_alive(true)
+        .build();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match timeout(Duration::from_millis(200), hold_client.send(&req)).await {
+            Ok(Ok(resp)) if resp.status_code() == StatusCode::OK => break,
+            Ok(_) | Err(_) if Instant::now() < deadline => {
                 sleep(Duration::from_millis(10)).await;
             }
-            Ok(Ok(resp)) => break resp,
-            Ok(Err(err)) if Instant::now() < deadline => {
-                if matches!(
-                    err,
-                    Error::Io(ref io_err)
-                        if matches!(
-                            io_err.kind(),
-                            std::io::ErrorKind::ConnectionAborted
-                                | std::io::ErrorKind::ConnectionReset
-                        )
-                ) {
-                    sleep(Duration::from_millis(10)).await;
-                    continue;
-                }
-                panic!("client.send failed: {err}");
-            }
-            Ok(Err(err)) => panic!("client.send failed: {err}"),
-            Err(_) if Instant::now() < deadline => {}
-            Err(elapsed) => panic!("client.send timed out after {elapsed:?}"),
+            other => panic!("could not occupy the connection permit: {other:?}"),
         }
-    };
-
-    assert_eq!(
-        resp.status_code(),
-        StatusCode::SERVICE_UNAVAILABLE,
-        "expected early 503 produced by server accept loop"
-    );
-
-    let enc = resp
-        .get_header("Encapsulated")
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_ascii_lowercase);
-    if let Some(v) = enc {
-        assert_eq!(v, "null-body=0");
     }
+
+    // The permit is now held by `hold_client`'s still-open connection, so a fresh
+    // connection must be rejected at the accept loop. Rejection surfaces either as
+    // a clean early 503, or — because the server writes 503 and closes without
+    // reading the request — as a TCP reset/abort on some platforms. Both are valid;
+    // the one outcome that must NOT happen is a 200 OK (which would mean the limit
+    // was not enforced).
+    let client = make_client("127.0.0.1", sa.port());
+    match timeout(Duration::from_secs(1), client.send(&req)).await {
+        Ok(Ok(resp)) => {
+            assert_eq!(
+                resp.status_code(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "expected early 503 produced by server accept loop"
+            );
+            if let Some(v) = resp
+                .get_header("Encapsulated")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_ascii_lowercase)
+            {
+                assert_eq!(v, "null-body=0");
+            }
+        }
+        Ok(Err(Error::Io(e)))
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::ConnectionAborted | std::io::ErrorKind::ConnectionReset
+            ) => {}
+        Ok(Err(e)) => panic!("unexpected error from over-limit send: {e}"),
+        Err(elapsed) => panic!("over-limit send timed out: {elapsed:?}"),
+    }
+
+    drop(hold_client);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
