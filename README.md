@@ -35,6 +35,14 @@ tested.
   `use-original-body` marker.
 - `ISTag` validation for successful ICAP responses.
 - Keep-alive connection reuse without pipelining.
+- Client-side OPTIONS response caching with `Options-TTL` lifetime and `ISTag`
+  invalidation (RFC 3507 §4.10 / §5), opt-in via
+  `ClientBuilder::with_options_cache`.
+- Client-side `Transfer-Preview` / `Transfer-Ignore` / `Transfer-Complete`
+  policy applied per file extension from a cached `OPTIONS` response
+  (RFC 3507 §4.10.2).
+- Client `Proxy-Authorization: Basic` retry on `407 Proxy Authentication
+  Required` (RFC 3507 §7.1), opt-in via `ClientBuilder::proxy_auth`.
 - Direct ICAPS (`icaps://`) via Rustls when the `tls-rustls` feature is
   enabled.
 - TLS listener and mTLS support in the library server API.
@@ -49,12 +57,10 @@ support matrix and known gaps.
 - Incoming client responses accept legacy `204 No Content` responses without
   `Encapsulated` as equivalent to `Encapsulated: null-body=0` for c-icap
   interoperability.
-- `Transfer-Preview`, `Transfer-Ignore`, and `Transfer-Complete` can be
-  advertised by the server, but the client does not automatically apply the
-  full RFC transfer policy model.
-- Cache-related headers such as `ISTag` and `Options-TTL` can be emitted and
-  parsed, but the client does not implement a complete OPTIONS cache
-  invalidation model.
+- Client-side `Transfer-*` policy and OPTIONS caching are opt-in: without
+  `ClientBuilder::with_options_cache` the client never fetches `OPTIONS`
+  automatically and applies no transfer policy. The server always advertises
+  the `Transfer-*` and cache headers configured on its `ServiceOptions`.
 - Service routing is currently based on the resolved service path segment, not
   the full RFC service URI identity model.
 - Chunk extensions used by supported flows are parsed, but structured trailer
@@ -63,8 +69,11 @@ support matrix and known gaps.
 ## Not Implemented
 
 - RFC 3507 `Upgrade` TLS negotiation. Use direct `icaps://` instead.
-- Built-in ICAP proxy/service authentication.
-- Full RFC cache model.
+- Server-side ICAP authentication enforcement. The client sends
+  `Proxy-Authorization` on `407` (RFC 3507 §7.1), but the server does not
+  challenge or verify credentials.
+- Full RFC cache model. Core OPTIONS caching and `ISTag` invalidation are
+  implemented; some advanced cache semantics are not.
 - Full structured trailer API.
 - Complete external interoperability fixture suite.
 

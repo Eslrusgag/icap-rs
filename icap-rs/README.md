@@ -13,7 +13,8 @@ exists.
 
 | Feature | Default | Purpose |
 | --- | --- | --- |
-| `tls-rustls` | No | Enables direct ICAPS (`icaps://`) client connections and TLS/mTLS server listeners through Rustls. |
+| `tls-rustls` | No | Enables direct ICAPS (`icaps://`) client connections and TLS/mTLS server listeners through Rustls. Bundles the `ring` crypto provider as the default backend. |
+| `tls-rustls-aws-lc-rs` | No | Additive opt-in: also compiles the `aws-lc-rs` crypto provider and prefers it at runtime. Implies `tls-rustls`, so code gated on `feature = "tls-rustls"` keeps working. |
 
 Without `tls-rustls`, plaintext `icap://` clients and servers are available.
 
@@ -360,6 +361,10 @@ fn comma_separated_header_example() -> IcapResult<()> {
   HTTP message instead.
 - `Allow: 206` no-modification responses use the `use-original-body` marker.
 - Keep-alive is supported without request pipelining.
+- Client-side OPTIONS caching, `Transfer-*` policy (§4.10.2), and
+  `Proxy-Authorization` retry on `407` (§7.1) are opt-in on `ClientBuilder`
+  via `with_options_cache` and `proxy_auth`; without them the client never
+  fetches `OPTIONS` automatically.
 
 For the detailed support matrix and known gaps, see
 [`docs/rfc3507.md`](docs/rfc3507.md).
@@ -370,9 +375,10 @@ Most applications can import the main API directly from the crate root:
 
 ```rust
 use icap_rs::{
-    Body, Client, ClientBuilder, ConnectionPolicy, EmbeddedHttp, Error, IcapResult,
-    IncomingRequest, Method, PreviewDecision, Request, Response, Server, ServerBuilder,
-    ServiceOptions, StatusCode, TransferBehavior,
+    Body, Client, ClientBuilder, ClientTimeouts, ConnectionPolicy, EmbeddedHttp, Error,
+    HandlerError, HandlerResult, IcapResult, IncomingRequest, IsTagHandle, Method,
+    OptionsCacheConfig, PreviewDecision, ProxyAuth, Request, Response, Server, ServerBuilder,
+    ServerTimeouts, ServiceOptions, ShutdownEvent, StatusCode, TransferBehavior,
 };
 ```
 
@@ -387,6 +393,10 @@ use icap_rs::{
 | [`Body`], [`EmbeddedHttp`] | Inspecting embedded HTTP request/response heads and bodies in server handlers. Regular handlers receive [`Body::Full`]; preview-aware handlers may receive [`Body::Preview`]. |
 | [`PreviewDecision`] | Returning an early final response from a preview-aware route, or continuing the RFC preview flow. |
 | [`Error`], [`IcapResult`] | Handling protocol, parsing, serialization, network, service, and handler errors without converting them into generic I/O errors. |
+| [`OptionsCacheConfig`], [`ProxyAuth`] | Opt-in client-side OPTIONS caching (`ClientBuilder::with_options_cache`, RFC 3507 §4.10 / §5 plus `Transfer-*` policy §4.10.2) and `Proxy-Authorization` retry on `407` (`ClientBuilder::proxy_auth`, §7.1). |
+| [`ClientTimeouts`], [`ServerTimeouts`] | Tuning client- and server-side network deadlines (connect, write, idle keep-alive, Preview continue, body/header read, shutdown drain). |
+| [`ShutdownEvent`], [`HandlerError`], [`HandlerResult`] | Observing graceful-shutdown drain progress (`ServerBuilder::on_shutdown_event`) and returning structured errors from route handlers. |
+| [`IsTagHandle`] | Rotating a dynamic `ISTag` from a background task while handlers read the current value. |
 
 Submodules are still public for discoverability and namespacing:
 `icap_rs::client`, `icap_rs::request`, `icap_rs::response`,
@@ -586,5 +596,14 @@ cargo run -p icap-rs --example client
 cargo run -p icap-rs --example streaming_client -- Cargo.toml
 cargo run -p icap-rs --example preview_decision_server
 cargo run -p icap-rs --example squid_interop_server
+cargo run -p icap-rs --example dynamic_istag
+cargo run -p icap-rs --example modify_http_headers
+cargo run -p icap-rs --example block_by_url
+cargo run -p icap-rs --example route_by_icap_header
+cargo run -p icap-rs --example options_cache_client
+cargo run -p icap-rs --example transfer_policy_client
+cargo run -p icap-rs --example proxy_auth_client
 cargo run -p icap-rs --example tls_client --features tls-rustls
+cargo run -p icap-rs --example tls_server --features tls-rustls
+cargo run -p icap-rs --example tls_mtls_client --features tls-rustls
 ```

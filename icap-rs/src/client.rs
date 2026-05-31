@@ -379,7 +379,7 @@ impl Client {
     /// let client = Client::builder().host("127.0.0.1").port(1344).build();
     ///
     /// // Hand-crafted REQMOD: scan a small POST body.
-    /// // HTTP request head (39 bytes), so req-body=39.
+    /// // `req-body` equals the byte length of the HTTP request head (`http_head_len`).
     /// let http_head = b"POST /upload HTTP/1.1\r\nHost: app\r\n\r\n";  // 36 bytes
     /// let http_head_len = http_head.len();  // must match the req-body offset below
     ///

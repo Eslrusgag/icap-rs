@@ -9,12 +9,12 @@
 //!
 //! RFC 3507 §5 requires the client to invalidate a cached entry when the
 //! `ISTag` observed on a later `REQMOD`/`RESPMOD` response differs from the one
-//! captured at `OPTIONS` time; [`OptionsCache::reconcile_istag`] implements
+//! captured at `OPTIONS` time; `OptionsCache::reconcile_istag` implements
 //! that rule.
 //!
 //! RFC 3507 §4.10.2 defines `Transfer-Preview`, `Transfer-Ignore`, and
 //! `Transfer-Complete` headers that tell the client how to handle objects by
-//! file extension. [`OptionsCache::resolve_transfer`] looks up the action for a
+//! file extension. `OptionsCache::resolve_transfer` looks up the action for a
 //! given extension from the cached OPTIONS response.
 
 use crate::response::ParsedResponse;

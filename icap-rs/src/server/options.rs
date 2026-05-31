@@ -2,7 +2,7 @@
 //!
 //! This module provides types to build an ICAP `OPTIONS` response for a given
 //! service. It includes:
-//! - [`Method`] — ICAP methods
+//! - [`Method`](crate::Method) — ICAP methods
 //! - [`TransferBehavior`] — per-extension transfer hints (Preview/Ignore/Complete)
 //! - [`ServiceOptions`] — a builder-like struct that serializes to an ICAP response
 //!   and supports a dynamic `ISTag` provider.
@@ -327,7 +327,28 @@ impl ServiceOptions {
         self
     }
 
-    /// Set opt-body and its type.
+    /// Advertise an opt-body in the service's `OPTIONS` response (RFC 3507 §4.10).
+    ///
+    /// The generated `OPTIONS` response sets `Encapsulated: opt-body=0`, adds an
+    /// `Opt-body-type: <body_type>` header, and serializes `body` as a single
+    /// ICAP chunk terminated by `0\r\n\r\n`. `body_type` describes the payload
+    /// (for example `"text/plain"` or a service-defined token); it is required
+    /// whenever an opt-body is present and is checked by
+    /// [`ServiceOptions::validate`] at server build time.
+    ///
+    /// A client reading the `OPTIONS` response receives the dechunked bytes via
+    /// `Response::body()`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use icap_rs::server::options::ServiceOptions;
+    ///
+    /// let options = ServiceOptions::new()
+    ///     .with_static_istag("opt-1.0")
+    ///     .with_service("Scanner")
+    ///     .with_opt_body("text/plain", b"server info".to_vec());
+    /// ```
     pub fn with_opt_body(mut self, body_type: &str, body: Vec<u8>) -> Self {
         self.opt_body_type = Some(body_type.to_string());
         self.opt_body = Some(body);

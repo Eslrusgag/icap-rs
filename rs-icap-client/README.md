@@ -177,8 +177,7 @@ cargo run -p rs-icap-client -- \
 ```bash
 cargo run -p rs-icap-client -- \
   -u icaps://localhost:11344/scan \
-  --tls-backend rustls \
-  --tls-ca test_data/certs/ca.crt \
+  --tls-ca test_data/certs/ca.pem \
   --sni localhost \
   -m OPTIONS \
   -v

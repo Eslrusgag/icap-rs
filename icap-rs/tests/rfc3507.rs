@@ -142,6 +142,28 @@ async fn start_options_capability_server() -> u16 {
     port
 }
 
+const OPT_BODY: &[u8] = b"server info";
+
+async fn start_opt_body_options_server() -> u16 {
+    let port = unused_port();
+    let options = ServiceOptions::new()
+        .with_static_istag(ISTAG)
+        .with_service("RFC 3507 opt-body service")
+        .with_opt_body("text/plain", OPT_BODY.to_vec());
+    let server = Server::builder()
+        .bind(&format!("127.0.0.1:{port}"))
+        .route_respmod("info", no_modification_handler, Some(options))
+        .build()
+        .await
+        .expect("build opt-body options server");
+
+    tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    port
+}
+
 async fn send_raw_icap_request(port: u16, request: &str) -> Vec<u8> {
     let mut stream = TcpStream::connect(("127.0.0.1", port))
         .await
@@ -625,6 +647,31 @@ mod section_4_10_options {
                 .expect("Transfer-Complete"),
             "*"
         );
+    }
+
+    /// RFC 3507 §4.10: an `OPTIONS` response may carry an opt-body advertised via
+    /// `Encapsulated: opt-body=0` and described by `Opt-body-type`. The entity is
+    /// ICAP-chunked on the wire; the client dechunks it into `Response::body()`.
+    #[tokio::test]
+    async fn supported_service_options_emit_chunked_opt_body() {
+        let port = start_opt_body_options_server().await;
+        let client = Client::builder().host("127.0.0.1").port(port).build();
+        let response = client
+            .send(&Request::options("info"))
+            .await
+            .expect("send options");
+
+        assert_eq!(response.status_code(), StatusCode::OK);
+        assert_eq!(
+            response.get_header("Encapsulated").expect("Encapsulated"),
+            "opt-body=0"
+        );
+        assert_eq!(
+            response.get_header("Opt-body-type").expect("Opt-body-type"),
+            "text/plain"
+        );
+        // The ICAP-chunked opt-body round-trips back to the original bytes.
+        assert_eq!(response.body(), OPT_BODY);
     }
 
     #[tokio::test]

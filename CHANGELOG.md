@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Client-side OPTIONS response cache (RFC 3507 §4.10 / §5), opt-in via `ClientBuilder::with_options_cache(OptionsCacheConfig)`. Lifetime is taken from the response `Options-TTL` header, falling back to `OptionsCacheConfig::default_ttl`; with neither, the response is not cached. A changed `ISTag` observed on a later `REQMOD`/`RESPMOD` response invalidates the entry, and `Client::invalidate_options_cache()` clears every entry on demand (#15).
+- Client-side `Transfer-Preview` / `Transfer-Ignore` / `Transfer-Complete` policy (RFC 3507 §4.10.2). When the OPTIONS cache is enabled, the client resolves the per-extension transfer action from the cached OPTIONS response: `Transfer-Ignore` returns a synthetic `204` without contacting the server, `Transfer-Complete` sends the full body with no `Preview` header, and `Transfer-Preview` sends the advertised preview window before `100 Continue` (#16, #19).
+- Client proxy authentication (RFC 3507 §7.1), opt-in via `ClientBuilder::proxy_auth(username, password)`. On `407 Proxy Authentication Required` the client retries the request once with `Proxy-Authorization: Basic <base64(user:pass)>`. New public `ProxyAuth` type (#16, #19).
+- New examples: `options_cache_client`, `transfer_policy_client`, `proxy_auth_client`.
+
+### Changed
+
+- Server-injected request metadata (`ISTag`, chunk trailers) moved off the public `Request` field set into `IncomingMeta`, carried through the new sealed `DirectionMeta` trait as `Request<R, D>::meta`. `OutboundRequest` pays zero overhead for these fields; `IncomingRequest` exposes them via `istag()` / `chunk_trailers()` (#18).
+
+### Fixed
+
+- Client response framing on early/single-line error responses: a parsed 4xx/5xx status line no longer terminates the ICAP response while the connection stays open, so error responses whose headers arrive in a later TCP read are not truncated (#15).
+
 ## 0.3
 
 ### Added
@@ -7,7 +24,7 @@
 - New top-level `tls` module (`ServerTlsConfig`, `ClientTlsConfig`, `TlsError`) consolidating all Rustls usage; replaces the ad-hoc TLS plumbing previously spread across `server/builder.rs` and `client/tls/*`.
 - Server TLS builder with explicit `from_pem` for PEM content, `from_pem_files` for file paths, `with_client_auth_pem` / `with_optional_client_auth_pem` for CA PEM content, file-path variants for both mTLS modes, `with_handshake_timeout`, and `from_rustls_config` escape hatch.
 - Client TLS builder with `with_native_roots`, `empty`, PEM-content and PEM-file trust root helpers, PEM-content and PEM-file client auth helpers, `with_sni`, `with_handshake_timeout`, and `from_rustls_config` escape hatch. Client mTLS is now supported.
-- Cargo feature `tls-rustls-ring` (default backend) and additive `tls-rustls-aws-lc-rs`; explicit `ensure_crypto_provider()` on first TLS use removes the implicit `install_default()` race.
+- Cargo feature `tls-rustls` (bundles the `ring` crypto provider as the default backend) and additive `tls-rustls-aws-lc-rs`; explicit `ensure_crypto_provider()` on first TLS use removes the implicit `install_default()` race.
 - Cargo feature `dangerous-insecure-tls` enabling a real `dangerous_disable_cert_verification()` on the client (parity with `c-icap-client -tls-no-verify`), gated behind the feature with a `WARN` log when used.
 - TLS handshake timeout enforced on both server (accept loop) and client (`connect`); surfaced as `TlsError::HandshakeTimeout` instead of a generic I/O error.
 - Client-side total-operation, TCP connect, write, and Preview continue timeouts via `ClientBuilder`, with matching `rs-icap-client` CLI flags.

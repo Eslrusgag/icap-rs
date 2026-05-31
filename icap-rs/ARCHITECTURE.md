@@ -3,11 +3,7 @@
 > **For AI agents and new contributors — start here.**
 > This document is the authoritative map of the `icap-rs` codebase.
 > Before reading any source file, read this document in full to understand
-> module ownership, key types, and data-flow invariants. It is intentionally
-> kept concise; every section is load-bearing. The CLAUDE.md files record
-> project principles and contribution rules; this file records *what is actually
-> built and how it fits together*.
-
+> module ownership, key types, and data-flow invariants.
 This document describes the internal structure of the `icap-rs` crate. Keep it
 up-to-date whenever you add, remove, or materially change a module, public
 type, or data-flow invariant.
@@ -32,30 +28,33 @@ The two CLI crates are thin shells. All protocol logic lives in `icap-rs`.
 src/
 ├── lib.rs               re-exports, public constants
 ├── error.rs             hierarchical error types
-├── request.rs           Request<R,D>, Body<R>, EmbeddedHttp<R>, Method, normalize_service_path
+├── request.rs           Request<R,D>, Body<R>, EmbeddedHttp<R>, Method, DirectionMeta, IncomingMeta, normalize_service_path
 ├── response.rs          Response<D>, StatusCode (re-export)
 ├── net.rs               Conn enum (plain TCP | TLS stream)
+├── protocol.rs          module file; declares + re-exports the protocol/ submodules
 ├── protocol/            wire-level parsing and serialization
 │   ├── chunked.rs       ICAP chunked framing (read/write/dechunk/trailers)
 │   ├── encapsulated.rs  Encapsulated header parsing
 │   ├── headers.rs       ICAP response head parser, serializer
 │   ├── http_embed.rs    embedded HTTP request/response serialization
 │   └── istag.rs         ISTag validation and quoting
+├── client.rs            module file; Client — send / streaming / get_request; ClientRef
 ├── client/
-│   ├── builder.rs       ClientBuilder, ConnectionPolicy
-│   ├── options_cache.rs OptionsCacheConfig, OptionsCache (client OPTIONS cache)
-│   ├── timeouts.rs      ClientTimeouts
-│   └── client.rs        Client — send / streaming / get_request
+│   ├── builder.rs       ClientBuilder, ConnectionPolicy, ProxyAuth
+│   ├── options_cache.rs OptionsCacheConfig, OptionsCache, CachedOptions, TransferAction
+│   └── timeouts.rs      ClientTimeouts
+├── server.rs            module file; Server, run/run_until accept loop, ShutdownEvent
 ├── server/
 │   ├── builder.rs       ServerBuilder
 │   ├── connection.rs    per-connection read-parse-route-respond loop
-│   ├── router.rs        RequestHandler, RouteEntry, RouteOutput trait, resolve_service
-│   ├── handler.rs       HandlerError, HandlerResult
+│   ├── router.rs        RouteEntry, HandlerEntry, RouteOutput trait, resolve_service
+│   ├── handler.rs       HandlerError, HandlerResult, BoxError
 │   ├── preview.rs       PreviewDecision
-│   ├── options.rs       ServiceOptions, IstagSource, TransferBehavior
+│   ├── options.rs       ServiceOptions, IstagSource, IsTagHandle, TransferBehavior
 │   ├── no_modification.rs  build_206_use_original_body helper
 │   ├── errors.rs        write_wire_*_response helpers
 │   └── timeouts.rs      ServerTimeouts
+├── tls.rs               module file (feature tls-rustls); ensure_crypto_provider, DEFAULT_HANDSHAKE_TIMEOUT
 └── tls/                 feature-gated: tls-rustls
     ├── client.rs        ClientTlsConfig → ClientTlsConnector
     ├── server.rs        ServerTlsConfig → TlsAcceptor
@@ -63,25 +62,15 @@ src/
     └── error.rs         TlsError
 ```
 
-### Layering rules
-
-```
-error, protocol/           ← no internal dependencies
-request, response, net     ← depend on error + protocol only
-client/, server/           ← depend on all layers above
-tls/                       ← depends on error only; orthogonal to client/server
-```
-
-Nothing in `protocol/` may import from `client/`, `server/`, or `tls/`.  
-Nothing in `error.rs` may import from any other internal module.
-
----
+The crate uses the Rust 2018 module layout: a module is a file `foo.rs`
+*alongside* a directory `foo/` holding its submodules. There are no `mod.rs`
+files.
 
 ## Key types
 
 ### Direction markers
 
-Every `Request` and `Response` carries a phantom direction marker:
+Every `Request` and `Response` carries a direction marker as a type parameter:
 
 | Type alias | Marker | Used by |
 |---|---|---|
@@ -92,6 +81,13 @@ Every `Request` and `Response` carries a phantom direction marker:
 
 This encoding makes it a compile-time error to call a server-only builder method
 from client code, or to mutate ICAP request metadata inside a handler.
+
+`Response<D>` keeps the marker as a zero-sized `PhantomData<D>`. `Request<R, D>`
+goes one step further: the marker selects a metadata type through the **sealed**
+`DirectionMeta` trait (`type Meta`), stored in `Request::meta`:
+
+- `Outbound` → `OutboundMeta` (zero-sized; no overhead on the client path).
+- `Incoming` → `IncomingMeta { istag, chunk_trailers }` (server-injected fields).
 
 ### Request
 
@@ -104,14 +100,17 @@ Request<R, D>
   preview_size: Option<usize>
   allow_204 / allow_206: bool
   preview_ieof: bool               true → send "0; ieof" chunk
-  chunk_trailers: HeaderMap        RFC 7230 §4.1.2 trailers; populated by server on Incoming, empty on Outbound
+  meta: D::Meta                    OutboundMeta on Outbound; IncomingMeta { istag, chunk_trailers } on Incoming
 ```
 
 `R` is the body carrier:
 - `Vec<u8>` on the client side (buffered)
 - `Box<dyn AsyncRead + Unpin + Send>` (`BodyRead`) on the server side (streaming)
 
-`chunk_trailers` is accessible via `IncomingRequest::chunk_trailers() -> &HeaderMap`.
+Server-injected metadata is reachable only on `IncomingRequest`:
+`istag() -> Option<&str>` and `chunk_trailers() -> &HeaderMap` (RFC 7230 §4.1.2
+trailers, populated by the server during dechunking). On `OutboundRequest` the
+metadata type is zero-sized and these accessors do not exist.
 
 ### Body
 
@@ -249,7 +248,9 @@ Server::run_until(shutdown: F)
     arm 1: shutdown future fires (only if !shutting_down)
       → send true on watch channel (all keep-alive connections close after current request)
       → shutting_down = true
-      → emit ShutdownEvent::Draining via on_shutdown_event callback
+      → if no connections are in flight: break immediately (no Draining event)
+      → else emit ShutdownEvent::Draining { active_connections, drain_timeout }
+             via on_shutdown_event callback
       → if shutdown_drain timeout configured: reset drain_timer to now + timeout
 
     arm 2: drain_timer fires (only if drain_timer_armed)
@@ -404,9 +405,11 @@ When the shutdown future resolves:
 - The accept loop keeps running. New TCP connections receive a fire-and-forget
   `503 Service Shutting Down` response. For TLS, only a TCP FIN is sent (no
   handshake before rejecting).
-- `ShutdownEvent::Draining` is delivered to the user callback registered via
-  `ServerBuilder::on_shutdown_event`. If no callback is registered, the default
-  handler logs via `tracing::warn`.
+- `ShutdownEvent::Draining { active_connections, drain_timeout }` is delivered to
+  the user callback registered via `ServerBuilder::on_shutdown_event`. If no
+  callback is registered, the default handler logs via `tracing::warn`. When no
+  connection is in flight at shutdown time, the loop exits immediately and no
+  `Draining` event is emitted.
 - If `ServerTimeouts::shutdown_drain` is set, a re-armable `tokio::time::Sleep`
   timer is activated. When it fires, `ShutdownEvent::DrainTimedOut` is delivered,
   all tasks are aborted, and `run_until` returns immediately.
@@ -431,7 +434,7 @@ coordinating a separate shutdown channel.
 
 | Type | Where defined | Purpose |
 |---|---|---|
-| `ShutdownEvent` | `server.rs` | `#[non_exhaustive]` enum delivered to user callback; variants `Draining`, `DrainTimedOut` |
+| `ShutdownEvent` | `server.rs` | `#[non_exhaustive]` enum delivered to user callback; `Draining { active_connections, drain_timeout }` and `DrainTimedOut { remaining_connections }` |
 | `ServerTimeouts::shutdown_drain` | `server/timeouts.rs` | `Option<Duration>` — how long to wait before aborting in-flight connections |
 | `TaskTracker` | `tokio_util::task` | Third-party type; registered via `ServerBuilder::with_task_tracker` |
 
@@ -455,9 +458,12 @@ an early response before sending headers.
 call). `ServerTlsConfig` can be constructed from PEM bytes or file paths. Both
 support mTLS via `with_client_auth_pem*` helpers.
 
-The global rustls crypto provider is installed once via a `OnceLock` in
-`tls::ensure_crypto_provider()`, preferring `aws-lc-rs` and falling back to
-`ring`.
+The global rustls crypto provider is installed lazily on first TLS use by
+`tls::ensure_crypto_provider()`. It returns early when a provider is already
+installed (by this crate or the host application); otherwise it installs one
+chosen at **compile time** by Cargo features — `aws-lc-rs` when
+`tls-rustls-aws-lc-rs` is enabled, otherwise `ring` (bundled by `tls-rustls`).
+This is feature selection, not a runtime fallback.
 
 ---
 

@@ -518,9 +518,9 @@ impl<R> EmbeddedHttp<R> {
 /// Returns `(http_head_bytes, body_bytes_up_to_limit, original_body_len)`.
 ///
 /// `body_limit` caps how many body bytes are copied into the returned `Vec`.
-/// Pass `None` to copy the full body (required for [`Client::send`] so the
-/// remainder is available after `100 Continue`).
-/// Pass `Some(preview_size)` for dry-run helpers like [`Client::get_request`]
+/// Pass `None` to copy the full body (required for [`Client::send`](crate::Client::send)
+/// so the remainder is available after `100 Continue`).
+/// Pass `Some(preview_size)` for dry-run helpers like [`Client::get_request`](crate::Client::get_request)
 /// where only the preview bytes need to appear in the wire buffer; the caller
 /// must use `original_body_len` to decide the correct chunk terminator
 /// (`ieof` vs `0\r\n\r\n`) regardless of how many bytes were actually copied.
@@ -842,11 +842,14 @@ impl<R> Request<R, Incoming> {
         &self.meta.chunk_trailers
     }
 
-    /// Return the `ISTag` that the server resolved from [`ServiceOptions`] for
-    /// this request, or `None` if no `ServiceOptions` were configured.
+    /// Return the `ISTag` that the server resolved from
+    /// [`ServiceOptions`](crate::ServiceOptions) for this request, or `None` if
+    /// no `ServiceOptions` were configured.
     ///
     /// This is the same value that will appear in the ICAP response's `ISTag`
-    /// header when using [`Response::no_content_with_istag`] or similar.
+    /// header when using
+    /// [`Response::no_content_with_istag`](crate::Response::no_content_with_istag)
+    /// or similar.
     ///
     /// This accessor is only available on [`IncomingRequest`]; outbound client
     /// requests do not carry an ISTag.
