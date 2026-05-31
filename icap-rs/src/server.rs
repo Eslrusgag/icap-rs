@@ -275,7 +275,7 @@ impl Server {
         let mut drain_deadline: Option<tokio::time::Instant> = None;
 
         // Sentinel timer far in the future; reset to a real deadline when drain begins.
-        let drain_timer = sleep(Duration::from_secs(365 * 24 * 3600));
+        let drain_timer = sleep(Duration::from_hours(8760));
         tokio::pin!(shutdown, drain_timer);
 
         loop {

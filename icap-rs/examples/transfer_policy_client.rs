@@ -162,7 +162,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .host("127.0.0.1")
         .port(port)
         // Enable the OPTIONS cache — required for Transfer-* policy to apply.
-        .with_options_cache(OptionsCacheConfig::new().with_default_ttl(Duration::from_secs(60)))
+        .with_options_cache(OptionsCacheConfig::new().with_default_ttl(Duration::from_mins(1)))
         .build();
 
     // -----------------------------------------------------------------------

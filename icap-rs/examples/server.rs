@@ -38,7 +38,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             // In a real application this might be a queue consumer, metrics flusher, etc.
             // TaskTracker::wait() returns only after close() is called AND all spawned
             // tasks complete, so this task will be awaited during graceful shutdown.
-            tokio::time::sleep(Duration::from_millis(10000)).await;
+            tokio::time::sleep(Duration::from_secs(10)).await;
             info!("background task finished");
         }
     });

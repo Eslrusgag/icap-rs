@@ -763,9 +763,7 @@ impl CacheBenchEnv {
             .host("127.0.0.1")
             .port(port)
             .keep_alive(true)
-            .with_options_cache(
-                OptionsCacheConfig::new().with_default_ttl(Duration::from_secs(3600)),
-            )
+            .with_options_cache(OptionsCacheConfig::new().with_default_ttl(Duration::from_hours(1)))
             .build();
 
         let request_empty = Request::reqmod("/reqmod").allow_204();

@@ -1443,7 +1443,7 @@ mod section_5_options_cache {
         let client = Client::builder()
             .host("127.0.0.1")
             .port(port)
-            .with_options_cache(OptionsCacheConfig::new().with_default_ttl(Duration::from_secs(60)))
+            .with_options_cache(OptionsCacheConfig::new().with_default_ttl(Duration::from_mins(1)))
             .build();
 
         // Two REQMODs in a row must share one cached OPTIONS.
@@ -1621,7 +1621,7 @@ mod section_4_10_2_transfer_policy {
         let client = Client::builder()
             .host("127.0.0.1")
             .port(port)
-            .with_options_cache(OptionsCacheConfig::new().with_default_ttl(Duration::from_secs(60)))
+            .with_options_cache(OptionsCacheConfig::new().with_default_ttl(Duration::from_mins(1)))
             .build();
 
         let resp = client
@@ -1646,7 +1646,7 @@ mod section_4_10_2_transfer_policy {
         let client = Client::builder()
             .host("127.0.0.1")
             .port(port)
-            .with_options_cache(OptionsCacheConfig::new().with_default_ttl(Duration::from_secs(60)))
+            .with_options_cache(OptionsCacheConfig::new().with_default_ttl(Duration::from_mins(1)))
             .build();
 
         // Request has NO preview set; Transfer-Preview: html should force Preview: 512.
@@ -1677,7 +1677,7 @@ mod section_4_10_2_transfer_policy {
         let client = Client::builder()
             .host("127.0.0.1")
             .port(port)
-            .with_options_cache(OptionsCacheConfig::new().with_default_ttl(Duration::from_secs(60)))
+            .with_options_cache(OptionsCacheConfig::new().with_default_ttl(Duration::from_mins(1)))
             .build();
 
         let resp = client

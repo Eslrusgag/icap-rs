@@ -1,0 +1,7 @@
+# Pin the toolchain so local builds and CI use the same compiler and the same
+# Clippy lint set. Bumping Rust is then a deliberate change to this file rather
+# than a surprise breakage when a new stable adds pedantic/nursery lints.
+[toolchain]
+channel = "1.96.0"
+profile = "minimal"
+components = ["rustfmt", "clippy"]
