@@ -1,15 +1,15 @@
+use clap::Parser;
 use clap::builder::styling::{AnsiColor, Color, Style, Styles};
-use clap::{Parser, ValueEnum};
 
 use http::{
     HeaderName, HeaderValue, Method, Request as HttpRequest, Response as HttpResponse, StatusCode,
     Version,
 };
 use icap_rs::error::IcapResult;
-use icap_rs::response::{Response as IcapResponse, StatusCode as IcapStatus};
+use icap_rs::response::{ParsedResponse as IcapResponse, StatusCode as IcapStatus};
 use icap_rs::{Client, Request};
 use std::{fs, path::PathBuf};
-use tokio::fs::File;
+use tokio::fs::{self as tokio_fs, File};
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, error, info, warn};
 
@@ -20,7 +20,7 @@ use std::time::Duration;
 const BIN_NAME: &str = env!("CARGO_PKG_NAME");
 const BIN_VER: &str = env!("CARGO_PKG_VERSION");
 
-pub fn cli_styles() -> Styles {
+pub const fn cli_styles() -> Styles {
     Styles::styled()
         .usage(
             Style::new()
@@ -54,13 +54,6 @@ pub fn cli_styles() -> Styles {
         .placeholder(Style::new().fg_color(Some(Color::Ansi(AnsiColor::BrightBlue))))
 }
 
-#[derive(ValueEnum, Clone, Debug)]
-enum TlsBackendCli {
-    Rustls,
-    // OpenSSL backend is intentionally disabled/commented out
-    // Openssl,
-}
-
 #[derive(Parser, Debug)]
 #[command(
     name = "rs-icap-client",
@@ -81,9 +74,21 @@ struct Args {
     #[arg(short = 'o', long)]
     output: Option<String>,
 
-    /// Read timeout in seconds (client-side). Default: no timeout (like c-icap-client).
+    /// Total timeout in seconds for one ICAP operation. Default: no timeout.
     #[arg(short, long)]
     timeout: Option<u64>,
+
+    /// TCP connect timeout in seconds. Default: no timeout.
+    #[arg(long = "connect-timeout")]
+    connect_timeout: Option<u64>,
+
+    /// Network write timeout in seconds. Default: no timeout.
+    #[arg(long = "write-timeout")]
+    write_timeout: Option<u64>,
+
+    /// Timeout in seconds while waiting for `100 Continue` or an early final response.
+    #[arg(long = "continue-timeout")]
+    continue_timeout: Option<u64>,
 
     /// ICAP method: `OPTIONS|REQMOD|RESPMOD`.
     #[arg(short, long)]
@@ -113,7 +118,7 @@ struct Args {
     #[arg(long, action = clap::ArgAction::SetTrue)]
     no204: bool,
 
-    /// Advertise/accept `Allow: 206`.
+    /// Advertise `Allow: 206` and accept partial-content responses.
     #[arg(long = "206", action = clap::ArgAction::SetTrue)]
     allow_206: bool,
 
@@ -129,11 +134,8 @@ struct Args {
     #[arg(long = "rhx")]
     rhx_header: Vec<String>,
 
-    /// Select TLS backend (effective only for `icaps://`).
-    #[arg(long = "tls-backend", value_enum)]
-    tls_backend: Option<TlsBackendCli>,
-
-    /// Compatibility flag. With rustls 0.23 this is ignored.
+    /// Disable server certificate verification (rustls).
+    /// Equivalent to c-icap-client `-tls-no-verify`. **Insecure.**
     #[arg(long, action = clap::ArgAction::SetTrue)]
     insecure: bool,
 
@@ -141,9 +143,22 @@ struct Args {
     #[arg(long = "tls-ca", value_name = "PEM_FILE")]
     tls_ca: Option<String>,
 
+    /// Path to a client certificate chain in PEM (rustls only). Pair with
+    /// `--tls-key` to enable mutual TLS.
+    #[arg(long = "tls-cert", value_name = "PEM_FILE", requires = "tls_key")]
+    tls_cert: Option<String>,
+
+    /// Path to the client private key in PEM (rustls only).
+    #[arg(long = "tls-key", value_name = "PEM_FILE", requires = "tls_cert")]
+    tls_key: Option<String>,
+
     /// Override SNI hostname (used with TLS; ignored for `icap://`).
     #[arg(long = "sni", value_name = "HOSTNAME")]
     sni: Option<String>,
+
+    /// TLS handshake timeout in seconds (used with TLS; ignored for `icap://`).
+    #[arg(long = "tls-handshake-timeout")]
+    tls_handshake_timeout: Option<u64>,
 
     /// Force `Preview: N` explicitly (advanced). If not set, negotiated via OPTIONS.
     #[arg(short = 'w', long)]
@@ -172,6 +187,88 @@ struct IcapCaps {
     allow_204_advertised: bool,
     methods: HashSet<String>,
     timeout_secs: Option<u64>,
+}
+
+/// Apply CLI TLS arguments (`--tls-ca`, `--tls-cert`/`--tls-key`, `--sni`,
+/// `--insecure`) to a `ClientBuilder`. When the crate is built without
+/// `tls-rustls`, the TLS flags are reported as noops.
+#[cfg(feature = "tls-rustls")]
+fn apply_tls_args(
+    builder: icap_rs::ClientBuilder,
+    args: &Args,
+    is_tls_uri: bool,
+) -> IcapResult<icap_rs::ClientBuilder> {
+    use icap_rs::tls::ClientTlsConfig;
+
+    if !is_tls_uri {
+        if args.sni.is_some() {
+            eprintln!("Note: --sni is ignored for icap:// (TLS is off).");
+        }
+        if args.tls_handshake_timeout.is_some() {
+            eprintln!("Note: --tls-handshake-timeout is ignored for icap:// (TLS is off).");
+        }
+        if args.tls_ca.is_some() {
+            eprintln!("Note: --tls-ca is ignored for icap:// (TLS is off).");
+        }
+        if args.tls_cert.is_some() || args.tls_key.is_some() {
+            eprintln!("Note: --tls-cert/--tls-key are ignored for icap:// (TLS is off).");
+        }
+        if args.insecure {
+            eprintln!("Note: --insecure is ignored for icap:// (TLS is off).");
+        }
+        return Ok(builder);
+    }
+
+    let mut tls = ClientTlsConfig::with_native_roots();
+    if let Some(pem) = &args.tls_ca {
+        tls = tls.add_root_ca_pem_file(pem)?;
+    }
+    if let (Some(cert), Some(key)) = (&args.tls_cert, &args.tls_key) {
+        tls = tls.with_client_auth_pem_files(cert, key)?;
+    }
+    if let Some(sni) = &args.sni {
+        tls = tls.with_sni(sni);
+    }
+    if let Some(secs) = args.tls_handshake_timeout {
+        tls = tls.with_handshake_timeout(Duration::from_secs(secs));
+    }
+    if args.insecure {
+        // Mirrors c-icap-client `-tls-no-verify`. Logged at WARN.
+        tls = tls.dangerous_disable_cert_verification()?;
+    }
+    Ok(builder.with_tls(tls))
+}
+
+// Mirror the `tls-rustls` signature so the call site needs no cfg.
+#[cfg(not(feature = "tls-rustls"))]
+#[allow(clippy::unnecessary_wraps)]
+fn apply_tls_args(
+    builder: icap_rs::ClientBuilder,
+    args: &Args,
+    is_tls_uri: bool,
+) -> IcapResult<icap_rs::ClientBuilder> {
+    if is_tls_uri {
+        eprintln!(
+            "Error: `icaps://` requested but this binary was built without feature `tls-rustls`."
+        );
+        std::process::exit(2);
+    }
+    for (flag, set) in [
+        ("--tls-ca", args.tls_ca.is_some()),
+        ("--tls-cert", args.tls_cert.is_some()),
+        ("--tls-key", args.tls_key.is_some()),
+        ("--sni", args.sni.is_some()),
+        (
+            "--tls-handshake-timeout",
+            args.tls_handshake_timeout.is_some(),
+        ),
+        ("--insecure", args.insecure),
+    ] {
+        if set {
+            eprintln!("Note: {flag} requires a binary built with feature `tls-rustls`.");
+        }
+    }
+    Ok(builder)
 }
 
 #[tokio::main]
@@ -213,8 +310,7 @@ async fn main() -> IcapResult<()> {
         .await
         .ok()
         .and_then(|mut it| it.next())
-        .map(|sa| sa.ip().to_string())
-        .unwrap_or_else(|| "?".into());
+        .map_or_else(|| "?".into(), |sa| sa.ip().to_string());
 
     let ua = format!(
         "{}/{} (lib: icap-rs/{})",
@@ -223,78 +319,15 @@ async fn main() -> IcapResult<()> {
         icap_rs::LIB_VERSION
     );
 
-    let mut builder = Client::builder().with_uri(&args.uri)?;
+    let builder = Client::builder().with_uri(&args.uri)?;
     let is_tls_uri = args.uri.starts_with("icaps://");
-
-    if let Some(be) = &args.tls_backend {
-        if is_tls_uri {
-            match be {
-                TlsBackendCli::Rustls => {
-                    #[cfg(feature = "tls-rustls")]
-                    {
-                        builder = builder.use_rustls();
-                    }
-                    #[cfg(not(feature = "tls-rustls"))]
-                    {
-                        eprintln!("This binary was built without feature `tls-rustls`");
-                        std::process::exit(2);
-                    }
-                } // TlsBackendCli::Openssl => {
-                  //     // OpenSSL backend intentionally disabled
-                  //     #[cfg(feature = "tls-openssl")]
-                  //     {
-                  //         builder = builder.use_openssl();
-                  //     }
-                  //     #[cfg(not(feature = "tls-openssl"))]
-                  //     {
-                  //         eprintln!("This binary was built without feature `tls-openssl`");
-                  //         std::process::exit(2);
-                  //     }
-                  // }
-            }
-        } else {
-            eprintln!("Note: --tls-backend is ignored for icap:// (use icaps:// to enable TLS).");
-        }
-    }
-
-    if let Some(sni) = &args.sni {
-        if is_tls_uri {
-            builder = builder.sni_hostname(sni);
-        } else {
-            eprintln!("Note: --sni is ignored for icap:// (TLS is off).");
-        }
-    }
-
-    #[cfg(feature = "tls-rustls")]
-    {
-        if let Some(pem_path) = &args.tls_ca {
-            if is_tls_uri {
-                builder = builder.add_root_ca_pem_file(pem_path)?;
-            } else {
-                eprintln!("Note: --tls-ca is ignored for icap:// (TLS is off).");
-            }
-        }
-    }
-    #[cfg(not(feature = "tls-rustls"))]
-    {
-        if args.tls_ca.is_some() {
-            eprintln!("--tls-ca requires a binary built with feature `tls-rustls`.");
-        }
-    }
-
-    if args.insecure {
-        if is_tls_uri {
-            #[cfg(feature = "tls-rustls")]
-            eprintln!(
-                "Warning: --insecure is ignored with rustls 0.23 (public no-verify API is unavailable)."
-            );
-        } else {
-            eprintln!("Note: --insecure is ignored for icap:// (TLS is off).");
-        }
-    }
+    let builder = apply_tls_args(builder, &args, is_tls_uri)?;
 
     let client = builder
-        .read_timeout(args.timeout.map(Duration::from_secs))
+        .timeout(args.timeout.map(Duration::from_secs))
+        .connect_timeout(args.connect_timeout.map(Duration::from_secs))
+        .write_timeout(args.write_timeout.map(Duration::from_secs))
+        .continue_timeout(args.continue_timeout.map(Duration::from_secs))
         .user_agent(&ua)
         .build();
     let service = service_from_uri(&args.uri).unwrap_or_else(|| "/".to_string());
@@ -306,7 +339,7 @@ async fn main() -> IcapResult<()> {
         debug!("Negotiated caps: {:?}", caps);
     }
 
-    let mut icap_req = Request::new(icap_method.as_str(), &service);
+    let mut icap_req = Request::try_new(icap_method.as_str(), &service)?;
     if !args.no204 {
         icap_req = icap_req.allow_204();
     }
@@ -351,11 +384,12 @@ async fn main() -> IcapResult<()> {
     {
         icap_req = icap_req.preview(n);
     }
+    let effective_preview = icap_req.preview_size();
 
     // Prepare embedded HTTP and body source
     let (file_bytes, file_path_opt, file_len_opt) = if let Some(filename) = &args.filename {
         let p = PathBuf::from(filename);
-        if args.stream_io || caps.preview == Some(0) || args.nopreview {
+        if should_stream_file_body(args.stream_io, effective_preview) {
             let len = std::fs::metadata(&p).ok().map(|m| m.len());
             debug!("Using stream-io from file '{}' (len={:?})", filename, len);
             (None, Some(p), len)
@@ -375,14 +409,30 @@ async fn main() -> IcapResult<()> {
     } else {
         (None, None, None)
     };
+    let stream_file_body = file_path_opt.is_some() && file_bytes.is_none();
+    if stream_file_body && effective_preview.is_none() {
+        icap_req = icap_req.preview(0);
+    }
+    let effective_preview = icap_req.preview_size();
+    validate_ieof_body(
+        args.ieof,
+        file_path_opt.is_some(),
+        file_len_opt,
+        effective_preview,
+    )?;
 
     if icap_method == "REQMOD" || icap_method == "RESPMOD" {
         if icap_method == "REQMOD" {
             // Build embedded HTTP request
-            let (host_hdr, uri) = match args.req_url.as_deref() {
-                Some(url) => (host_from_url(url).map(|s| s.to_string()), url.to_string()),
-                None => (Some("localhost".into()), "/rs-icap-client".into()),
-            };
+            let (host_hdr, uri) = args.req_url.as_deref().map_or_else(
+                || (Some("localhost".into()), "/rs-icap-client".into()),
+                |url| {
+                    (
+                        host_from_url(url).map(std::string::ToString::to_string),
+                        url.to_string(),
+                    )
+                },
+            );
 
             let body_vec = file_bytes.clone().unwrap_or_default();
             let use_post = !body_vec.is_empty() || file_len_opt.unwrap_or(0) > 0;
@@ -395,9 +445,7 @@ async fn main() -> IcapResult<()> {
             if let Some(h) = host_hdr.as_deref() {
                 httpb = httpb.header("Host", h);
             }
-            if args.stream_io
-                && let Some(len) = file_len_opt
-            {
+            if let Some(len) = file_len_opt {
                 httpb = httpb.header("Content-Length", len.to_string());
             }
 
@@ -413,23 +461,29 @@ async fn main() -> IcapResult<()> {
                 }
             }
 
-            let http_req = httpb
-                .body(body_vec)
-                .map_err(|e| format!("failed to build HTTP request: {e}"))?;
-            icap_req = icap_req.with_http_request(http_req);
+            if stream_file_body {
+                let http_req = httpb.body(()).map_err(|e| {
+                    icap_rs::Error::http_parse(format!("failed to build HTTP request head: {e}"))
+                })?;
+                icap_req = icap_req.with_http_request_head(http_req)?;
+            } else {
+                let http_req = httpb.body(body_vec).map_err(|e| {
+                    icap_rs::Error::http_parse(format!("failed to build HTTP request: {e}"))
+                })?;
+                icap_req = icap_req.with_http_request(http_req)?;
+            }
         } else {
             // Build embedded HTTP response (HTTP/1.0 by default, like c-icap-client)
             let mut httpb = HttpResponse::builder()
                 .status(StatusCode::OK)
                 .version(Version::HTTP_10);
 
-            // Simple `Date` and `Last-Modified` similar to c-icap-client output (local time)
-            let now_local = Local::now();
-            let http_date_simple = now_local.format("%a %b %d %H:%M:%S %Y").to_string();
+            // RFC 2822 date with local timezone offset (required by RFC 3507 §4.10.2)
+            let http_date_rfc2822 = Local::now().to_rfc2822();
 
             httpb = httpb
-                .header("Date", http_date_simple.as_str())
-                .header("Last-Modified", http_date_simple.as_str());
+                .header("Date", http_date_rfc2822.as_str())
+                .header("Last-Modified", http_date_rfc2822.as_str());
 
             if let Some(len) = file_len_opt {
                 httpb = httpb.header("Content-Length", len.to_string());
@@ -451,23 +505,22 @@ async fn main() -> IcapResult<()> {
             }
 
             let body_vec = file_bytes.clone().unwrap_or_default();
-            let http_resp = httpb
-                .body(body_vec)
-                .map_err(|e| format!("failed to build HTTP response: {e}"))?;
-            icap_req = icap_req.with_http_response(http_resp);
+            if stream_file_body {
+                let http_resp = httpb.body(()).map_err(|e| {
+                    icap_rs::Error::http_parse(format!("failed to build HTTP response head: {e}"))
+                })?;
+                icap_req = icap_req.with_http_response_head(http_resp)?;
+            } else {
+                let http_resp = httpb.body(body_vec).map_err(|e| {
+                    icap_rs::Error::http_parse(format!("failed to build HTTP response: {e}"))
+                })?;
+                icap_req = icap_req.with_http_response(http_resp)?;
+            }
         }
 
         // Dry-run: print the exact wire bytes and exit
         if args.print_request {
-            let forced_preview = if args.nopreview {
-                Some(0)
-            } else {
-                args.preview_size
-            };
-            let streaming_mode = args.nopreview
-                || forced_preview == Some(0)
-                || (args.stream_io && forced_preview.unwrap_or(0) == 0);
-
+            let streaming_mode = stream_file_body;
             let bytes = client.get_request_wire(&icap_req, streaming_mode)?;
             println!("{}", String::from_utf8_lossy(&bytes));
             return Ok(());
@@ -477,18 +530,22 @@ async fn main() -> IcapResult<()> {
             &client,
             icap_req,
             file_path_opt.clone(),
-            file_bytes.clone(),
-            if args.preview_size.is_none() && !args.nopreview {
-                caps.preview
-            } else {
-                args.preview_size
-            },
-            args.stream_io,
+            effective_preview,
+            stream_file_body,
             args.nopreview,
         )
         .await?;
 
-        output_response(&args, &server_host, &server_ip, server_port, response).await?;
+        output_response(
+            &args,
+            &server_host,
+            &server_ip,
+            server_port,
+            response,
+            file_path_opt.as_ref(),
+            file_bytes.as_deref(),
+        )
+        .await?;
         return Ok(());
     }
 
@@ -500,7 +557,16 @@ async fn main() -> IcapResult<()> {
             return Ok(());
         }
         let response = client.send(&icap_req).await?;
-        output_response(&args, &server_host, &server_ip, server_port, response).await?;
+        output_response(
+            &args,
+            &server_host,
+            &server_ip,
+            server_port,
+            response,
+            None,
+            None,
+        )
+        .await?;
         return Ok(());
     }
 
@@ -513,23 +579,27 @@ async fn output_response(
     server_ip: &str,
     server_port: u16,
     response: IcapResponse,
+    original_body_path: Option<&PathBuf>,
+    original_body_bytes: Option<&[u8]>,
 ) -> IcapResult<()> {
-    if args.verbose {
-        println!(
-            "ICAP server:{}, ip:{}, port:{}\n",
-            server_host, server_ip, server_port
-        );
+    let output_body =
+        response_output_body(&response, original_body_path, original_body_bytes).await?;
 
-        if matches!(response.status_code, IcapStatus::NO_CONTENT) {
+    if args.verbose {
+        println!("ICAP server:{server_host}, ip:{server_ip}, port:{server_port}\n");
+
+        if matches!(response.status_code(), IcapStatus::NO_CONTENT) {
             println!("No modification needed (Allow 204 response)\n");
+        } else if let Some(offset) = response.use_original_body_offset() {
+            println!("Partial content uses original body from offset {offset}\n");
         }
 
         println!("ICAP HEADERS:");
         println!(
             "\t{} {} {}",
-            response.version,
-            response.status_code.as_str(),
-            response.status_text
+            response.version(),
+            response.status_code().as_str(),
+            response.status_text()
         );
         for (name, value) in response.headers() {
             let v = value.to_str().unwrap_or("<binary>");
@@ -539,22 +609,62 @@ async fn output_response(
 
         if let Some(output_file) = &args.output {
             let mut file = File::create(output_file).await?;
-            file.write_all(&response.body).await?;
+            file.write_all(&output_body).await?;
             info!("Response body written to file: {}", output_file);
-        } else if !response.body.is_empty() {
-            print!("{}", String::from_utf8_lossy(&response.body));
+        } else if !output_body.is_empty() {
+            print!("{}", String::from_utf8_lossy(&output_body));
         }
     } else {
-        println!("ICAP/1.0 {} {}", response.status_code, response.status_text);
+        println!(
+            "ICAP/1.0 {} {}",
+            response.status_code(),
+            response.status_text()
+        );
         if let Some(output_file) = &args.output {
             let mut file = File::create(output_file).await?;
-            file.write_all(&response.body).await?;
+            file.write_all(&output_body).await?;
             info!("Response body written to file: {}", output_file);
         } else {
-            print!("{}", String::from_utf8_lossy(&response.body));
+            print!("{}", String::from_utf8_lossy(&output_body));
         }
     }
     Ok(())
+}
+
+async fn response_output_body(
+    response: &IcapResponse,
+    original_body_path: Option<&PathBuf>,
+    original_body_bytes: Option<&[u8]>,
+) -> IcapResult<Vec<u8>> {
+    let Some(offset) = response.use_original_body_offset() else {
+        return Ok(response.body().to_vec());
+    };
+
+    let original_body = if let Some(bytes) = original_body_bytes {
+        bytes.to_vec()
+    } else if let Some(path) = original_body_path {
+        tokio_fs::read(path).await?
+    } else {
+        Vec::new()
+    };
+
+    append_original_body_suffix(response.body().to_vec(), &original_body, offset)
+}
+
+fn append_original_body_suffix(
+    mut response_body: Vec<u8>,
+    original_body: &[u8],
+    offset: usize,
+) -> IcapResult<Vec<u8>> {
+    if offset > original_body.len() {
+        return Err(icap_rs::Error::body(format!(
+            "use-original-body offset {offset} exceeds original body length {}",
+            original_body.len()
+        )));
+    }
+
+    response_body.extend_from_slice(&original_body[offset..]);
+    Ok(response_body)
 }
 
 fn service_from_uri(uri: &str) -> Option<String> {
@@ -610,6 +720,31 @@ fn parse_authority_and_service(uri: &str) -> Option<(String, u16, String)> {
     Some((host, port, service))
 }
 
+const fn should_stream_file_body(cli_stream_io: bool, preview_size: Option<usize>) -> bool {
+    cli_stream_io || matches!(preview_size, Some(0))
+}
+
+fn validate_ieof_body(
+    ieof: bool,
+    has_file: bool,
+    file_len: Option<u64>,
+    preview_size: Option<usize>,
+) -> IcapResult<()> {
+    if !ieof || !has_file || preview_size != Some(0) {
+        return Ok(());
+    }
+
+    match file_len {
+        Some(0) => Ok(()),
+        Some(len) => Err(icap_rs::Error::body(format!(
+            "--ieof with Preview: 0 is only valid when the complete body is already in the preview; file has {len} byte(s)"
+        ))),
+        None => Err(icap_rs::Error::body(
+            "--ieof with Preview: 0 requires proving that the file body is empty",
+        )),
+    }
+}
+
 async fn negotiate_caps(client: &Client, service: &str) -> IcapResult<IcapCaps> {
     let opt_req = Request::options(service).allow_204();
     let resp: IcapResponse = client.send(&opt_req).await?;
@@ -652,16 +787,25 @@ async fn send_with_preview(
     client: &Client,
     mut icap_req: Request,
     file_path_opt: Option<PathBuf>,
-    _file_in_mem: Option<Vec<u8>>,
     negotiated_or_forced_preview: Option<usize>,
-    cli_stream_io: bool,
+    stream_file_body: bool,
     cli_nopreview: bool,
 ) -> IcapResult<IcapResponse> {
+    if stream_file_body && let Some(file_path) = file_path_opt {
+        if cli_nopreview || negotiated_or_forced_preview == Some(0) {
+            icap_req = icap_req.preview(0);
+        } else if let Some(n) = negotiated_or_forced_preview {
+            icap_req = icap_req.preview(n);
+        } else {
+            // c-icap-client compatibility: streaming uploads use a Preview: 0
+            // gate unless the server or caller selected a larger preview.
+            icap_req = icap_req.preview(0);
+        }
+        return client.send_streaming(&icap_req, file_path).await;
+    }
+
     if cli_nopreview || negotiated_or_forced_preview == Some(0) {
         icap_req = icap_req.preview(0);
-        if let Some(file_path) = file_path_opt {
-            return client.send_streaming(&icap_req, file_path).await;
-        }
         return client.send(&icap_req).await;
     }
 
@@ -671,10 +815,133 @@ async fn send_with_preview(
         return client.send(&icap_req).await;
     }
 
-    if cli_stream_io && let Some(file_path) = file_path_opt {
-        icap_req = icap_req.preview(0);
-        return client.send_streaming(&icap_req, file_path).await;
+    client.send(&icap_req).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_body_mode_covers_preview_variants() {
+        assert!(should_stream_file_body(true, Some(4)));
+        assert!(should_stream_file_body(true, None));
+        assert!(should_stream_file_body(false, Some(0)));
+        assert!(!should_stream_file_body(false, Some(4)));
+        assert!(!should_stream_file_body(false, None));
     }
 
-    client.send(&icap_req).await
+    #[test]
+    fn rejects_ieof_for_non_empty_file_body() {
+        let err = validate_ieof_body(true, true, Some(5), Some(0))
+            .expect_err("non-empty file cannot be sent as Preview: 0 ieof");
+
+        assert!(err.to_string().contains("--ieof"));
+    }
+
+    #[test]
+    fn accepts_ieof_for_empty_file_body() {
+        validate_ieof_body(true, true, Some(0), Some(0)).expect("empty body can use ieof");
+    }
+
+    #[test]
+    fn appends_original_body_suffix_from_offset() {
+        let body =
+            append_original_body_suffix(b"HTTP/1.1 200 OK\r\n\r\nabc".to_vec(), b"abcdef", 3)
+                .expect("append original suffix");
+
+        assert_eq!(body, b"HTTP/1.1 200 OK\r\n\r\nabcdef");
+    }
+
+    #[test]
+    fn rejects_original_body_offset_past_input() {
+        let err = append_original_body_suffix(Vec::new(), b"abc", 4)
+            .expect_err("offset past original body must fail");
+
+        assert!(err.to_string().contains("exceeds original body length"));
+    }
+
+    async fn read_until_contains(stream: &mut tokio::net::TcpStream, needle: &[u8]) -> Vec<u8> {
+        use tokio::io::AsyncReadExt;
+
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 1024];
+        loop {
+            if buf.windows(needle.len()).any(|window| window == needle) {
+                return buf;
+            }
+            let n = stream.read(&mut tmp).await.expect("read from client");
+            assert!(n > 0, "connection closed before expected bytes arrived");
+            buf.extend_from_slice(&tmp[..n]);
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_io_preview_n_sends_preview_and_remainder() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "rs-icap-client-stream-{}-{unique}.txt",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"hello").expect("write temp body");
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("local addr").port();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let preview = read_until_contains(&mut socket, b"4\r\nhell\r\n0\r\n\r\n").await;
+            let preview_text = String::from_utf8_lossy(&preview);
+            assert!(preview_text.contains("\r\nPreview: 4\r\n"));
+            assert!(preview_text.contains("Encapsulated: req-hdr=0, req-body="));
+
+            socket
+                .write_all(b"ICAP/1.0 100 Continue\r\n\r\n")
+                .await
+                .expect("write continue");
+
+            let remainder = read_until_contains(&mut socket, b"1\r\no\r\n0\r\n\r\n").await;
+            assert!(
+                String::from_utf8_lossy(&remainder).contains("1\r\no\r\n0\r\n\r\n"),
+                "missing streamed remainder"
+            );
+
+            socket
+                .write_all(
+                    b"ICAP/1.0 204 No Content\r\n\
+                      ISTag: \"stream-test\"\r\n\
+                      Encapsulated: null-body=0\r\n\r\n",
+                )
+                .await
+                .expect("write response");
+        });
+
+        let client = Client::builder().host("127.0.0.1").port(port).build();
+        let http = HttpRequest::builder()
+            .method(Method::POST)
+            .uri("/")
+            .version(Version::HTTP_10)
+            .header("Host", "origin.example")
+            .header("Content-Length", "5")
+            .body(())
+            .expect("build HTTP head");
+        let req = Request::reqmod("scan")
+            .preview(4)
+            .with_http_request_head(http)
+            .expect("build ICAP request");
+
+        let response = send_with_preview(&client, req, Some(path.clone()), Some(4), true, false)
+            .await
+            .expect("send streaming preview");
+
+        assert_eq!(response.status_code(), IcapStatus::NO_CONTENT);
+        server.await.expect("server task");
+        let _ = std::fs::remove_file(path);
+    }
 }
