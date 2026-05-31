@@ -12,7 +12,7 @@ use icap_rs::response::Response;
 use icap_rs::server::Server;
 use icap_rs::server::options::ServiceOptions;
 use icap_rs::server::timeouts::ServerTimeouts;
-use icap_rs::{Body, Method, ShutdownEvent};
+use icap_rs::{Body, HandlerResult, Method, ShutdownEvent};
 use tokio_util::task::TaskTracker;
 use tracing::{info, warn};
 
@@ -118,55 +118,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 let t = Arc::clone(&resp_tag);
                 move |request: IncomingRequest| {
                     let t = Arc::clone(&t);
-                    async move {
-                        info!("RESPMOD called: {}", request.service());
-                        // Artificial delay — useful for manually testing graceful shutdown.
-                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-
-                        if let Some(EmbeddedHttp::Resp { head, .. }) = request.embedded() {
-                            info!("HTTP status: {}", head.status());
-                        } else {
-                            warn!("RESPMOD without embedded HTTP response");
-                        }
-
-                        let istag_now = t.read().unwrap().clone();
-
-                        if request.preview_size().is_some()
-                            && can_return_204(request.icap_headers())
-                        {
-                            return Ok(Response::no_content_with_istag(&istag_now)?
-                                .add_header("Server", "icap-rs/0.1.0"));
-                        }
-
-                        if let Some(EmbeddedHttp::Resp {
-                            head,
-                            body: Body::Full { reader },
-                        }) = request.embedded()
-                        {
-                            let mut builder = http::Response::builder()
-                                .status(head.status())
-                                .version(head.version());
-                            if let Some(h) = builder.headers_mut() {
-                                h.extend(head.headers().clone());
-                                h.remove(http::header::TRANSFER_ENCODING);
-                                h.insert(
-                                    http::header::CONTENT_LENGTH,
-                                    http::HeaderValue::from_str(&reader.len().to_string()).unwrap(),
-                                );
-                            }
-                            let http_resp = builder.body(reader.clone()).map_err(|e| {
-                                icap_rs::HandlerError::internal(format!(
-                                    "build http::Response: {e}"
-                                ))
-                            })?;
-
-                            return Ok(Response::ok_with_istag(&istag_now)?
-                                .with_http_response(&http_resp)?
-                                .add_header("Server", "icap-rs/0.1.0"));
-                        }
-                        Ok(Response::no_content_with_istag(&istag_now)?
-                            .add_header("Server", "icap-rs/0.1.0"))
-                    }
+                    handle_respmod(request, t)
                 }
             },
             Some(respmod_opts),
@@ -246,6 +198,55 @@ fn can_return_204(h: &HeaderMap) -> bool {
     h.get("Allow")
         .and_then(|v| v.to_str().ok())
         .is_some_and(|s| s.split(',').any(|p| p.trim().eq_ignore_ascii_case("204")))
+}
+
+async fn handle_respmod(
+    request: IncomingRequest,
+    istag: Arc<RwLock<String>>,
+) -> HandlerResult<Response> {
+    info!("RESPMOD called: {}", request.service());
+    // Artificial delay — useful for manually testing graceful shutdown.
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+    if let Some(EmbeddedHttp::Resp { head, .. }) = request.embedded() {
+        info!("HTTP status: {}", head.status());
+    } else {
+        warn!("RESPMOD without embedded HTTP response");
+    }
+
+    let istag_now = istag.read().unwrap().clone();
+
+    if request.preview_size().is_some() && can_return_204(request.icap_headers()) {
+        return Ok(
+            Response::no_content_with_istag(&istag_now)?.add_header("Server", "icap-rs/0.1.0")
+        );
+    }
+
+    if let Some(EmbeddedHttp::Resp {
+        head,
+        body: Body::Full { reader },
+    }) = request.embedded()
+    {
+        let mut builder = http::Response::builder()
+            .status(head.status())
+            .version(head.version());
+        if let Some(h) = builder.headers_mut() {
+            h.extend(head.headers().clone());
+            h.remove(http::header::TRANSFER_ENCODING);
+            h.insert(
+                http::header::CONTENT_LENGTH,
+                http::HeaderValue::from_str(&reader.len().to_string())?,
+            );
+        }
+        let http_resp = builder
+            .body(reader.clone())
+            .map_err(|e| icap_rs::HandlerError::internal(format!("build http::Response: {e}")))?;
+
+        return Ok(Response::ok_with_istag(&istag_now)?
+            .with_http_response(&http_resp)?
+            .add_header("Server", "icap-rs/0.1.0"));
+    }
+    Ok(Response::no_content_with_istag(&istag_now)?.add_header("Server", "icap-rs/0.1.0"))
 }
 
 /// Build a simple HTTP 403 page with a reason (as `http::Response<Vec<u8>>`).
