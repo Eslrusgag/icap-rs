@@ -7,11 +7,14 @@
 - Client-side OPTIONS response cache (RFC 3507 §4.10 / §5), opt-in via `ClientBuilder::with_options_cache(OptionsCacheConfig)`. Lifetime is taken from the response `Options-TTL` header, falling back to `OptionsCacheConfig::default_ttl`; with neither, the response is not cached. A changed `ISTag` observed on a later `REQMOD`/`RESPMOD` response invalidates the entry, and `Client::invalidate_options_cache()` clears every entry on demand (#15).
 - Client-side `Transfer-Preview` / `Transfer-Ignore` / `Transfer-Complete` policy (RFC 3507 §4.10.2). When the OPTIONS cache is enabled, the client resolves the per-extension transfer action from the cached OPTIONS response: `Transfer-Ignore` returns a synthetic `204` without contacting the server, `Transfer-Complete` sends the full body with no `Preview` header, and `Transfer-Preview` sends the advertised preview window before `100 Continue` (#16, #19).
 - Client proxy authentication (RFC 3507 §7.1), opt-in via `ClientBuilder::proxy_auth(username, password)`. On `407 Proxy Authentication Required` the client retries the request once with `Proxy-Authorization: Basic <base64(user:pass)>`. New public `ProxyAuth` type (#16, #19).
+- Configurable ICAP header limits: `ClientBuilder::with_response_header_limit(bytes)` for response header reads and `ServerBuilder::with_request_header_limit(bytes)` for request header reads. Both default to 64 KiB.
+- Per-service embedded HTTP object limits via `ServiceOptions::with_max_object_size(bytes)`. The value is advertised as `Max-Object-Size` in `OPTIONS`; request handling enforces it by counting decoded ICAP chunked body bytes instead of trusting embedded HTTP `Content-Length`.
 - New examples: `options_cache_client`, `transfer_policy_client`, `proxy_auth_client`.
 
 ### Changed
 
 - Server-injected request metadata (`ISTag`, chunk trailers) moved off the public `Request` field set into `IncomingMeta`, carried through the new sealed `DirectionMeta` trait as `Request<R, D>::meta`. `OutboundRequest` pays zero overhead for these fields; `IncomingRequest` exposes them via `istag()` / `chunk_trailers()` (#18).
+- Removed the public hard-coded `MAX_HDR_BYTES` API in favour of explicit client/server builder configuration for ICAP header limits.
 
 ### Fixed
 

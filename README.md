@@ -43,6 +43,13 @@ tested.
   (RFC 3507 §4.10.2).
 - Client `Proxy-Authorization: Basic` retry on `407 Proxy Authentication
   Required` (RFC 3507 §7.1), opt-in via `ClientBuilder::proxy_auth`.
+- Configurable ICAP request/response header limits via
+  `ServerBuilder::with_request_header_limit` and
+  `ClientBuilder::with_response_header_limit`.
+- Per-service embedded HTTP body limits via `ServiceOptions::with_max_object_size`;
+  the limit is advertised as `Max-Object-Size` in `OPTIONS` and enforced using
+  decoded ICAP chunked body bytes rather than trusting embedded HTTP
+  `Content-Length`.
 - Direct ICAPS (`icaps://`) via Rustls when the `tls-rustls` feature is
   enabled.
 - TLS listener and mTLS support in the library server API.

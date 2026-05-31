@@ -34,6 +34,7 @@ pub struct ServerBuilder {
     default_service: Option<String>,
     request_parser_mode: RequestParserMode,
     timeouts: ServerTimeouts,
+    max_request_header_bytes: Option<usize>,
     shutdown_handler: Arc<dyn Fn(ShutdownEvent) + Send + Sync>,
     task_tracker: Option<TaskTracker>,
     #[cfg(feature = "tls-rustls")]
@@ -50,6 +51,7 @@ impl Default for ServerBuilder {
             default_service: None,
             request_parser_mode: RequestParserMode::default(),
             timeouts: ServerTimeouts::default(),
+            max_request_header_bytes: None,
             shutdown_handler: Arc::new(default_shutdown_handler),
             task_tracker: None,
             #[cfg(feature = "tls-rustls")]
@@ -126,6 +128,16 @@ impl ServerBuilder {
     /// corresponding deadline.
     pub const fn with_timeouts(mut self, timeouts: ServerTimeouts) -> Self {
         self.timeouts = timeouts;
+        self
+    }
+
+    /// Set the maximum ICAP request header block size, in bytes.
+    ///
+    /// The limit includes the request line, all ICAP header lines, and the
+    /// terminating `CRLFCRLF`. The default is 64 KiB. Oversized request headers
+    /// receive `400 Bad Request` and the connection is closed.
+    pub const fn with_request_header_limit(mut self, bytes: usize) -> Self {
+        self.max_request_header_bytes = Some(bytes);
         self
     }
 
@@ -414,6 +426,9 @@ impl ServerBuilder {
             default_service: self.default_service,
             request_parser_mode: self.request_parser_mode,
             timeouts: self.timeouts,
+            max_request_header_bytes: self
+                .max_request_header_bytes
+                .unwrap_or(crate::DEFAULT_ICAP_HEADER_BYTES),
             shutdown_handler: self.shutdown_handler,
             task_tracker: self.task_tracker,
 

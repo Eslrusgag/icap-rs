@@ -60,6 +60,7 @@ pub struct ClientBuilder {
     default_headers: HeaderMap,
     connection_policy: ConnectionPolicy,
     timeouts: ClientTimeouts,
+    max_response_header_bytes: Option<usize>,
 
     // OPTIONS cache. `None` keeps the legacy behavior (no automatic OPTIONS).
     options_cache: Option<OptionsCacheConfig>,
@@ -225,6 +226,17 @@ impl ClientBuilder {
         self
     }
 
+    /// Set the maximum ICAP response header block size, in bytes.
+    ///
+    /// The limit includes the status line, all ICAP header lines, and the
+    /// terminating `CRLFCRLF`. The default is 64 KiB. Oversized response
+    /// headers are reported as protocol header errors instead of generic I/O
+    /// failures.
+    pub const fn with_response_header_limit(mut self, bytes: usize) -> Self {
+        self.max_response_header_bytes = Some(bytes);
+        self
+    }
+
     /// Enable client-side caching of `OPTIONS` responses (RFC 3507 §4.10 / §5).
     ///
     /// When enabled, the client fetches `OPTIONS` for a service once and reuses
@@ -364,6 +376,9 @@ impl ClientBuilder {
                 default_headers: self.default_headers,
                 connection_policy: self.connection_policy,
                 timeouts: self.timeouts,
+                max_response_header_bytes: self
+                    .max_response_header_bytes
+                    .unwrap_or(crate::DEFAULT_ICAP_HEADER_BYTES),
                 #[cfg(feature = "tls-rustls")]
                 tls,
                 idle_conn: Mutex::new(None),

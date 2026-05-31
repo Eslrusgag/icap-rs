@@ -228,6 +228,7 @@ pub fn canon_icap_header(name: &str) -> Cow<'_, str> {
         "encapsulated" => Cow::Borrowed("Encapsulated"),
         "service" => Cow::Borrowed("Service"),
         "max-connections" => Cow::Borrowed("Max-Connections"),
+        "max-object-size" => Cow::Borrowed("Max-Object-Size"),
         "options-ttl" => Cow::Borrowed("Options-TTL"),
         "preview" => Cow::Borrowed("Preview"),
         "allow" => Cow::Borrowed("Allow"),

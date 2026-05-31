@@ -13,10 +13,11 @@ use crate::error::{Error, IcapResult};
 use crate::protocol::{
     dechunk_icap_entity, dechunk_icap_entity_with_ieof, find_double_crlf,
     parse_encapsulated_header, parse_preview_header_value, read_chunked_to_end,
-    read_chunked_until_zero,
+    read_chunked_to_end_limited, read_chunked_until_zero, read_chunked_until_zero_limited,
 };
 use crate::request::{
-    IncomingRequest, RequestParserMode, parse_icap_request, parse_icap_request_with_mode,
+    IncomingRequest, RequestParserMode, normalize_service_path, parse_icap_request,
+    parse_icap_request_with_mode,
 };
 use crate::{Body, EmbeddedHttp, Method, Response, StatusCode};
 
@@ -97,6 +98,7 @@ impl Server {
         advertised_max_conn: Option<usize>,
         request_parser_mode: RequestParserMode,
         timeouts: ServerTimeouts,
+        max_request_header_bytes: usize,
         mut shutdown: watch::Receiver<bool>,
         addr: std::net::SocketAddr,
     ) -> IcapResult<()>
@@ -119,10 +121,19 @@ impl Server {
             // === Read headers ===
             let h_end = loop {
                 if let Some(end) = find_double_crlf(&buf[buf_start..]) {
+                    if end > max_request_header_bytes {
+                        Self::write_wire_error_response(
+                            &mut socket,
+                            StatusCode::BAD_REQUEST,
+                            "Request Header Too Large",
+                        )
+                        .await?;
+                        return Ok(());
+                    }
                     break buf_start + end;
                 }
 
-                if buf.len() - buf_start > crate::MAX_HDR_BYTES {
+                if buf.len() - buf_start > max_request_header_bytes {
                     Self::write_wire_error_response(
                         &mut socket,
                         StatusCode::BAD_REQUEST,
@@ -227,6 +238,20 @@ impl Server {
                     return Ok(());
                 }
             };
+            let (request_method_for_limits, service_for_limits) =
+                match request_context_for_limits(hdr_str, &aliases, default_service.as_deref()) {
+                    Ok(context) => context,
+                    Err(err) => {
+                        warn!(client=%addr, error=%err, "malformed ICAP request line");
+                        Self::write_wire_parse_error_response(&mut socket, &err).await?;
+                        return Ok(());
+                    }
+                };
+            let max_object_size = max_object_size_for_service(
+                request_method_for_limits,
+                &service_for_limits,
+                &routes,
+            );
             let mut msg_end = h_end;
             // Chunk trailers (RFC 7230 §4.1.2) extracted during dechunking;
             // applied to the parsed request after parse_request_for_mode.
@@ -248,12 +273,44 @@ impl Server {
                 }
 
                 if preview_size.is_some() {
-                    let (preview_end, preview_ieof) = with_timeout_as(
-                        timeouts.body_read,
-                        async { read_chunked_until_zero(&mut socket, &mut buf, body_abs).await },
-                        Error::server_body_read_timeout,
-                    )
-                    .await?;
+                    let (preview_end, preview_ieof) = if let Some(max_size) = max_object_size {
+                        let read_result = with_timeout_as(
+                            timeouts.body_read,
+                            async {
+                                read_chunked_until_zero_limited(
+                                    &mut socket,
+                                    &mut buf,
+                                    body_abs,
+                                    max_size,
+                                )
+                                .await
+                            },
+                            Error::server_body_read_timeout,
+                        )
+                        .await;
+                        match read_result {
+                            Ok((end, ieof, _decoded_len)) => (end, ieof),
+                            Err(err) if err.is_body_too_large() => {
+                                Self::write_wire_error_response(
+                                    &mut socket,
+                                    StatusCode::PAYLOAD_TOO_LARGE,
+                                    "Payload Too Large",
+                                )
+                                .await?;
+                                return Ok(());
+                            }
+                            Err(err) => return Err(err),
+                        }
+                    } else {
+                        with_timeout_as(
+                            timeouts.body_read,
+                            async {
+                                read_chunked_until_zero(&mut socket, &mut buf, body_abs).await
+                            },
+                            Error::server_body_read_timeout,
+                        )
+                        .await?
+                    };
 
                     let mut preview_slice = &buf[body_abs..preview_end];
                     let (mut decoded, _ieof_seen, _preview_trailers) =
@@ -357,12 +414,46 @@ impl Server {
                         .await?;
                         flush_with_timeout(&mut socket, timeouts.write).await?;
 
-                        let rest_end = with_timeout_as(
-                            timeouts.body_read,
-                            async { read_chunked_to_end(&mut socket, &mut buf, preview_end).await },
-                            Error::server_body_read_timeout,
-                        )
-                        .await?;
+                        let rest_end = if let Some(max_size) = max_object_size {
+                            let preview_decoded_len = decoded.len();
+                            let read_result = with_timeout_as(
+                                timeouts.body_read,
+                                async {
+                                    read_chunked_to_end_limited(
+                                        &mut socket,
+                                        &mut buf,
+                                        preview_end,
+                                        preview_decoded_len,
+                                        max_size,
+                                    )
+                                    .await
+                                },
+                                Error::server_body_read_timeout,
+                            )
+                            .await;
+                            match read_result {
+                                Ok(end) => end,
+                                Err(err) if err.is_body_too_large() => {
+                                    Self::write_wire_error_response(
+                                        &mut socket,
+                                        StatusCode::PAYLOAD_TOO_LARGE,
+                                        "Payload Too Large",
+                                    )
+                                    .await?;
+                                    return Ok(());
+                                }
+                                Err(err) => return Err(err),
+                            }
+                        } else {
+                            with_timeout_as(
+                                timeouts.body_read,
+                                async {
+                                    read_chunked_to_end(&mut socket, &mut buf, preview_end).await
+                                },
+                                Error::server_body_read_timeout,
+                            )
+                            .await?
+                        };
                         let mut rest_slice = &buf[preview_end..rest_end];
                         let (rest_decoded, _, body_trailers) =
                             dechunk_icap_entity_with_ieof(&mut rest_slice).map_err(|e| {
@@ -377,12 +468,43 @@ impl Server {
                     buf.splice(body_abs..msg_end, decoded);
                     msg_end = body_abs + decoded_len;
                 } else {
-                    msg_end = with_timeout_as(
-                        timeouts.body_read,
-                        async { read_chunked_to_end(&mut socket, &mut buf, body_abs).await },
-                        Error::server_body_read_timeout,
-                    )
-                    .await?;
+                    msg_end = if let Some(max_size) = max_object_size {
+                        let read_result = with_timeout_as(
+                            timeouts.body_read,
+                            async {
+                                read_chunked_to_end_limited(
+                                    &mut socket,
+                                    &mut buf,
+                                    body_abs,
+                                    0,
+                                    max_size,
+                                )
+                                .await
+                            },
+                            Error::server_body_read_timeout,
+                        )
+                        .await;
+                        match read_result {
+                            Ok(end) => end,
+                            Err(err) if err.is_body_too_large() => {
+                                Self::write_wire_error_response(
+                                    &mut socket,
+                                    StatusCode::PAYLOAD_TOO_LARGE,
+                                    "Payload Too Large",
+                                )
+                                .await?;
+                                return Ok(());
+                            }
+                            Err(err) => return Err(err),
+                        }
+                    } else {
+                        with_timeout_as(
+                            timeouts.body_read,
+                            async { read_chunked_to_end(&mut socket, &mut buf, body_abs).await },
+                            Error::server_body_read_timeout,
+                        )
+                        .await?
+                    };
                     if msg_end > body_abs {
                         let mut chunked_slice = &buf[body_abs..msg_end];
                         let (decoded, body_trailers) = dechunk_icap_entity(&mut chunked_slice)
@@ -614,6 +736,43 @@ fn advance_buf(buf: &mut Vec<u8>, buf_start: &mut usize, new_start: usize) {
         buf.drain(..*buf_start);
         *buf_start = 0;
     }
+}
+
+fn request_context_for_limits(
+    hdr_str: &str,
+    aliases: &HashMap<String, String>,
+    default_service: Option<&str>,
+) -> IcapResult<(Method, String)> {
+    let request_line = hdr_str
+        .split("\r\n")
+        .next()
+        .ok_or_else(|| Error::parse("Empty request"))?;
+    let mut parts = request_line.split_whitespace();
+    let method = Method::parse_token(
+        parts
+            .next()
+            .ok_or_else(|| Error::parse("Invalid request line"))?,
+    )?;
+    let icap_uri = parts
+        .next()
+        .ok_or_else(|| Error::parse("Invalid request line"))?;
+    let service = normalize_service_path(icap_uri);
+    let resolved = resolve_service(&service, aliases, default_service).into_owned();
+    Ok((method, resolved))
+}
+
+fn max_object_size_for_service(
+    method: Method,
+    service: &str,
+    routes: &HashMap<String, RouteEntry>,
+) -> Option<usize> {
+    if !matches!(method, Method::ReqMod | Method::RespMod) {
+        return None;
+    }
+    routes
+        .get(service)
+        .and_then(|entry| entry.options.as_ref())
+        .and_then(|options| options.max_object_size)
 }
 
 fn parse_request_for_mode(

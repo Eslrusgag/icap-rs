@@ -158,6 +158,8 @@ pub struct ServiceOptions {
     pub(crate) istag: Option<IstagSource>,
     /// Max concurrent connections hint (optional).
     pub(crate) max_connections: Option<usize>,
+    /// Maximum embedded HTTP object size advertised and enforced by the service.
+    pub(crate) max_object_size: Option<usize>,
     /// TTL (seconds) for caching the OPTIONS response (optional).
     pub(crate) options_ttl: Option<u32>,
     /// Short service identifier (optional).
@@ -196,6 +198,7 @@ impl ServiceOptions {
             service: None,
             istag: None,
             max_connections: None,
+            max_object_size: None,
             options_ttl: None,
             service_id: None,
             allow: Vec::new(),
@@ -266,6 +269,17 @@ impl ServiceOptions {
     /// Router-only: set Max-Connections from global advertised limit if not set.
     pub(crate) const fn with_max_connections(&mut self, n: usize) {
         self.max_connections = Some(n);
+    }
+
+    /// Set the maximum embedded HTTP object size, in bytes.
+    ///
+    /// The value is advertised in `OPTIONS` as `Max-Object-Size` and enforced by
+    /// the server for this service by counting decoded ICAP chunked body bytes.
+    /// Embedded HTTP `Content-Length` is not trusted for enforcement because
+    /// peers may send a value that differs from the actual body.
+    pub const fn with_max_object_size(mut self, bytes: usize) -> Self {
+        self.max_object_size = Some(bytes);
+        self
     }
 
     /// Set `Options-TTL` (seconds).
@@ -431,6 +445,9 @@ impl<'a> OptionsResponseBuilder<'a> {
         }
         if let Some(max_conn) = self.options.max_connections {
             response = response.add_header("Max-Connections", &max_conn.to_string());
+        }
+        if let Some(max_object_size) = self.options.max_object_size {
+            response = response.add_header("Max-Object-Size", &max_object_size.to_string());
         }
         if let Some(ttl) = self.options.options_ttl {
             response = response.add_header("Options-TTL", &ttl.to_string());

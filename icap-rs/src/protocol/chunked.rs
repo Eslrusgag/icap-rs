@@ -96,6 +96,25 @@ pub fn parse_one_chunk_meta(buf: &[u8], from: usize) -> IcapResult<Option<ChunkM
     }))
 }
 
+fn parse_chunk_size_line(buf: &[u8], from: usize) -> IcapResult<Option<usize>> {
+    if from >= buf.len() {
+        return Ok(None);
+    }
+
+    let Some(line_end_rel) = memmem::find(&buf[from..], b"\r\n") else {
+        return Ok(None);
+    };
+    let line_end = from + line_end_rel;
+    let size_line = &buf[from..line_end];
+    let size_hex = size_line.split(|&b| b == b';').next().unwrap_or(size_line);
+    let size_str = std::str::from_utf8(size_hex)
+        .map_err(|_| Error::body("chunk size not utf8"))?
+        .trim();
+    let size =
+        usize::from_str_radix(size_str, 16).map_err(|_| Error::body("chunk size not hex"))?;
+    Ok(Some(size))
+}
+
 /// Parse HTTP-style chunk trailers that follow the zero chunk.
 ///
 /// RFC 7230 §4.1.2 (and RFC 3507 §6.3 by reference) allows zero or more
@@ -201,6 +220,79 @@ where
     }
 }
 
+/// Drain ICAP chunked body while enforcing a decoded body-size limit.
+///
+/// `decoded_so_far` is useful for preview flows where preview bytes were
+/// already counted before reading the remainder.
+pub async fn read_chunked_to_end_limited<S>(
+    stream: &mut S,
+    buf: &mut Vec<u8>,
+    mut pos: usize,
+    mut decoded_so_far: usize,
+    max_decoded: usize,
+) -> IcapResult<usize>
+where
+    S: AsyncRead + Unpin,
+{
+    loop {
+        if let Some(size) = parse_chunk_size_line(buf, pos)? {
+            let projected = decoded_so_far
+                .checked_add(size)
+                .ok_or_else(|| Error::body_too_large(usize::MAX, max_decoded))?;
+            if projected > max_decoded {
+                return Err(Error::body_too_large(projected, max_decoded));
+            }
+        }
+
+        if let Some((next_pos, is_final, size)) = parse_one_chunk(buf, pos) {
+            if is_final {
+                pos = next_pos;
+                loop {
+                    while buf.len() < pos + 2 {
+                        let mut tmp = [0u8; 4096];
+                        let n = AsyncReadExt::read(stream, &mut tmp).await?;
+                        if n == 0 {
+                            return Err(Error::body("unexpected EOF in chunk trailer block"));
+                        }
+                        buf.extend_from_slice(&tmp[..n]);
+                    }
+                    let crlf_rel = loop {
+                        if let Some(rel) = memmem::find(&buf[pos..], b"\r\n") {
+                            break rel;
+                        }
+                        let mut tmp = [0u8; 4096];
+                        let n = AsyncReadExt::read(stream, &mut tmp).await?;
+                        if n == 0 {
+                            return Err(Error::body("unexpected EOF in chunk trailer block"));
+                        }
+                        buf.extend_from_slice(&tmp[..n]);
+                    };
+                    pos += crlf_rel + 2;
+                    if crlf_rel == 0 {
+                        return Ok(pos);
+                    }
+                }
+            }
+            decoded_so_far = decoded_so_far
+                .checked_add(size)
+                .ok_or_else(|| Error::body_too_large(usize::MAX, max_decoded))?;
+            if decoded_so_far > max_decoded {
+                return Err(Error::body_too_large(decoded_so_far, max_decoded));
+            }
+            pos = next_pos;
+        } else {
+            let mut tmp = [0u8; 4096];
+            let n = AsyncReadExt::read(stream, &mut tmp).await?;
+            if n == 0 {
+                return Err(Error::body(
+                    "unexpected EOF while reading ICAP chunked body",
+                ));
+            }
+            buf.extend_from_slice(&tmp[..n]);
+        }
+    }
+}
+
 pub async fn read_chunked_until_zero<S>(
     stream: &mut S,
     buf: &mut Vec<u8>,
@@ -213,6 +305,50 @@ where
         if let Some(meta) = parse_one_chunk_meta(buf, pos)? {
             if meta.is_zero {
                 return Ok((meta.next_pos, meta.has_ieof));
+            }
+            pos = meta.next_pos;
+        } else {
+            let mut tmp = [0u8; 4096];
+            let n = stream.read(&mut tmp).await?;
+            if n == 0 {
+                return Err(Error::body(
+                    "unexpected EOF while reading ICAP preview body",
+                ));
+            }
+            buf.extend_from_slice(&tmp[..n]);
+        }
+    }
+}
+
+pub async fn read_chunked_until_zero_limited<S>(
+    stream: &mut S,
+    buf: &mut Vec<u8>,
+    mut pos: usize,
+    max_decoded: usize,
+) -> IcapResult<(usize, bool, usize)>
+where
+    S: AsyncRead + Unpin,
+{
+    let mut decoded = 0usize;
+    loop {
+        if let Some(size) = parse_chunk_size_line(buf, pos)? {
+            let projected = decoded
+                .checked_add(size)
+                .ok_or_else(|| Error::body_too_large(usize::MAX, max_decoded))?;
+            if projected > max_decoded {
+                return Err(Error::body_too_large(projected, max_decoded));
+            }
+        }
+
+        if let Some(meta) = parse_one_chunk_meta(buf, pos)? {
+            if meta.is_zero {
+                return Ok((meta.next_pos, meta.has_ieof, decoded));
+            }
+            decoded = decoded
+                .checked_add(meta.size)
+                .ok_or_else(|| Error::body_too_large(usize::MAX, max_decoded))?;
+            if decoded > max_decoded {
+                return Err(Error::body_too_large(decoded, max_decoded));
             }
             pos = meta.next_pos;
         } else {

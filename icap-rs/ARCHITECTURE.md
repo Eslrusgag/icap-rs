@@ -279,19 +279,23 @@ handle_connection(socket, routes, aliases, shutdown: watch::Receiver<bool>, …)
     1. read until CRLFCRLF (idle_keepalive / header_read timeouts)
        — first read of each new request uses select! between socket.read and
          shutdown signal; resolves immediately on shutdown (idle connection)
-    2. parse_icap_request(raw, mode) → IncomingRequest
+    2. parse Encapsulated / Preview / request-line metadata needed before full parse
+       if the resolved service has ServiceOptions::with_max_object_size:
+         enforce decoded ICAP chunked body bytes while reading preview/full body
+         reject bytes over Max-Object-Size with 413
+    3. parse_icap_request(raw, mode) → IncomingRequest
          parse_icap_request_with_mode:
            parse request line + ICAP headers
            validate Host + Encapsulated presence
            parse Encapsulated offsets
            parse embedded HTTP head
            read + dechunk embedded body
-    3. resolve_service(path, aliases, default_service)
-    4. route lookup → RouteEntry for service
+    4. resolve_service(path, aliases, default_service)
+    5. route lookup → RouteEntry for service
        unknown service → 404
        unsupported method → 405
        OPTIONS → ServiceOptions::build_response_for(req)
-    5. if preview flag present:
+    6. if preview flag present:
          read preview bytes up to Preview: N limit
          mark body as Body::Preview { bytes, ieof, remainder }
          call handler (preview-aware route)
@@ -301,11 +305,11 @@ handle_connection(socket, routes, aliases, shutdown: watch::Receiver<bool>, …)
            read remainder body (body_read timeout)
            convert body to Body::Full
            call handler again with full body
-    6. call handler → HandlerResult<Response>
+    7. call handler → HandlerResult<Response>
        HandlerError → error response (status from HandlerError)
-    7. guard 204: if Allow:204 absent and no preview → wrap as 200 with echoed body
-    8. response.to_raw() → wire bytes
-    9. write response (write_timeout)
+    8. guard 204: if Allow:204 absent and no preview → wrap as 200 with echoed body
+    9. response.to_raw() → wire bytes
+   10. write response (write_timeout)
    break on non-keep-alive, shutdown signal, or error
 ```
 
@@ -380,7 +384,8 @@ resolve_service(path, aliases, default_service)   // path already normalized
 
 Route lookup returns a `RouteEntry` containing:
 - `handlers: HashMap<Method, HandlerEntry>` — one entry per ICAP method
-- `options: Option<ServiceOptions>` — OPTIONS response configuration
+- `options: Option<ServiceOptions>` — OPTIONS response configuration, including
+  per-service `Max-Object-Size` body-limit policy
 
 `HandlerEntry` wraps the async handler closure and a `preview_aware: bool` flag
 (derived from the return type via the `RouteOutput` trait).
@@ -497,9 +502,10 @@ Unit tests live inline in each source module (`#[cfg(test)]`).
 
 | Constant | Value | Purpose |
 |---|---|---|
-| `MAX_HDR_BYTES` | 64 KiB | Maximum ICAP header block size |
 | `ICAP_VERSION` | `"ICAP/1.0"` | Protocol version string used in request/response lines |
 | `LIB_VERSION` | from `Cargo.toml` | Exposed for `User-Agent` headers |
+| Header limits | 64 KiB default | Configurable via `ClientBuilder::with_response_header_limit` and `ServerBuilder::with_request_header_limit` |
+| Body limits | unset by default | Configurable per service via `ServiceOptions::with_max_object_size`; advertised as `Max-Object-Size` and enforced by counting decoded ICAP chunked bytes |
 | `DEFAULT_ICAP_PORT` | `1344` | Default port for `icap://` URIs |
 | `DEFAULT_ICAPS_PORT` | `11344` | Default port for `icaps://` URIs |
 | `DEFAULT_HANDSHAKE_TIMEOUT` | `10s` | TLS handshake deadline |

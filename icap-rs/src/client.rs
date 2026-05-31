@@ -71,6 +71,7 @@ struct ClientRef {
     default_headers: HeaderMap,
     connection_policy: ConnectionPolicy,
     timeouts: ClientTimeouts,
+    max_response_header_bytes: usize,
     #[cfg(feature = "tls-rustls")]
     tls: Option<ClientTlsConnector>,
     idle_conn: Mutex<Option<Conn>>,
@@ -88,8 +89,14 @@ impl Client {
     /// Useful for debugging or for printing what would be sent without
     /// actually opening a connection.
     pub fn get_request(&self, req: &Request) -> IcapResult<Vec<u8>> {
-        let built =
-            self.build_icap_request_bytes(req, None, None, false, req.preview_ieof, true)?;
+        let built = self.build_icap_request_bytes(
+            req,
+            EffectivePreview::Inherit,
+            None,
+            false,
+            req.preview_ieof,
+            true,
+        )?;
         Ok(built.bytes)
     }
 
@@ -106,7 +113,7 @@ impl Client {
 
         // RFC 3507 §4.10.2: apply server-advertised Transfer-* policy.
         let effective_preview = self.resolve_effective_preview(req).await;
-        if matches!(effective_preview, Some(None)) && req.is_mod() {
+        if matches!(effective_preview, EffectivePreview::Skip) {
             // Transfer-Ignore: skip ICAP entirely, return a synthetic pass-through.
             return synthetic_204();
         }
@@ -190,54 +197,43 @@ impl Client {
         }
     }
 
-    /// Determine the preview size override for a modification request by
-    /// consulting the cached OPTIONS Transfer-* policy (RFC 3507 §4.10.2).
+    /// Resolve the server-advertised `Transfer-*` policy for a modification
+    /// request from the cached OPTIONS response (RFC 3507 §4.10.2).
     ///
-    /// Returns:
-    /// - `None`       — no override; use `req.preview_size` as-is.
-    /// - `Some(None)` — **skip**: Transfer-Ignore matched; caller should return
-    ///                  a synthetic 204 without contacting the server.
-    /// - `Some(Some(n))` — **override**: use `n` as the preview size.
-    ///                  `n = 0` from Transfer-Complete means send the full body
-    ///                  without a `Preview` header (achieved by `Some(Some(0))`
-    ///                  being treated as "no preview" inside `build_icap_request_bytes`).
-    ///
-    /// Uses `None` as the "full body" sentinel for Transfer-Complete so that
-    /// the distinction is preserved by `effective_preview`:
-    /// `Some(Some(usize::MAX))` could collide; instead Transfer-Complete is
-    /// encoded as `Some(Some(0))` which `build_icap_request_bytes` treats as
-    /// "no Preview header" when `full_body` is set.
-    async fn resolve_effective_preview(&self, req: &Request) -> Option<Option<usize>> {
-        let cache = self.inner.options_cache.as_ref()?;
+    /// Returns [`EffectivePreview::Inherit`] when the OPTIONS cache is disabled,
+    /// the request is not a modification, or no `Transfer-*` rule matches the
+    /// request's file extension — the caller then uses `req.preview_size`
+    /// unchanged.
+    async fn resolve_effective_preview(&self, req: &Request) -> EffectivePreview {
+        let Some(cache) = self.inner.options_cache.as_ref() else {
+            return EffectivePreview::Inherit;
+        };
         if !req.is_mod() {
-            return None;
+            return EffectivePreview::Inherit;
         }
         let path = normalize_service_path(&req.service);
         let ext = file_ext_from_request(req);
         match cache
             .resolve_transfer(&self.inner.host, self.inner.port, &path, &ext)
-            .await?
+            .await
         {
-            TransferAction::Skip => Some(None), // sentinel: caller returns synthetic 204
-            TransferAction::Full => Some(Some(usize::MAX)), // full body, no preview
-            TransferAction::Preview(n) => Some(Some(n)),
+            Some(TransferAction::Skip) => EffectivePreview::Skip,
+            Some(TransferAction::Full) => EffectivePreview::FullBody,
+            Some(TransferAction::Preview(n)) => EffectivePreview::Preview(n),
+            None => EffectivePreview::Inherit,
         }
     }
 
     /// Low-level send; called by [`send`](Self::send) and the streaming variant.
     ///
-    /// `effective_preview`:
-    /// - `None` → use `req.preview_size` as-is.
-    /// - `Some(Some(n))` → override preview size with `n`; `usize::MAX` means
-    ///   "send full body with no Preview header" (Transfer-Complete).
-    /// - `Some(None)` should never reach here (handled as Skip in `send`).
-    ///
-    /// `proxy_auth_value`: when `Some`, the string is written verbatim as the
+    /// `effective_preview` carries the resolved `Transfer-*` policy;
+    /// [`EffectivePreview::Skip`] is handled by [`send`](Self::send) and never
+    /// reaches here. `proxy_auth_value`, when `Some`, is written verbatim as the
     /// `Proxy-Authorization` ICAP header value (RFC 3507 §7.1 retry path).
     async fn send_inner(
         &self,
         req: &Request,
-        effective_preview: Option<Option<usize>>,
+        effective_preview: EffectivePreview,
         proxy_auth_value: Option<&str>,
     ) -> IcapResult<ParsedResponse> {
         trace!(
@@ -268,7 +264,8 @@ impl Client {
             ) {
                 return Err(write_err);
             }
-            if let Ok((_code, hdr_buf)) = read_icap_headers(&mut stream).await
+            if let Ok((_code, hdr_buf)) =
+                read_icap_headers(&mut stream, self.inner.max_response_header_bytes).await
                 && let Ok(response_buf) = self
                     .read_response_buffer_with_headers(&mut stream, hdr_buf)
                     .await
@@ -288,7 +285,8 @@ impl Client {
             ) {
                 return Err(flush_err);
             }
-            if let Ok((_code, hdr_buf)) = read_icap_headers(&mut stream).await
+            if let Ok((_code, hdr_buf)) =
+                read_icap_headers(&mut stream, self.inner.max_response_header_bytes).await
                 && let Ok(response_buf) = self
                     .read_response_buffer_with_headers(&mut stream, hdr_buf)
                     .await
@@ -308,7 +306,7 @@ impl Client {
         if built.expect_continue {
             let (code, hdr_buf) = Self::with_timeout_as(
                 self.continue_timeout(),
-                read_icap_headers(&mut stream),
+                read_icap_headers(&mut stream, self.inner.max_response_header_bytes),
                 Error::client_continue_timeout,
             )
             .await?;
@@ -460,7 +458,14 @@ impl Client {
             return Ok(resp);
         }
 
-        let built = self.build_icap_request_bytes(req, None, None, true, false, false)?;
+        let built = self.build_icap_request_bytes(
+            req,
+            EffectivePreview::Inherit,
+            None,
+            true,
+            false,
+            false,
+        )?;
         self.write_all(&mut stream, &built.bytes).await?;
 
         match req.preview_size {
@@ -496,7 +501,7 @@ impl Client {
         // Read server decision (100 Continue or final)
         let (code, hdr_buf) = Self::with_timeout_as(
             self.continue_timeout(),
-            read_icap_headers(&mut stream),
+            read_icap_headers(&mut stream, self.inner.max_response_header_bytes),
             Error::client_continue_timeout,
         )
         .await?;
@@ -526,7 +531,7 @@ impl Client {
     pub fn get_request_wire(&self, req: &Request, streaming: bool) -> IcapResult<Vec<u8>> {
         let built = self.build_icap_request_bytes(
             req,
-            None,
+            EffectivePreview::Inherit,
             None,
             streaming || matches!(req.preview_size, Some(0)),
             req.preview_ieof,
@@ -606,7 +611,8 @@ impl Client {
     }
 
     async fn read_response_buffer(&self, stream: &mut Conn) -> IcapResult<Vec<u8>> {
-        let (_code, mut response_buf) = read_icap_headers(stream).await?;
+        let (_code, mut response_buf) =
+            read_icap_headers(stream, self.inner.max_response_header_bytes).await?;
         read_icap_body_if_any(stream, &mut response_buf).await?;
         Ok(response_buf)
     }
@@ -637,13 +643,10 @@ impl Client {
         Ok(resp)
     }
 
-    // `effective_preview`: None = use req.preview_size; Some(Some(n)) = override;
-    //   Some(Some(usize::MAX)) = Transfer-Complete (full body, no Preview header).
-    // `proxy_auth_value`: when Some, written as Proxy-Authorization before Encapsulated.
     fn build_icap_request_bytes(
         &self,
         req: &Request,
-        effective_preview: Option<Option<usize>>,
+        effective_preview: EffectivePreview,
         proxy_auth_value: Option<&str>,
         force_has_body: bool,
         preview0_ieof: bool,
@@ -719,14 +722,11 @@ impl Client {
                 (Vec::new(), None, None, None, 0usize)
             };
 
-        // Resolve effective preview size.
-        // `Some(usize::MAX)` is the Transfer-Complete sentinel: send full body,
-        // no `Preview` header. Anything else overrides `req.preview_size`.
         let preview_for_wire = match effective_preview {
-            None => req.preview_size,
-            Some(Some(n)) if n == usize::MAX => None, // full body, no Preview header
-            Some(Some(n)) => Some(n),
-            Some(None) => unreachable!("Skip must be handled before send_inner"),
+            EffectivePreview::Inherit => req.preview_size,
+            EffectivePreview::FullBody => None,
+            EffectivePreview::Preview(n) => Some(n),
+            EffectivePreview::Skip => unreachable!("Skip must be handled before send_inner"),
         };
 
         // Write ICAP headers (except Encapsulated)
@@ -816,7 +816,9 @@ impl Client {
         // If the server already sent a response on a kept-alive *plain* TCP
         // socket, consume it now so callers never write into a closed pipe.
         if let Some(inner) = stream.plain_mut()
-            && let Some(resp) = Self::try_read_early_response_now(inner).await?
+            && let Some(resp) =
+                Self::try_read_early_response_now(inner, self.inner.max_response_header_bytes)
+                    .await?
         {
             return Ok((stream, Some(resp)));
         }
@@ -840,6 +842,7 @@ impl Client {
     ///   and the caller proceeds with writing the ICAP request.
     async fn try_read_early_response_now(
         stream: &mut TcpStream,
+        max_response_header_bytes: usize,
     ) -> IcapResult<Option<ParsedResponse>> {
         let mut buf = Vec::new();
         let mut tmp = [0u8; 4096];
@@ -851,10 +854,12 @@ impl Client {
                 }
                 Ok(n) => {
                     buf.extend_from_slice(&tmp[..n]);
-                    if find_double_crlf(&buf).is_some() {
+                    if let Some(header_len) = find_double_crlf(&buf) {
+                        check_icap_response_header_limit(header_len, max_response_header_bytes)?;
                         let _ = read_icap_body_if_any(stream, &mut buf).await;
                         return parse_icap_response(&buf).map(Some);
                     }
+                    check_icap_response_header_limit(buf.len(), max_response_header_bytes)?;
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     return Ok(None);
@@ -923,6 +928,14 @@ struct BuiltIcap {
     bytes: Vec<u8>,
     expect_continue: bool,
     remaining_body: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EffectivePreview {
+    Inherit,
+    Skip,
+    FullBody,
+    Preview(usize),
 }
 
 async fn read_until_len<S: AsyncRead + AsyncWrite + Unpin>(
@@ -1053,7 +1066,7 @@ fn file_ext_from_request(req: &Request) -> String {
     path.rsplit('.')
         .next()
         .filter(|e| !e.is_empty() && !e.contains('/'))
-        .map(|e| e.to_lowercase())
+        .map(str::to_lowercase)
         .unwrap_or_default()
 }
 
@@ -1081,7 +1094,7 @@ fn basic_auth_value(username: &str, password: &str) -> String {
 /// Minimal standard-conforming RFC 4648 Base64 encoder (no external crate).
 fn base64_encode(input: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = Vec::with_capacity((input.len() + 2) / 3 * 4);
+    let mut out = Vec::with_capacity(input.len().div_ceil(3) * 4);
     for chunk in input.chunks(3) {
         let b = [
             chunk[0],
@@ -1318,7 +1331,16 @@ fn parse_status_code_from_status_line(line: &[u8]) -> Option<u16> {
     Some(u16::from(d0 - b'0') * 100 + u16::from(d1 - b'0') * 10 + u16::from(d2 - b'0'))
 }
 
-async fn read_icap_headers<S>(stream: &mut S) -> IcapResult<(u16, Vec<u8>)>
+fn check_icap_response_header_limit(size: usize, max: usize) -> IcapResult<()> {
+    if size > max {
+        return Err(Error::header(format!(
+            "ICAP response headers too large: {size} bytes (max {max})"
+        )));
+    }
+    Ok(())
+}
+
+async fn read_icap_headers<S>(stream: &mut S, max_header_bytes: usize) -> IcapResult<(u16, Vec<u8>)>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -1385,7 +1407,7 @@ where
 
                 win = (win << 8) | u32::from(b);
                 if hdr_end.is_none() && win == CRLFCRLF {
-                    hdr_end = Some(i - 3);
+                    hdr_end = Some(i + 1);
                 }
 
                 prev = Some(b);
@@ -1425,18 +1447,13 @@ where
         //     return Ok((c, buf));
         // }
 
-        if hdr_end.is_some() {
+        if let Some(header_len) = hdr_end {
+            check_icap_response_header_limit(header_len, max_header_bytes)?;
             let c = code.ok_or_else(|| Error::parse("missing/bad status code"))?;
             return Ok((c, buf));
         }
 
-        if buf.len() > crate::MAX_HDR_BYTES {
-            return Err(Error::header(format!(
-                "Headers too large: {} bytes (max {})",
-                buf.len(),
-                crate::MAX_HDR_BYTES
-            )));
-        }
+        check_icap_response_header_limit(buf.len(), max_header_bytes)?;
     }
 }
 
@@ -2237,7 +2254,11 @@ mod tests {
             true,
         ));
 
-        let res = timeout(Duration::from_millis(50), read_icap_headers(&mut client)).await;
+        let res = timeout(
+            Duration::from_millis(50),
+            read_icap_headers(&mut client, crate::DEFAULT_ICAP_HEADER_BYTES),
+        )
+        .await;
         assert!(res.is_err());
     }
 
@@ -2249,10 +2270,13 @@ mod tests {
         let wire = b"ICAP/1.0 404 ICAP Service not found\r\nISTag: x\r\nDate: Thu, 21 Aug 2025 17:00:00 GMT\r\n\r\n";
         tokio::spawn(server_write(server, wire, false));
 
-        let (code, buf) = timeout(Duration::from_millis(300), read_icap_headers(&mut client))
-            .await
-            .expect("client hung on proper 404")
-            .expect("read_icap_headers failed");
+        let (code, buf) = timeout(
+            Duration::from_millis(300),
+            read_icap_headers(&mut client, crate::DEFAULT_ICAP_HEADER_BYTES),
+        )
+        .await
+        .expect("client hung on proper 404")
+        .expect("read_icap_headers failed");
 
         assert_eq!(code, 404);
         assert!(buf.ends_with(b"\r\n\r\n"));
@@ -2281,10 +2305,13 @@ mod tests {
             server.flush().await.unwrap();
         });
 
-        let (code, buf) = timeout(Duration::from_millis(300), read_icap_headers(&mut client))
-            .await
-            .expect("client hung on split 404")
-            .expect("read_icap_headers failed");
+        let (code, buf) = timeout(
+            Duration::from_millis(300),
+            read_icap_headers(&mut client, crate::DEFAULT_ICAP_HEADER_BYTES),
+        )
+        .await
+        .expect("client hung on split 404")
+        .expect("read_icap_headers failed");
 
         assert_eq!(code, 404);
         let text = String::from_utf8(buf).unwrap();
@@ -2301,10 +2328,13 @@ mod tests {
         let wire = b"ICAP/1.0 404 ICAP Service not found\r\nISTag: y\r\n";
         tokio::spawn(server_write(server, wire, false));
 
-        let (code, buf) = timeout(Duration::from_millis(300), read_icap_headers(&mut client))
-            .await
-            .expect("client hung on 404 with EOF")
-            .expect("read_icap_headers failed");
+        let (code, buf) = timeout(
+            Duration::from_millis(300),
+            read_icap_headers(&mut client, crate::DEFAULT_ICAP_HEADER_BYTES),
+        )
+        .await
+        .expect("client hung on 404 with EOF")
+        .expect("read_icap_headers failed");
 
         assert_eq!(code, 404);
         assert!(buf.ends_with(b"\r\n\r\n"), "normalized to CRLFCRLF on EOF");
@@ -2322,7 +2352,11 @@ mod tests {
         let (mut client, server) = connect_pair().await;
 
         tokio::spawn(server_write(server, b"ICAP/1.0 200 OK\r\n", true));
-        let res = timeout(Duration::from_millis(50), read_icap_headers(&mut client)).await;
+        let res = timeout(
+            Duration::from_millis(50),
+            read_icap_headers(&mut client, crate::DEFAULT_ICAP_HEADER_BYTES),
+        )
+        .await;
         assert!(res.is_err());
     }
 }

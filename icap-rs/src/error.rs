@@ -85,6 +85,11 @@ impl Error {
         matches!(self, Self::Protocol(_))
     }
 
+    /// True if the peer sent an embedded body larger than a configured limit.
+    pub const fn is_body_too_large(&self) -> bool {
+        matches!(self, Self::Protocol(ProtocolError::BodyTooLarge { .. }))
+    }
+
     /// True if the error came from builder / configuration validation.
     pub const fn is_config(&self) -> bool {
         matches!(self, Self::Config(_))
@@ -130,6 +135,11 @@ impl Error {
     /// Build a body error.
     pub fn body(message: impl Into<String>) -> Self {
         Self::Protocol(ProtocolError::Body(message.into()))
+    }
+
+    /// Build an oversized-body protocol error.
+    pub const fn body_too_large(size: usize, max: usize) -> Self {
+        Self::Protocol(ProtocolError::BodyTooLarge { size, max })
     }
 
     /// Build a serialization error.
@@ -327,6 +337,10 @@ pub enum ProtocolError {
     /// Body-handling error (chunked decoder, dechunking, etc.).
     #[error("body error: {0}")]
     Body(String),
+
+    /// Embedded body exceeded a configured byte limit.
+    #[error("body too large: {size} bytes (max {max})")]
+    BodyTooLarge { size: usize, max: usize },
 
     /// Invalid value for a specific ICAP/HTTP field.
     #[error("invalid {field}: {value}")]

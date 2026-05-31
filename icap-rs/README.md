@@ -365,6 +365,15 @@ fn comma_separated_header_example() -> IcapResult<()> {
   `Proxy-Authorization` retry on `407` (§7.1) are opt-in on `ClientBuilder`
   via `with_options_cache` and `proxy_auth`; without them the client never
   fetches `OPTIONS` automatically.
+- ICAP request and response header block limits default to 64 KiB and are
+  configurable via `ServerBuilder::with_request_header_limit` and
+  `ClientBuilder::with_response_header_limit`. Oversized headers are rejected as
+  protocol-level failures (`400 Bad Request` on the server path).
+- Embedded HTTP object-size limits are configured per service with
+  `ServiceOptions::with_max_object_size`. The value is advertised in `OPTIONS`
+  as `Max-Object-Size`; request handling counts the actual decoded ICAP chunked
+  body bytes for that service and does not trust embedded HTTP
+  `Content-Length` for enforcement.
 
 For the detailed support matrix and known gaps, see
 [`docs/rfc3507.md`](docs/rfc3507.md).
@@ -384,12 +393,12 @@ use icap_rs::{
 
 | Type | Use it for |
 | --- | --- |
-| [`Client`], [`ClientBuilder`], [`ConnectionPolicy`] | Connecting to an ICAP service, configuring host/port or `icap://` / `icaps://` URI, keep-alive, timeouts, default headers, and streaming sends. |
+| [`Client`], [`ClientBuilder`], [`ConnectionPolicy`] | Connecting to an ICAP service, configuring host/port or `icap://` / `icaps://` URI, keep-alive, timeouts, response header limits, default headers, and streaming sends. |
 | [`Request`], [`Method`] | Building outbound `OPTIONS`, `REQMOD`, and `RESPMOD` requests for client send/build APIs. |
 | [`IncomingRequest`] | Inspecting server-side ICAP requests in route handlers. ICAP metadata is read-only; services may mutate or consume only the embedded HTTP message. |
 | [`Response`], [`StatusCode`] | Building ICAP responses, parsing raw responses, validating `ISTag`, serializing RFC-compatible wire bytes, and attaching embedded HTTP messages. |
-| [`Server`], [`ServerBuilder`] | Running a Tokio ICAP service with per-service routes, aliases, default service routing, connection limits, TLS/mTLS, and automatic `OPTIONS`. |
-| [`ServiceOptions`], [`TransferBehavior`] | Describing per-service `OPTIONS` capabilities: `Methods`, `Service`, explicit `ISTag`, `Allow`, `Preview`, `Transfer-*`, `Options-TTL`, and optional `opt-body`. |
+| [`Server`], [`ServerBuilder`] | Running a Tokio ICAP service with per-service routes, aliases, default service routing, request header limits, connection limits, TLS/mTLS, and automatic `OPTIONS`. |
+| [`ServiceOptions`], [`TransferBehavior`] | Describing per-service `OPTIONS` capabilities: `Methods`, `Service`, explicit `ISTag`, `Allow`, `Preview`, `Max-Object-Size`, `Transfer-*`, `Options-TTL`, and optional `opt-body`. |
 | [`Body`], [`EmbeddedHttp`] | Inspecting embedded HTTP request/response heads and bodies in server handlers. Regular handlers receive [`Body::Full`]; preview-aware handlers may receive [`Body::Preview`]. |
 | [`PreviewDecision`] | Returning an early final response from a preview-aware route, or continuing the RFC preview flow. |
 | [`Error`], [`IcapResult`] | Handling protocol, parsing, serialization, network, service, and handler errors without converting them into generic I/O errors. |
@@ -436,6 +445,7 @@ let client = Client::builder()
     .connect_timeout(Some(Duration::from_secs(3)))
     .write_timeout(Some(Duration::from_secs(30)))
     .continue_timeout(Some(Duration::from_secs(10)))
+    .with_response_header_limit(64 * 1024)
     .try_build()?;
 # Ok::<(), icap_rs::Error>(())
 ```
@@ -555,10 +565,12 @@ async fn run() -> IcapResult<()> {
     let options = ServiceOptions::new()
         .with_static_istag(ISTAG)
         .allow_204()
-        .with_preview(1024);
+        .with_preview(1024)
+        .with_max_object_size(10 * 1024 * 1024);
 
     let server = Server::builder()
         .bind("127.0.0.1:1344")
+        .with_request_header_limit(64 * 1024)
         .route_reqmod(
             "scan",
             |_request: IncomingRequest| async move {

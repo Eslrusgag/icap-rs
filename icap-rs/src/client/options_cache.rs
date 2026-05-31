@@ -253,12 +253,12 @@ impl OptionsCache {
         file_ext: &str,
     ) -> Option<TransferAction> {
         let key = (host.to_string(), port, path.to_string());
-        let entries = self.entries.read().await;
-        let entry = entries.get(&key)?;
-        if !entry.is_fresh() {
-            return None;
-        }
-        entry.transfer_action(file_ext)
+        self.entries
+            .read()
+            .await
+            .get(&key)
+            .filter(|entry| entry.is_fresh())
+            .and_then(|entry| entry.transfer_action(file_ext))
     }
 
     /// Invalidate the cached entry when an observed `ISTag` differs from the
@@ -280,14 +280,15 @@ impl OptionsCache {
         let key = (host.to_string(), port, path.to_string());
 
         // Fast path (warm cache, no ISTag change): read lock only.
-        {
-            let entries = self.entries.read().await;
-            let Some(entry) = entries.get(&key) else {
-                return;
-            };
-            if entry.istag.as_deref() == Some(observed) {
-                return;
-            }
+        let matches_observed = self
+            .entries
+            .read()
+            .await
+            .get(&key)
+            .map(|entry| entry.istag.as_deref() == Some(observed));
+        match matches_observed {
+            Some(true) | None => return,
+            Some(false) => {}
         }
 
         // Slow path: ISTag changed — acquire write lock and remove the entry.

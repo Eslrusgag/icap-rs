@@ -209,6 +209,7 @@ pub struct Server {
     default_service: Option<String>,
     request_parser_mode: RequestParserMode,
     timeouts: ServerTimeouts,
+    max_request_header_bytes: usize,
     shutdown_handler: Arc<dyn Fn(ShutdownEvent) + Send + Sync>,
     task_tracker: Option<TaskTracker>,
     #[cfg(feature = "tls-rustls")]
@@ -364,6 +365,7 @@ impl Server {
                     let advertised_max = self.advertised_max_conn;
                     let request_parser_mode = self.request_parser_mode;
                     let timeouts = self.timeouts.clone();
+                    let max_request_header_bytes = self.max_request_header_bytes;
                     let conn_shutdown = shutdown_rx.clone();
 
                     #[cfg(feature = "tls-rustls")]
@@ -411,6 +413,7 @@ impl Server {
                                         advertised_max,
                                         request_parser_mode,
                                         timeouts,
+                                        max_request_header_bytes,
                                         conn_shutdown,
                                         addr,
                                     ))
@@ -442,6 +445,7 @@ impl Server {
                             advertised_max,
                             request_parser_mode,
                             timeouts,
+                            max_request_header_bytes,
                             conn_shutdown,
                             addr,
                         ))

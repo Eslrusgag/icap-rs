@@ -89,8 +89,11 @@ async fn start_auth_server() -> (u16, Arc<AtomicUsize>, Arc<tokio::sync::Mutex<S
                         .lines()
                         .find(|l| l.to_ascii_lowercase().starts_with("proxy-authorization:"))
                     {
-                        *la.lock().await =
-                            line.splitn(2, ':').nth(1).unwrap_or("").trim().to_string();
+                        *la.lock().await = line
+                            .split_once(':')
+                            .map_or("", |(_, value)| value)
+                            .trim()
+                            .to_string();
                     }
 
                     // A real proxy checks whether credentials are present and

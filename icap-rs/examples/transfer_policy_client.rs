@@ -104,9 +104,8 @@ async fn start_server() -> (u16, Arc<AtomicUsize>) {
                         let preview = head_str
                             .lines()
                             .find(|l| l.to_ascii_lowercase().starts_with("preview:"))
-                            .and_then(|l| l.splitn(2, ':').nth(1))
-                            .map(|v| v.trim().to_string())
-                            .unwrap_or_else(|| "none".to_string());
+                            .and_then(|l| l.split_once(':').map(|(_, value)| value))
+                            .map_or_else(|| "none".to_string(), |v| v.trim().to_string());
 
                         format!(
                             "ICAP/1.0 204 No Content\r\n\

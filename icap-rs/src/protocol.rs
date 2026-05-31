@@ -6,7 +6,8 @@ pub mod istag;
 
 pub use chunked::{
     dechunk_icap_entity, dechunk_icap_entity_with_ieof, dechunk_icap_entity_with_use_original_body,
-    parse_one_chunk, read_chunked_to_end, read_chunked_until_zero, write_chunk, write_chunk_into,
+    parse_one_chunk, read_chunked_to_end, read_chunked_to_end_limited, read_chunked_until_zero,
+    read_chunked_until_zero_limited, write_chunk, write_chunk_into,
 };
 pub use encapsulated::{Encapsulated, parse_encapsulated_header, parse_encapsulated_value};
 pub use headers::parse_icap_response_head;

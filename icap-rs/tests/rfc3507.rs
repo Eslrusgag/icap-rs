@@ -120,6 +120,7 @@ async fn start_options_capability_server() -> u16 {
         .add_allow("204")
         .add_allow("206")
         .with_preview(1024)
+        .with_max_object_size(4096)
         .add_transfer_rule("txt", TransferBehavior::Preview)
         .add_transfer_rule("zip", TransferBehavior::Ignore)
         .with_default_transfer_behavior(TransferBehavior::Complete);
@@ -203,6 +204,240 @@ fn embedded_http_response(body: &str) -> HttpResponse<Vec<u8>> {
         .header("Content-Length", body.len().to_string())
         .body(body.as_bytes().to_vec())
         .expect("http response")
+}
+
+mod header_limits {
+    use super::*;
+
+    #[tokio::test]
+    async fn rfc3507_server_rejects_icap_request_headers_over_configured_limit() {
+        let port = unused_port();
+        let server = Server::builder()
+            .bind(&format!("127.0.0.1:{port}"))
+            .with_request_header_limit(128)
+            .route_reqmod(
+                "scan",
+                no_modification_handler,
+                Some(ServiceOptions::new().with_static_istag(ISTAG)),
+            )
+            .build()
+            .await
+            .expect("build limited server");
+
+        tokio::spawn(async move {
+            let _ = server.run().await;
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let filler = "a".repeat(256);
+        let request = format!(
+            "REQMOD icap://127.0.0.1:{port}/scan ICAP/1.0\r\n\
+             Host: 127.0.0.1\r\n\
+             X-Fill: {filler}\r\n\
+             Encapsulated: null-body=0\r\n\r\n"
+        );
+
+        let raw = send_raw_icap_request(port, &request).await;
+        assert_eq!(first_line(&raw), "ICAP/1.0 400 Request Header Too Large");
+        assert!(
+            String::from_utf8_lossy(&raw).contains("Request Header Too Large"),
+            "wire response should identify the oversized ICAP request header"
+        );
+    }
+
+    #[tokio::test]
+    async fn rfc3507_client_rejects_icap_response_headers_over_configured_limit() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut request_buf = [0_u8; 512];
+            let _ = stream.read(&mut request_buf).await;
+
+            let filler = "a".repeat(256);
+            let response = format!(
+                "ICAP/1.0 204 No Content\r\n\
+                 X-Fill: {filler}\r\n\
+                 Encapsulated: null-body=0\r\n\r\n"
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response");
+        });
+
+        let client = Client::builder()
+            .host("127.0.0.1")
+            .port(port)
+            .with_response_header_limit(128)
+            .build();
+        let err = client
+            .send(&Request::options("scan"))
+            .await
+            .expect_err("oversized ICAP response header should fail");
+
+        assert!(err.is_protocol());
+        assert!(
+            err.to_string().contains("ICAP response headers too large"),
+            "error should preserve the protocol-level header limit failure"
+        );
+    }
+}
+
+mod body_limits {
+    use super::*;
+
+    async fn start_body_limited_server(max_object_size: usize) -> u16 {
+        let port = unused_port();
+        let server = Server::builder()
+            .bind(&format!("127.0.0.1:{port}"))
+            .route_reqmod(
+                "scan",
+                no_modification_handler,
+                Some(
+                    ServiceOptions::new()
+                        .with_static_istag(ISTAG)
+                        .with_max_object_size(max_object_size),
+                ),
+            )
+            .build()
+            .await
+            .expect("build body-limited server");
+
+        tokio::spawn(async move {
+            let _ = server.run().await;
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        port
+    }
+
+    async fn start_per_service_body_limit_server() -> u16 {
+        let port = unused_port();
+        let server = Server::builder()
+            .bind(&format!("127.0.0.1:{port}"))
+            .route_reqmod(
+                "small",
+                no_modification_handler,
+                Some(
+                    ServiceOptions::new()
+                        .with_static_istag(ISTAG)
+                        .with_max_object_size(4),
+                ),
+            )
+            .route_reqmod(
+                "large",
+                no_modification_handler,
+                Some(
+                    ServiceOptions::new()
+                        .with_static_istag(ISTAG)
+                        .with_max_object_size(16),
+                ),
+            )
+            .build()
+            .await
+            .expect("build per-service body-limited server");
+
+        tokio::spawn(async move {
+            let _ = server.run().await;
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        port
+    }
+
+    #[tokio::test]
+    async fn rfc3507_service_counts_actual_body_not_content_length_for_max_object_size() {
+        let port = start_body_limited_server(4).await;
+        let http_head = "POST /upload HTTP/1.1\r\nHost: example.com\r\nContent-Length: 999\r\n\r\n";
+        let req_body_offset = http_head.len();
+        let request = format!(
+            "REQMOD icap://127.0.0.1:{port}/scan ICAP/1.0\r\n\
+             Host: 127.0.0.1\r\n\
+             Allow: 204\r\n\
+             Encapsulated: req-hdr=0, req-body={req_body_offset}\r\n\r\n\
+             {http_head}\
+             3\r\nabc\r\n0\r\n\r\n"
+        );
+
+        let raw = send_raw_icap_request(port, &request).await;
+        assert_eq!(first_line(&raw), "ICAP/1.0 204 No Content");
+    }
+
+    #[tokio::test]
+    async fn rfc3507_service_does_not_trust_null_body_content_length_for_max_object_size() {
+        let port = start_body_limited_server(4).await;
+        let http_head = "POST /upload HTTP/1.1\r\nHost: example.com\r\nContent-Length: 999\r\n\r\n";
+        let null_body_offset = http_head.len();
+        let request = format!(
+            "REQMOD icap://127.0.0.1:{port}/scan ICAP/1.0\r\n\
+             Host: 127.0.0.1\r\n\
+             Allow: 204\r\n\
+             Encapsulated: req-hdr=0, null-body={null_body_offset}\r\n\r\n\
+             {http_head}"
+        );
+
+        let raw = send_raw_icap_request(port, &request).await;
+        assert_eq!(first_line(&raw), "ICAP/1.0 204 No Content");
+    }
+
+    #[tokio::test]
+    async fn rfc3507_service_rejects_actual_body_over_max_object_size() {
+        let port = start_body_limited_server(4).await;
+        let http_head = "POST /upload HTTP/1.1\r\nHost: example.com\r\nContent-Length: 3\r\n\r\n";
+        let req_body_offset = http_head.len();
+        let request = format!(
+            "REQMOD icap://127.0.0.1:{port}/scan ICAP/1.0\r\n\
+             Host: 127.0.0.1\r\n\
+             Encapsulated: req-hdr=0, req-body={req_body_offset}\r\n\r\n\
+             {http_head}\
+             6\r\nabcdef\r\n0\r\n\r\n"
+        );
+
+        let raw = send_raw_icap_request(port, &request).await;
+        assert_eq!(first_line(&raw), "ICAP/1.0 413 Payload Too Large");
+    }
+
+    #[tokio::test]
+    async fn rfc3507_max_object_size_is_service_specific_options_policy() {
+        let port = start_per_service_body_limit_server().await;
+        let client = Client::builder().host("127.0.0.1").port(port).build();
+
+        let small_options = client
+            .send(&Request::options("small"))
+            .await
+            .expect("small options");
+        let large_options = client
+            .send(&Request::options("large"))
+            .await
+            .expect("large options");
+
+        assert_eq!(
+            small_options
+                .get_header("Max-Object-Size")
+                .expect("small Max-Object-Size"),
+            "4"
+        );
+        assert_eq!(
+            large_options
+                .get_header("Max-Object-Size")
+                .expect("large Max-Object-Size"),
+            "16"
+        );
+
+        let http_head = "POST /upload HTTP/1.1\r\nHost: example.com\r\nContent-Length: 8\r\n\r\n";
+        let req_body_offset = http_head.len();
+        let request = format!(
+            "REQMOD icap://127.0.0.1:{port}/large ICAP/1.0\r\n\
+             Host: 127.0.0.1\r\n\
+             Allow: 204\r\n\
+             Encapsulated: req-hdr=0, req-body={req_body_offset}\r\n\r\n\
+             {http_head}\
+             8\r\nabcdefgh\r\n0\r\n\r\n"
+        );
+
+        let raw = send_raw_icap_request(port, &request).await;
+        assert_eq!(first_line(&raw), "ICAP/1.0 204 No Content");
+    }
 }
 
 mod section_4_3_messages {
@@ -629,6 +864,12 @@ mod section_4_10_options {
         );
         assert_eq!(response.get_header("Allow").expect("Allow"), "204, 206");
         assert_eq!(response.get_header("Preview").expect("Preview"), "1024");
+        assert_eq!(
+            response
+                .get_header("Max-Object-Size")
+                .expect("Max-Object-Size"),
+            "4096"
+        );
         assert_eq!(
             response
                 .get_header("Transfer-Preview")
@@ -1287,11 +1528,12 @@ mod section_4_10_2_transfer_policy {
 
     /// Start a raw ICAP server that advertises Transfer-* policy in OPTIONS.
     ///
-    /// - OPTIONS → 200 with Transfer-Ignore: jpg, Transfer-Preview: html,
-    ///             Transfer-Complete: gif  (Preview: 512, Options-TTL: 3600)
-    /// - REQMOD  → 204 No Content; increments `reqmod_count`
+    /// - OPTIONS -> 200 with `Transfer-Ignore: jpg`,
+    ///   `Transfer-Preview: html`, and `Transfer-Complete: gif`
+    ///   (`Preview: 512`, `Options-TTL: 3600`)
+    /// - REQMOD -> 204 No Content; increments `reqmod_count`
     ///
-    /// Returns (port, reqmod_count, received_preview_size).
+    /// Returns `(port, reqmod_count, received_preview_size)`.
     /// `received_preview_size` is set to the `Preview` header value from the
     /// REQMOD request (or 0 if no Preview header).
     async fn start_transfer_policy_server() -> (
@@ -1487,10 +1729,10 @@ mod section_7_1_proxy_authentication {
     }
 
     /// Start a raw ICAP server that:
-    ///  - returns 407 Proxy Authentication Required on the FIRST REQMOD,
-    ///  - returns 204 No Content on the SECOND REQMOD (with credentials).
+    /// - returns 407 Proxy Authentication Required on the first `REQMOD`;
+    /// - returns 204 No Content on the second `REQMOD` with credentials.
     ///
-    /// Returns (port, request_count, last_proxy_auth_header).
+    /// Returns `(port, request_count, last_proxy_auth_header)`.
     async fn start_auth_server() -> (u16, Arc<AtomicUsize>, Arc<tokio::sync::Mutex<String>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let port = listener.local_addr().expect("addr").port();
@@ -1520,9 +1762,8 @@ mod section_7_1_proxy_authentication {
                             .find(|l| l.to_ascii_lowercase().starts_with("proxy-authorization:"))
                         {
                             *la.lock().await = auth_line
-                                .splitn(2, ':')
-                                .nth(1)
-                                .unwrap_or("")
+                                .split_once(':')
+                                .map_or("", |(_, value)| value)
                                 .trim()
                                 .to_string();
                         }
@@ -1583,10 +1824,9 @@ mod section_7_1_proxy_authentication {
 
         // Verify the Proxy-Authorization value: Basic base64("alice:hunter2")
         // "alice:hunter2" → YWxpY2U6aHVudGVyMg==
-        let auth = last_auth.lock().await;
+        let auth = last_auth.lock().await.clone();
         assert_eq!(
-            auth.as_str(),
-            "Basic YWxpY2U6aHVudGVyMg==",
+            auth, "Basic YWxpY2U6aHVudGVyMg==",
             "Proxy-Authorization must use Basic scheme with correct base64"
         );
     }

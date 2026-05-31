@@ -105,7 +105,7 @@ pub struct Request<R = Vec<u8>, D: DirectionMeta = Outbound> {
     /// Direction-specific metadata.
     ///
     /// [`OutboundMeta`] for client-side requests (zero-sized, zero overhead).
-    /// [`IncomingMeta`] for server-side requests (ISTag + chunk trailers).
+    /// [`IncomingMeta`] for server-side requests (`ISTag` + chunk trailers).
     pub(crate) meta: D::Meta,
 }
 
@@ -114,7 +114,7 @@ pub type OutboundRequest<R = Vec<u8>> = Request<R, Outbound>;
 
 /// ICAP request received by server route handlers.
 ///
-/// Carries server-injected metadata (ISTag, chunk trailers) that is absent on
+/// Carries server-injected metadata (`ISTag`, chunk trailers) that is absent on
 /// the client-side [`OutboundRequest`]. Access it via [`Request::istag`] and
 /// [`Request::chunk_trailers`].
 pub type IncomingRequest<R = Vec<u8>> = Request<R, Incoming>;
@@ -838,7 +838,7 @@ impl<R> Request<R, Incoming> {
     /// This accessor is only available on [`IncomingRequest`]; outbound client
     /// requests never carry chunk trailers.
     #[inline]
-    pub fn chunk_trailers(&self) -> &HeaderMap {
+    pub const fn chunk_trailers(&self) -> &HeaderMap {
         &self.meta.chunk_trailers
     }
 
@@ -852,7 +852,7 @@ impl<R> Request<R, Incoming> {
     /// or similar.
     ///
     /// This accessor is only available on [`IncomingRequest`]; outbound client
-    /// requests do not carry an ISTag.
+    /// requests do not carry an `ISTag`.
     #[inline]
     pub fn istag(&self) -> Option<&str> {
         self.meta.istag.as_deref()
