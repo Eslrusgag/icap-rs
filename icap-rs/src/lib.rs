@@ -11,7 +11,7 @@ pub mod server;
 pub mod tls;
 
 pub use client::Client;
-pub use client::builder::*;
+pub use client::builder::{ClientBuilder, ConnectionPolicy, ProxyAuth};
 pub use client::options_cache::OptionsCacheConfig;
 pub use client::timeouts::ClientTimeouts;
 pub use error::{Error, IcapResult};

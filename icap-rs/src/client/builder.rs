@@ -1,6 +1,7 @@
 use crate::client::options_cache::{OptionsCache, OptionsCacheConfig};
 use crate::client::timeouts::ClientTimeouts;
 use crate::client::{Client, ClientRef, parse_authority_with_scheme};
+
 #[cfg(feature = "tls-rustls")]
 use crate::tls::ClientTlsConfig;
 use crate::{Error, IcapResult};
@@ -8,6 +9,28 @@ use http::{HeaderMap, HeaderName, HeaderValue};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
+
+/// Credentials for `Proxy-Authorization: Basic` authentication (RFC 3507 §7.1).
+///
+/// Supply via [`ClientBuilder::proxy_auth`]. When the ICAP server responds
+/// with `407 Proxy Authentication Required`, the client retries the request
+/// once with a `Proxy-Authorization: Basic <base64(username:password)>` header.
+///
+/// # Examples
+///
+/// ```
+/// use icap_rs::{Client, ProxyAuth};
+///
+/// let client = Client::builder()
+///     .host("127.0.0.1")
+///     .proxy_auth("user", "secret")
+///     .build();
+/// ```
+#[derive(Debug, Clone)]
+pub struct ProxyAuth {
+    pub(crate) username: String,
+    pub(crate) password: String,
+}
 
 /// Policy for connection lifetime management.
 ///
@@ -40,6 +63,9 @@ pub struct ClientBuilder {
 
     // OPTIONS cache. `None` keeps the legacy behavior (no automatic OPTIONS).
     options_cache: Option<OptionsCacheConfig>,
+
+    // Proxy authentication credentials. `None` → no automatic 407 retry.
+    proxy_auth: Option<ProxyAuth>,
 
     // TLS state. `tls` is the user-supplied config (explicit `with_tls`),
     // `auto_tls` records whether `with_uri("icaps://...")` requested TLS.
@@ -227,6 +253,33 @@ impl ClientBuilder {
         self
     }
 
+    /// Configure proxy authentication credentials (RFC 3507 §7.1).
+    ///
+    /// When the ICAP server responds with `407 Proxy Authentication Required`,
+    /// the client retries the request exactly once with a
+    /// `Proxy-Authorization: Basic <base64(username:password)>` header.
+    ///
+    /// If the retry also yields a `407` (wrong credentials), the error response
+    /// is returned to the caller as-is.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use icap_rs::Client;
+    ///
+    /// let client = Client::builder()
+    ///     .host("proxy.example.com")
+    ///     .proxy_auth("alice", "hunter2")
+    ///     .build();
+    /// ```
+    pub fn proxy_auth(mut self, username: &str, password: &str) -> Self {
+        self.proxy_auth = Some(ProxyAuth {
+            username: username.to_string(),
+            password: password.to_string(),
+        });
+        self
+    }
+
     /// Configure the builder from an ICAP URI (`icap://...` or `icaps://...`).
     ///
     /// This extracts `host` and `port` for use in the TCP connection. The service
@@ -315,6 +368,7 @@ impl ClientBuilder {
                 tls,
                 idle_conn: Mutex::new(None),
                 options_cache,
+                proxy_auth: self.proxy_auth,
             }),
         }
     }

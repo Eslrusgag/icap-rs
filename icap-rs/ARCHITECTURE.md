@@ -175,6 +175,12 @@ Lifetime = `Options-TTL` header (seconds) when present, else
 changed `ISTag` observed on a later REQMOD/RESPMOD response invalidates the
 entry; `Client::invalidate_options_cache()` clears every entry on demand.
 
+| Type | Where | Purpose |
+|---|---|---|
+| `TransferAction` | `client/options_cache.rs` | `pub(crate)` enum — `Full` / `Skip` / `Preview(n)` resolved from the cached OPTIONS Transfer-* headers |
+| `CachedOptions` extended | `client/options_cache.rs` | Now also stores `transfer_preview`, `transfer_ignore`, `transfer_complete`, `preview_size` parsed from the OPTIONS response |
+| `ProxyAuth` | `client/builder.rs` | `pub` struct — `username` + `password`; supplied via `ClientBuilder::proxy_auth` |
+
 ---
 
 ## Data flows
@@ -187,13 +193,19 @@ ClientBuilder::build() → Client
 Client::send(req)
   0. if OPTIONS cache enabled and req.is_mod():            (RFC 3507 §4.10 / §5)
        if no fresh CachedOptions for (host, port, normalize_service_path(service)):
-         send an OPTIONS for that path, parse Options-TTL / ISTag,
-         store a CachedOptions entry (skipped silently on any failure)
+         send an OPTIONS for that path, parse Options-TTL / ISTag /
+         Transfer-* / Preview, store a CachedOptions entry (silently on failure)
+  0b. if OPTIONS cache enabled and req.is_mod():           (RFC 3507 §4.10.2)
+       resolve Transfer-* policy for the request's file extension:
+         Transfer-Ignore  → return synthetic 204 immediately (no network I/O)
+         Transfer-Complete → effective_preview = None (full body, no Preview header)
+         Transfer-Preview  → effective_preview = Some(n) from OPTIONS Preview header
   1. acquire / create Conn (plain TCP or TLS via ClientTlsConnector)
-  2. build_icap_request_bytes(req)
+  2. build_icap_request_bytes(req, effective_preview)
        → compute Encapsulated offsets
        → serialize embedded HTTP head (unchunked)
-       → chunk preview bytes (if preview_size set)
+       → chunk preview bytes (using effective_preview instead of req.preview_size)
+       → if proxy_auth_value set: write Proxy-Authorization header
   3. write bytes to Conn (with write_timeout)
   4. if OPTIONS: read response, return
   5. if preview:
@@ -204,14 +216,18 @@ Client::send(req)
        parse_icap_response_head → status, headers
        dechunk_response_body_if_needed → dechunked body + chunk trailers (RFC 7230 §4.1.2)
   8. store / release Conn based on ConnectionPolicy
+  8b. if response is 407 and proxy_auth configured:        (RFC 3507 §7.1)
+       retry once with Proxy-Authorization: Basic <base64(user:pass)>
   9. if OPTIONS cache enabled and req.is_mod():            (RFC 3507 §5)
        if response ISTag differs from the cached one: invalidate the entry
 ```
 
 The OPTIONS cache is opt-in via `ClientBuilder::with_options_cache`; when it is
-not configured, steps 0 and 9 are skipped and `send` behaves exactly as before
-(no automatic OPTIONS). `Client::invalidate_options_cache()` drops every cached
-entry on demand.
+not configured, steps 0, 0b, and 9 are skipped. `Client::invalidate_options_cache()`
+drops every cached entry on demand.
+
+Proxy authentication is opt-in via `ClientBuilder::proxy_auth(username, password)`;
+without it, step 8b is skipped and 407 responses are returned to the caller.
 
 Streaming variant (`send_streaming_reader`) skips step 2 body buffering — the
 body is written chunk-by-chunk from an `AsyncRead` source after the headers.

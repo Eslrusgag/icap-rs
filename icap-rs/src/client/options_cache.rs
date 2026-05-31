@@ -11,6 +11,11 @@
 //! `ISTag` observed on a later `REQMOD`/`RESPMOD` response differs from the one
 //! captured at `OPTIONS` time; [`OptionsCache::reconcile_istag`] implements
 //! that rule.
+//!
+//! RFC 3507 §4.10.2 defines `Transfer-Preview`, `Transfer-Ignore`, and
+//! `Transfer-Complete` headers that tell the client how to handle objects by
+//! file extension. [`OptionsCache::resolve_transfer`] looks up the action for a
+//! given extension from the cached OPTIONS response.
 
 use crate::response::ParsedResponse;
 use std::collections::HashMap;
@@ -61,13 +66,47 @@ impl OptionsCacheConfig {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Transfer-* policy (RFC 3507 §4.10.2)
+// ---------------------------------------------------------------------------
+
+/// Action the client should take for a request based on the server's
+/// `Transfer-Preview`, `Transfer-Ignore`, and `Transfer-Complete` OPTIONS
+/// response headers (RFC 3507 §4.10.2).
+///
+/// Priority (highest first): `Full` > `Skip` > `Preview`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TransferAction {
+    /// Send the complete body without preview (`Transfer-Complete`).
+    Full,
+    /// Skip the ICAP transaction; return a synthetic 204 without contacting
+    /// the server (`Transfer-Ignore`).
+    Skip,
+    /// Send the first `n` bytes as a preview and wait for `100 Continue`
+    /// (`Transfer-Preview`). `n` is taken from the OPTIONS `Preview` header.
+    Preview(usize),
+}
+
+// ---------------------------------------------------------------------------
+// CachedOptions
+// ---------------------------------------------------------------------------
+
 /// A cached `OPTIONS` result for a single service endpoint.
 #[derive(Debug, Clone)]
 pub(crate) struct CachedOptions {
-    /// `ISTag` captured at `OPTIONS` time, used to detect server config changes.
+    /// `ISTag` captured at `OPTIONS` time.
     istag: Option<String>,
     /// Instant after which the entry is considered stale.
     expires_at: Instant,
+    /// File extensions for which the server requests preview bytes.
+    transfer_preview: Vec<String>,
+    /// File extensions that the server wants bypassed (no ICAP scan).
+    transfer_ignore: Vec<String>,
+    /// File extensions for which the server wants the full body (no preview).
+    transfer_complete: Vec<String>,
+    /// Preview size (bytes) advertised in the OPTIONS `Preview` header.
+    /// Used as the preview length when `Transfer-Preview` matches.
+    preview_size: Option<usize>,
 }
 
 impl CachedOptions {
@@ -88,14 +127,47 @@ impl CachedOptions {
             .get_header("ISTag")
             .and_then(|value| value.to_str().ok())
             .map(str::to_string);
-        Some(Self { istag, expires_at })
+        Some(Self {
+            istag,
+            expires_at,
+            transfer_preview: parse_extensions(response, "Transfer-Preview"),
+            transfer_ignore: parse_extensions(response, "Transfer-Ignore"),
+            transfer_complete: parse_extensions(response, "Transfer-Complete"),
+            preview_size: parse_preview_size(response),
+        })
     }
 
     /// Whether the entry has not yet expired.
     fn is_fresh(&self) -> bool {
         Instant::now() < self.expires_at
     }
+
+    /// Determine the transfer action for a request based on its file extension.
+    ///
+    /// Returns `None` when the extension does not match any of the server's
+    /// `Transfer-*` policies and the request should proceed with its own
+    /// preview settings.
+    ///
+    /// Priority (RFC 3507 §4.10.2): `Full` > `Skip` > `Preview`.
+    fn transfer_action(&self, file_ext: &str) -> Option<TransferAction> {
+        let matches = |list: &[String]| list.iter().any(|e| e == "*" || e == file_ext);
+
+        if matches(&self.transfer_complete) {
+            return Some(TransferAction::Full);
+        }
+        if matches(&self.transfer_ignore) {
+            return Some(TransferAction::Skip);
+        }
+        if matches(&self.transfer_preview) {
+            return Some(TransferAction::Preview(self.preview_size.unwrap_or(0)));
+        }
+        None
+    }
 }
+
+// ---------------------------------------------------------------------------
+// Header parsing helpers
+// ---------------------------------------------------------------------------
 
 /// Parse the `Options-TTL` header (integer seconds) into a [`Duration`].
 fn parse_options_ttl(response: &ParsedResponse) -> Option<Duration> {
@@ -103,6 +175,31 @@ fn parse_options_ttl(response: &ParsedResponse) -> Option<Duration> {
     let seconds: u64 = raw.trim().parse().ok()?;
     Some(Duration::from_secs(seconds))
 }
+
+/// Parse the `Preview` header (integer bytes) for use as a preview size.
+fn parse_preview_size(response: &ParsedResponse) -> Option<usize> {
+    let raw = response.get_header("Preview")?.to_str().ok()?;
+    raw.trim().parse().ok()
+}
+
+/// Parse a `Transfer-*` header as a comma-separated list of lowercase
+/// file extensions (without leading dot). `"*"` is preserved as-is.
+fn parse_extensions(response: &ParsedResponse, header: &str) -> Vec<String> {
+    let Some(value) = response.get_header(header) else {
+        return Vec::new();
+    };
+    let Ok(s) = value.to_str() else {
+        return Vec::new();
+    };
+    s.split(',')
+        .map(|e| e.trim().to_lowercase())
+        .filter(|e| !e.is_empty())
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// OptionsCache
+// ---------------------------------------------------------------------------
 
 /// Cache key: target host, port, and normalized service path.
 type CacheKey = (String, u16, String);
@@ -142,6 +239,28 @@ impl OptionsCache {
         entries.insert(key, entry);
     }
 
+    /// Return the server-requested transfer action for `file_ext` based on
+    /// the cached OPTIONS response (RFC 3507 §4.10.2).
+    ///
+    /// Returns `None` when there is no fresh cache entry or when the extension
+    /// does not match any `Transfer-*` policy. In that case the caller should
+    /// use the request's own preview settings unchanged.
+    pub(crate) async fn resolve_transfer(
+        &self,
+        host: &str,
+        port: u16,
+        path: &str,
+        file_ext: &str,
+    ) -> Option<TransferAction> {
+        let key = (host.to_string(), port, path.to_string());
+        let entries = self.entries.read().await;
+        let entry = entries.get(&key)?;
+        if !entry.is_fresh() {
+            return None;
+        }
+        entry.transfer_action(file_ext)
+    }
+
     /// Invalidate the cached entry when an observed `ISTag` differs from the
     /// captured one.
     ///
@@ -161,21 +280,17 @@ impl OptionsCache {
         let key = (host.to_string(), port, path.to_string());
 
         // Fast path (warm cache, no ISTag change): read lock only.
-        // In production the ISTag rarely changes, so the hot path must not
-        // block other readers by taking a write lock unconditionally.
         {
             let entries = self.entries.read().await;
             let Some(entry) = entries.get(&key) else {
-                return; // nothing cached — nothing to invalidate
+                return;
             };
             if entry.istag.as_deref() == Some(observed) {
-                return; // ISTag matches — no action needed
+                return;
             }
         }
 
         // Slow path: ISTag changed — acquire write lock and remove the entry.
-        // Re-check under the write lock to avoid a TOCTOU race if two tasks
-        // observe a new ISTag simultaneously.
         let mut entries = self.entries.write().await;
         if let Some(entry) = entries.get(&key)
             && entry.istag.as_deref() != Some(observed)

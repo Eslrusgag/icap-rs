@@ -659,14 +659,6 @@ mod unsupported_rfc3507_gaps {
     #[test]
     #[ignore = "not supported: RFC 3507 Upgrade header TLS handshake; direct icaps:// TLS is supported instead"]
     fn unsupported_section_7_2_upgrade_tls_handshake() {}
-
-    #[test]
-    #[ignore = "not supported as first-class API: RFC 3507 proxy/service authentication"]
-    fn unsupported_section_7_1_builtin_authentication() {}
-
-    #[test]
-    #[ignore = "partial support only: server advertises Transfer-* but client does not automatically apply transfer policy"]
-    fn unsupported_section_4_10_2_automatic_transfer_policy_consumption() {}
 }
 
 // ---------------------------------------------------------------------------
@@ -1206,6 +1198,378 @@ mod section_5_options_cache {
             options_count.load(Ordering::SeqCst),
             2,
             "an ISTag change must trigger a fresh OPTIONS fetch"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RFC 3507 §4.10.2 — Client-side Transfer-* policy consumption
+// ---------------------------------------------------------------------------
+//
+// The server MAY advertise Transfer-Preview, Transfer-Ignore, and
+// Transfer-Complete in its OPTIONS response. The client MUST apply the policy
+// that matches the request's file extension (RFC 3507 §4.10.2):
+//
+//   Transfer-Complete (highest priority): send the full body, no Preview header.
+//   Transfer-Ignore:                      bypass ICAP; return a synthetic 204.
+//   Transfer-Preview (lowest priority):   send N bytes as preview, wait for 100 Continue.
+//
+// These tests use a raw TCP server so Transfer-* headers can be included in
+// the OPTIONS response without modifying the server-side ServiceOptions API.
+
+mod section_4_10_2_transfer_policy {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // Read until the first CRLFCRLF — works for null-body and header-only ICAP messages.
+    async fn read_icap_head(stream: &mut TcpStream) -> Option<Vec<u8>> {
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 4096];
+        loop {
+            let n = stream.read(&mut tmp).await.ok()?;
+            if n == 0 {
+                return (!buf.is_empty()).then_some(buf);
+            }
+            buf.extend_from_slice(&tmp[..n]);
+            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                return Some(buf);
+            }
+        }
+    }
+
+    /// Start a raw ICAP server that advertises Transfer-* policy in OPTIONS.
+    ///
+    /// - OPTIONS → 200 with Transfer-Ignore: jpg, Transfer-Preview: html,
+    ///             Transfer-Complete: gif  (Preview: 512, Options-TTL: 3600)
+    /// - REQMOD  → 204 No Content; increments `reqmod_count`
+    ///
+    /// Returns (port, reqmod_count, received_preview_size).
+    /// `received_preview_size` is set to the `Preview` header value from the
+    /// REQMOD request (or 0 if no Preview header).
+    async fn start_transfer_policy_server() -> (
+        u16,
+        Arc<AtomicUsize>,
+        Arc<tokio::sync::Mutex<Option<usize>>>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let reqmod_count = Arc::new(AtomicUsize::new(0));
+        let preview_seen = Arc::new(tokio::sync::Mutex::new(None));
+
+        let rc = Arc::clone(&reqmod_count);
+        let ps = Arc::clone(&preview_seen);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let rc = Arc::clone(&rc);
+                let ps = Arc::clone(&ps);
+                tokio::spawn(async move {
+                    loop {
+                        let Some(head) = read_icap_head(&mut stream).await else {
+                            return;
+                        };
+                        let head_str = String::from_utf8_lossy(&head);
+                        let resp = if head_str.starts_with("OPTIONS") {
+                            "ICAP/1.0 200 OK\r\n\
+                             ISTag: \"transfer-test\"\r\n\
+                             Options-TTL: 3600\r\n\
+                             Transfer-Ignore: jpg\r\n\
+                             Transfer-Preview: html\r\n\
+                             Transfer-Complete: gif\r\n\
+                             Preview: 512\r\n\
+                             Methods: REQMOD\r\n\
+                             Encapsulated: null-body=0\r\n\r\n"
+                                .to_string()
+                        } else {
+                            // REQMOD — record whether the request carried a Preview header
+                            let preview = head_str
+                                .lines()
+                                .find(|l| l.to_ascii_lowercase().starts_with("preview:"))
+                                .and_then(|l| l.split(':').nth(1))
+                                .and_then(|v| v.trim().parse::<usize>().ok());
+                            *ps.lock().await = preview;
+                            rc.fetch_add(1, Ordering::SeqCst);
+                            "ICAP/1.0 204 No Content\r\n\
+                             ISTag: \"transfer-test\"\r\n\
+                             Encapsulated: null-body=0\r\n\r\n"
+                                .to_string()
+                        };
+                        if stream.write_all(resp.as_bytes()).await.is_err() {
+                            return;
+                        }
+                        let _ = stream.flush().await;
+                    }
+                });
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        (port, reqmod_count, preview_seen)
+    }
+
+    fn reqmod_for(uri: &str) -> Request {
+        let http_req = HttpRequest::builder()
+            .method("GET")
+            .uri(uri)
+            .version(Version::HTTP_11)
+            .header("Host", "example.com")
+            .body(Vec::new())
+            .expect("build http request");
+        Request::reqmod("/reqmod")
+            .allow_204()
+            .with_http_request(http_req)
+            .expect("build reqmod")
+    }
+
+    /// RFC 3507 §4.10.2 — Transfer-Ignore: the client returns a synthetic 204
+    /// without contacting the server for extensions listed in Transfer-Ignore.
+    #[tokio::test]
+    async fn rfc4_10_2_transfer_ignore_bypasses_icap() {
+        // RFC 3507 §4.10.2
+        let (port, reqmod_count, _) = start_transfer_policy_server().await;
+        let client = Client::builder()
+            .host("127.0.0.1")
+            .port(port)
+            .with_options_cache(OptionsCacheConfig::new().with_default_ttl(Duration::from_secs(60)))
+            .build();
+
+        let resp = client
+            .send(&reqmod_for("http://example.com/photo.jpg"))
+            .await
+            .expect("send");
+
+        assert_eq!(resp.status_code(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            reqmod_count.load(Ordering::SeqCst),
+            0,
+            "Transfer-Ignore must bypass ICAP — no REQMOD should reach the server"
+        );
+    }
+
+    /// RFC 3507 §4.10.2 — Transfer-Preview: the client sends the first N bytes
+    /// as preview and waits for 100 Continue.
+    #[tokio::test]
+    async fn rfc4_10_2_transfer_preview_overrides_request_preview_size() {
+        // RFC 3507 §4.10.2
+        let (port, reqmod_count, preview_seen) = start_transfer_policy_server().await;
+        let client = Client::builder()
+            .host("127.0.0.1")
+            .port(port)
+            .with_options_cache(OptionsCacheConfig::new().with_default_ttl(Duration::from_secs(60)))
+            .build();
+
+        // Request has NO preview set; Transfer-Preview: html should force Preview: 512.
+        let resp = client
+            .send(&reqmod_for("http://example.com/page.html"))
+            .await
+            .expect("send");
+
+        assert_eq!(resp.status_code(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            reqmod_count.load(Ordering::SeqCst),
+            1,
+            "REQMOD must reach server"
+        );
+        assert_eq!(
+            *preview_seen.lock().await,
+            Some(512),
+            "Transfer-Preview must inject Preview: 512 from OPTIONS"
+        );
+    }
+
+    /// RFC 3507 §4.10.2 — Transfer-Complete: the client sends the full body
+    /// with no Preview header.
+    #[tokio::test]
+    async fn rfc4_10_2_transfer_complete_sends_full_body_no_preview() {
+        // RFC 3507 §4.10.2
+        let (port, reqmod_count, preview_seen) = start_transfer_policy_server().await;
+        let client = Client::builder()
+            .host("127.0.0.1")
+            .port(port)
+            .with_options_cache(OptionsCacheConfig::new().with_default_ttl(Duration::from_secs(60)))
+            .build();
+
+        let resp = client
+            .send(&reqmod_for("http://example.com/icon.gif"))
+            .await
+            .expect("send");
+
+        assert_eq!(resp.status_code(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            reqmod_count.load(Ordering::SeqCst),
+            1,
+            "REQMOD must reach server"
+        );
+        assert_eq!(
+            *preview_seen.lock().await,
+            None,
+            "Transfer-Complete must not include a Preview header"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RFC 3507 §7.1 — Proxy authentication
+// ---------------------------------------------------------------------------
+//
+// RFC 3507 §7.1 describes proxy authentication via 407 Proxy Authentication
+// Required and the Proxy-Authorization header. The client MUST retry the
+// request once with credentials when it receives a 407 and credentials are
+// configured.
+
+mod section_7_1_proxy_authentication {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    async fn read_icap_head(stream: &mut TcpStream) -> Option<Vec<u8>> {
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 4096];
+        loop {
+            let n = stream.read(&mut tmp).await.ok()?;
+            if n == 0 {
+                return (!buf.is_empty()).then_some(buf);
+            }
+            buf.extend_from_slice(&tmp[..n]);
+            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                return Some(buf);
+            }
+        }
+    }
+
+    /// Start a raw ICAP server that:
+    ///  - returns 407 Proxy Authentication Required on the FIRST REQMOD,
+    ///  - returns 204 No Content on the SECOND REQMOD (with credentials).
+    ///
+    /// Returns (port, request_count, last_proxy_auth_header).
+    async fn start_auth_server() -> (u16, Arc<AtomicUsize>, Arc<tokio::sync::Mutex<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let last_auth = Arc::new(tokio::sync::Mutex::new(String::new()));
+
+        let rc = Arc::clone(&request_count);
+        let la = Arc::clone(&last_auth);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let rc = Arc::clone(&rc);
+                let la = Arc::clone(&la);
+                tokio::spawn(async move {
+                    loop {
+                        let Some(head) = read_icap_head(&mut stream).await else {
+                            return;
+                        };
+                        let head_str = String::from_utf8_lossy(&head);
+                        let n = rc.fetch_add(1, Ordering::SeqCst) + 1;
+
+                        // Record the Proxy-Authorization header if present.
+                        if let Some(auth_line) = head_str
+                            .lines()
+                            .find(|l| l.to_ascii_lowercase().starts_with("proxy-authorization:"))
+                        {
+                            *la.lock().await = auth_line
+                                .splitn(2, ':')
+                                .nth(1)
+                                .unwrap_or("")
+                                .trim()
+                                .to_string();
+                        }
+
+                        let resp = if n == 1 {
+                            // First request: challenge
+                            "ICAP/1.0 407 Proxy Authentication Required\r\n\
+                             Proxy-Authenticate: Basic realm=\"icap-test\"\r\n\
+                             Encapsulated: null-body=0\r\n\r\n"
+                                .to_string()
+                        } else {
+                            // Subsequent requests: accept
+                            "ICAP/1.0 204 No Content\r\n\
+                             ISTag: \"auth-ok\"\r\n\
+                             Encapsulated: null-body=0\r\n\r\n"
+                                .to_string()
+                        };
+                        if stream.write_all(resp.as_bytes()).await.is_err() {
+                            return;
+                        }
+                        let _ = stream.flush().await;
+                    }
+                });
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        (port, request_count, last_auth)
+    }
+
+    /// RFC 3507 §7.1 — the client retries with Basic credentials on 407, and
+    /// the Proxy-Authorization header uses the correct base64 encoding.
+    #[tokio::test]
+    async fn rfc7_1_client_retries_with_proxy_authorization_on_407() {
+        // RFC 3507 §7.1
+        let (port, request_count, last_auth) = start_auth_server().await;
+
+        let client = Client::builder()
+            .host("127.0.0.1")
+            .port(port)
+            .proxy_auth("alice", "hunter2")
+            .build();
+
+        let resp = client
+            .send(&Request::reqmod("/reqmod").allow_204())
+            .await
+            .expect("send with proxy auth");
+
+        assert_eq!(
+            resp.status_code(),
+            StatusCode::NO_CONTENT,
+            "retry with credentials must succeed"
+        );
+        assert_eq!(
+            request_count.load(Ordering::SeqCst),
+            2,
+            "exactly two requests expected: 407 challenge + authenticated retry"
+        );
+
+        // Verify the Proxy-Authorization value: Basic base64("alice:hunter2")
+        // "alice:hunter2" → YWxpY2U6aHVudGVyMg==
+        let auth = last_auth.lock().await;
+        assert_eq!(
+            auth.as_str(),
+            "Basic YWxpY2U6aHVudGVyMg==",
+            "Proxy-Authorization must use Basic scheme with correct base64"
+        );
+    }
+
+    /// RFC 3507 §7.1 — without credentials configured the 407 is returned
+    /// to the caller as-is (no retry).
+    #[tokio::test]
+    async fn rfc7_1_no_credentials_returns_407_to_caller() {
+        // RFC 3507 §7.1
+        let (port, request_count, _) = start_auth_server().await;
+
+        let client = Client::builder()
+            .host("127.0.0.1")
+            .port(port)
+            // no .proxy_auth()
+            .build();
+
+        let resp = client
+            .send(&Request::reqmod("/reqmod").allow_204())
+            .await
+            .expect("send without proxy auth");
+
+        assert_eq!(
+            resp.status_code(),
+            StatusCode::PROXY_AUTHENTICATION_REQUIRED
+        );
+        assert_eq!(
+            request_count.load(Ordering::SeqCst),
+            1,
+            "without credentials only one request is sent"
         );
     }
 }

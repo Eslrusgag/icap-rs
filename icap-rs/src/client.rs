@@ -40,8 +40,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::client::builder::{ClientBuilder, ConnectionPolicy};
-use crate::client::options_cache::{CachedOptions, OptionsCache};
+use crate::client::builder::{ClientBuilder, ConnectionPolicy, ProxyAuth};
+use crate::client::options_cache::{CachedOptions, OptionsCache, TransferAction};
 use crate::client::timeouts::ClientTimeouts;
 use crate::net::Conn;
 use tokio::fs::File as TokioFile;
@@ -75,6 +75,7 @@ struct ClientRef {
     tls: Option<ClientTlsConnector>,
     idle_conn: Mutex<Option<Conn>>,
     options_cache: Option<OptionsCache>,
+    proxy_auth: Option<ProxyAuth>,
 }
 
 impl Client {
@@ -87,7 +88,8 @@ impl Client {
     /// Useful for debugging or for printing what would be sent without
     /// actually opening a connection.
     pub fn get_request(&self, req: &Request) -> IcapResult<Vec<u8>> {
-        let built = self.build_icap_request_bytes(req, false, req.preview_ieof, true)?;
+        let built =
+            self.build_icap_request_bytes(req, None, None, false, req.preview_ieof, true)?;
         Ok(built.bytes)
     }
 
@@ -102,12 +104,37 @@ impl Client {
             self.ensure_options_cached(req).await;
         }
 
+        // RFC 3507 §4.10.2: apply server-advertised Transfer-* policy.
+        let effective_preview = self.resolve_effective_preview(req).await;
+        if matches!(effective_preview, Some(None)) && req.is_mod() {
+            // Transfer-Ignore: skip ICAP entirely, return a synthetic pass-through.
+            return synthetic_204();
+        }
+
         let response = Box::pin(Self::with_timeout_as(
             self.inner.timeouts.operation,
-            self.send_inner(req),
+            self.send_inner(req, effective_preview, None),
             Error::client_total_timeout,
         ))
         .await?;
+
+        // RFC 3507 §7.1: retry once with Proxy-Authorization on 407.
+        let response = if response.status_code() == http::StatusCode::PROXY_AUTHENTICATION_REQUIRED
+        {
+            if let Some(auth) = &self.inner.proxy_auth {
+                let auth_value = basic_auth_value(&auth.username, &auth.password);
+                Box::pin(Self::with_timeout_as(
+                    self.inner.timeouts.operation,
+                    self.send_inner(req, effective_preview, Some(auth_value.as_str())),
+                    Error::client_total_timeout,
+                ))
+                .await?
+            } else {
+                response
+            }
+        } else {
+            response
+        };
 
         if let Some(cache) = &self.inner.options_cache
             && req.is_mod()
@@ -163,7 +190,56 @@ impl Client {
         }
     }
 
-    async fn send_inner(&self, req: &Request) -> IcapResult<ParsedResponse> {
+    /// Determine the preview size override for a modification request by
+    /// consulting the cached OPTIONS Transfer-* policy (RFC 3507 §4.10.2).
+    ///
+    /// Returns:
+    /// - `None`       — no override; use `req.preview_size` as-is.
+    /// - `Some(None)` — **skip**: Transfer-Ignore matched; caller should return
+    ///                  a synthetic 204 without contacting the server.
+    /// - `Some(Some(n))` — **override**: use `n` as the preview size.
+    ///                  `n = 0` from Transfer-Complete means send the full body
+    ///                  without a `Preview` header (achieved by `Some(Some(0))`
+    ///                  being treated as "no preview" inside `build_icap_request_bytes`).
+    ///
+    /// Uses `None` as the "full body" sentinel for Transfer-Complete so that
+    /// the distinction is preserved by `effective_preview`:
+    /// `Some(Some(usize::MAX))` could collide; instead Transfer-Complete is
+    /// encoded as `Some(Some(0))` which `build_icap_request_bytes` treats as
+    /// "no Preview header" when `full_body` is set.
+    async fn resolve_effective_preview(&self, req: &Request) -> Option<Option<usize>> {
+        let cache = self.inner.options_cache.as_ref()?;
+        if !req.is_mod() {
+            return None;
+        }
+        let path = normalize_service_path(&req.service);
+        let ext = file_ext_from_request(req);
+        match cache
+            .resolve_transfer(&self.inner.host, self.inner.port, &path, &ext)
+            .await?
+        {
+            TransferAction::Skip => Some(None), // sentinel: caller returns synthetic 204
+            TransferAction::Full => Some(Some(usize::MAX)), // full body, no preview
+            TransferAction::Preview(n) => Some(Some(n)),
+        }
+    }
+
+    /// Low-level send; called by [`send`](Self::send) and the streaming variant.
+    ///
+    /// `effective_preview`:
+    /// - `None` → use `req.preview_size` as-is.
+    /// - `Some(Some(n))` → override preview size with `n`; `usize::MAX` means
+    ///   "send full body with no Preview header" (Transfer-Complete).
+    /// - `Some(None)` should never reach here (handled as Skip in `send`).
+    ///
+    /// `proxy_auth_value`: when `Some`, the string is written verbatim as the
+    /// `Proxy-Authorization` ICAP header value (RFC 3507 §7.1 retry path).
+    async fn send_inner(
+        &self,
+        req: &Request,
+        effective_preview: Option<Option<usize>>,
+        proxy_auth_value: Option<&str>,
+    ) -> IcapResult<ParsedResponse> {
         trace!(
             "client.send: method={}, service={}",
             req.method, req.service
@@ -174,7 +250,14 @@ impl Client {
             return Ok(resp);
         }
 
-        let built = self.build_icap_request_bytes(req, false, req.preview_ieof, false)?;
+        let built = self.build_icap_request_bytes(
+            req,
+            effective_preview,
+            proxy_auth_value,
+            false,
+            req.preview_ieof,
+            false,
+        )?;
         if let Err(write_err) = self.write_all(&mut stream, &built.bytes).await {
             if matches!(
                 write_err,
@@ -377,7 +460,7 @@ impl Client {
             return Ok(resp);
         }
 
-        let built = self.build_icap_request_bytes(req, true, false, false)?;
+        let built = self.build_icap_request_bytes(req, None, None, true, false, false)?;
         self.write_all(&mut stream, &built.bytes).await?;
 
         match req.preview_size {
@@ -443,6 +526,8 @@ impl Client {
     pub fn get_request_wire(&self, req: &Request, streaming: bool) -> IcapResult<Vec<u8>> {
         let built = self.build_icap_request_bytes(
             req,
+            None,
+            None,
             streaming || matches!(req.preview_size, Some(0)),
             req.preview_ieof,
             true,
@@ -552,9 +637,14 @@ impl Client {
         Ok(resp)
     }
 
+    // `effective_preview`: None = use req.preview_size; Some(Some(n)) = override;
+    //   Some(Some(usize::MAX)) = Transfer-Complete (full body, no Preview header).
+    // `proxy_auth_value`: when Some, written as Proxy-Authorization before Encapsulated.
     fn build_icap_request_bytes(
         &self,
         req: &Request,
+        effective_preview: Option<Option<usize>>,
+        proxy_auth_value: Option<&str>,
         force_has_body: bool,
         preview0_ieof: bool,
         limit_body_to_preview: bool,
@@ -629,6 +719,16 @@ impl Client {
                 (Vec::new(), None, None, None, 0usize)
             };
 
+        // Resolve effective preview size.
+        // `Some(usize::MAX)` is the Transfer-Complete sentinel: send full body,
+        // no `Preview` header. Anything else overrides `req.preview_size`.
+        let preview_for_wire = match effective_preview {
+            None => req.preview_size,
+            Some(Some(n)) if n == usize::MAX => None, // full body, no Preview header
+            Some(Some(n)) => Some(n),
+            Some(None) => unreachable!("Skip must be handled before send_inner"),
+        };
+
         // Write ICAP headers (except Encapsulated)
         write_icap_headers(
             &mut out,
@@ -637,9 +737,13 @@ impl Client {
             &host_value,
             req.allow_204,
             req.allow_206,
-            req.preview_size,
+            preview_for_wire,
             matches!(self.inner.connection_policy, ConnectionPolicy::Close),
         );
+        // Optional extra header (e.g. Proxy-Authorization for §7.1 retry).
+        if let Some(auth) = proxy_auth_value {
+            write!(&mut out, "Proxy-Authorization: {auth}\r\n").map_err(Error::Io)?;
+        }
         // Encapsulated last + CRLF
         if let Some((hdr_key, hdr_len)) = enc_head_key {
             if let Some(body_key) = enc_body_key {
@@ -670,7 +774,7 @@ impl Client {
             && let Some(body_now) = http_body_bytes
         {
             let (bytes, expect_continue, remaining) = build_preview_and_chunks(
-                req.preview_size,
+                preview_for_wire,
                 body_now,
                 preview0_ieof,
                 original_body_len,
@@ -931,6 +1035,78 @@ where
 
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// §4.10.2 helpers
+// ---------------------------------------------------------------------------
+
+/// Extract the file extension (lowercase, no leading dot) from the embedded
+/// HTTP request URI in a REQMOD request.
+///
+/// Returns an empty string when there is no embedded HTTP request or the URI
+/// path has no recognisable extension (e.g. bare API paths).
+fn file_ext_from_request(req: &Request) -> String {
+    let Some(crate::request::EmbeddedHttp::Req { head, .. }) = req.embedded() else {
+        return String::new();
+    };
+    let path = head.uri().path();
+    path.rsplit('.')
+        .next()
+        .filter(|e| !e.is_empty() && !e.contains('/'))
+        .map(|e| e.to_lowercase())
+        .unwrap_or_default()
+}
+
+/// Return a synthetic `ICAP/1.0 204 No Content` response.
+///
+/// Used by the Transfer-Ignore code path to indicate that the ICAP server
+/// approved pass-through without the client actually contacting it.
+fn synthetic_204() -> IcapResult<ParsedResponse> {
+    const BYTES: &[u8] =
+        b"ICAP/1.0 204 No Content\r\nISTag: \"bypass\"\r\nEncapsulated: null-body=0\r\n\r\n";
+    ParsedResponse::from_raw(BYTES)
+        .map_err(|_| crate::error::Error::unexpected("failed to build synthetic 204"))
+}
+
+// ---------------------------------------------------------------------------
+// §7.1 helpers
+// ---------------------------------------------------------------------------
+
+/// Encode `username:password` as an HTTP Basic authentication header value.
+fn basic_auth_value(username: &str, password: &str) -> String {
+    let credentials = format!("{username}:{password}");
+    format!("Basic {}", base64_encode(credentials.as_bytes()))
+}
+
+/// Minimal standard-conforming RFC 4648 Base64 encoder (no external crate).
+fn base64_encode(input: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = Vec::with_capacity((input.len() + 2) / 3 * 4);
+    for chunk in input.chunks(3) {
+        let b = [
+            chunk[0],
+            chunk.get(1).copied().unwrap_or(0),
+            chunk.get(2).copied().unwrap_or(0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        out.push(TABLE[(n >> 18) as usize]);
+        out.push(TABLE[((n >> 12) & 0x3f) as usize]);
+        out.push(if chunk.len() > 1 {
+            TABLE[((n >> 6) & 0x3f) as usize]
+        } else {
+            b'='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[(n & 0x3f) as usize]
+        } else {
+            b'='
+        });
+    }
+    // SAFETY: TABLE contains only ASCII.
+    String::from_utf8(out).unwrap_or_default()
+}
+
+// ---------------------------------------------------------------------------
 
 fn parse_authority_with_scheme(uri: &str) -> IcapResult<(String, u16, bool)> {
     let s = uri.trim();
