@@ -95,6 +95,14 @@ path = "examples/preview_decision_server.rs"
 name = "squid_interop_server"
 path = "examples/squid_interop_server.rs"
 
+[[example]]
+name = "transfer_policy_client"
+path = "examples/transfer_policy_client.rs"
+
+[[example]]
+name = "proxy_auth_client"
+path = "examples/proxy_auth_client.rs"
+
 [[bench]]
 name = "protocol_bench"
 harness = false
