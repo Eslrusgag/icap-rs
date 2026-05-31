@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## [0.3.0] - 2026-05-31
 
 ### Added
 
@@ -10,20 +10,6 @@
 - Configurable ICAP header limits: `ClientBuilder::with_response_header_limit(bytes)` for response header reads and `ServerBuilder::with_request_header_limit(bytes)` for request header reads. Both default to 64 KiB.
 - Per-service embedded HTTP object limits via `ServiceOptions::with_max_object_size(bytes)`. The value is advertised as `Max-Object-Size` in `OPTIONS`; request handling enforces it by counting decoded ICAP chunked body bytes instead of trusting embedded HTTP `Content-Length`.
 - New examples: `options_cache_client`, `transfer_policy_client`, `proxy_auth_client`.
-
-### Changed
-
-- Server-injected request metadata (`ISTag`, chunk trailers) moved off the public `Request` field set into `IncomingMeta`, carried through the new sealed `DirectionMeta` trait as `Request<R, D>::meta`. `OutboundRequest` pays zero overhead for these fields; `IncomingRequest` exposes them via `istag()` / `chunk_trailers()` (#18).
-- Removed the public hard-coded `MAX_HDR_BYTES` API in favour of explicit client/server builder configuration for ICAP header limits.
-
-### Fixed
-
-- Client response framing on early/single-line error responses: a parsed 4xx/5xx status line no longer terminates the ICAP response while the connection stays open, so error responses whose headers arrive in a later TCP read are not truncated (#15).
-
-## 0.3
-
-### Added
-
 - New top-level `tls` module (`ServerTlsConfig`, `ClientTlsConfig`, `TlsError`) consolidating all Rustls usage; replaces the ad-hoc TLS plumbing previously spread across `server/builder.rs` and `client/tls/*`.
 - Server TLS builder with explicit `from_pem` for PEM content, `from_pem_files` for file paths, `with_client_auth_pem` / `with_optional_client_auth_pem` for CA PEM content, file-path variants for both mTLS modes, `with_handshake_timeout`, and `from_rustls_config` escape hatch.
 - Client TLS builder with `with_native_roots`, `empty`, PEM-content and PEM-file trust root helpers, PEM-content and PEM-file client auth helpers, `with_sni`, `with_handshake_timeout`, and `from_rustls_config` escape hatch. Client mTLS is now supported.
@@ -39,6 +25,11 @@
 - New examples: `preview_decision_server`, `streaming_client`, `tls_mtls_client`.
 - Benchmarks: expanded `protocol_bench`, new `tls_overhead_bench`, expanded `rps_bench` with keep-alive coverage.
 - MIT `LICENSE` file at the workspace root.
+
+### Changed
+
+- Server-injected request metadata (`ISTag`, chunk trailers) moved off the public `Request` field set into `IncomingMeta`, carried through the new sealed `DirectionMeta` trait as `Request<R, D>::meta`. `OutboundRequest` pays zero overhead for these fields; `IncomingRequest` exposes them via `istag()` / `chunk_trailers()` (#18).
+- Removed the public hard-coded `MAX_HDR_BYTES` API in favour of explicit client/server builder configuration for ICAP header limits.
 
 ### Breaking
 
@@ -59,6 +50,7 @@
 
 ### Fixed
 
+- Client response framing on early/single-line error responses: a parsed 4xx/5xx status line no longer terminates the ICAP response while the connection stays open, so error responses whose headers arrive in a later TCP read are not truncated (#15).
 - Server now returns ICAP `400 Bad Request` for malformed wire requests and `501 Not Implemented` for unknown methods, instead of dropping the connection.
 - TLS handshake errors on the server are no longer reported as generic I/O errors; they are classified through `TlsError` and overload (503/connection-limit) is now decided **before** the TLS handshake so a connection-flood does not consume handshake CPU.
 - `Client` and `Response::from_raw` now read RFC-compliant embedded HTTP responses as `Response.body = HTTP head + dechunked HTTP body`, without chunk-size metadata leaking into the body.

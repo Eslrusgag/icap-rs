@@ -8,6 +8,8 @@ repository.workspace = true
 license.workspace = true
 keywords.workspace = true
 categories.workspace = true
+# Not published to crates.io: placeholder binary, released only via the repo.
+publish = false
 
 [lints]
 workspace = true
