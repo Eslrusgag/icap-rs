@@ -295,7 +295,7 @@ impl Server {
                         {
                             let log_service = preview_service_resolved.to_string();
                             mark_request_body_as_preview(&mut preview_req, false);
-                            preview_req.istag = entry
+                            preview_req.meta.istag = entry
                                 .options
                                 .as_ref()
                                 .and_then(|o| o.istag_for(&preview_req).ok());
@@ -423,7 +423,7 @@ impl Server {
                 };
             // Attach any chunk trailers parsed during dechunking.
             if let Some(trailers) = chunk_trailers_pending.take() {
-                req.chunk_trailers = trailers;
+                req.meta.chunk_trailers = trailers;
             }
             let method = req.method;
             let service_resolved =
@@ -535,7 +535,8 @@ impl Server {
                         }
                     } else if let Some(handler_entry) = entry.handlers.get(&method) {
                         let log_service = service_resolved.to_string();
-                        req.istag = entry.options.as_ref().and_then(|o| o.istag_for(&req).ok());
+                        req.meta.istag =
+                            entry.options.as_ref().and_then(|o| o.istag_for(&req).ok());
                         match (handler_entry.handler)(req).await {
                             Ok(PreviewDecision::Respond(resp)) => resp,
                             Ok(PreviewDecision::Continue) => {

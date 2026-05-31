@@ -16,8 +16,8 @@ pub use client::options_cache::OptionsCacheConfig;
 pub use client::timeouts::ClientTimeouts;
 pub use error::{Error, IcapResult};
 pub use request::{
-    Body, EmbeddedHttp, EmbeddedHttpKind, Incoming, IncomingRequest, Method, Outbound,
-    OutboundRequest, Request,
+    Body, DirectionMeta, EmbeddedHttp, EmbeddedHttpKind, Incoming, IncomingRequest, Method,
+    Outbound, OutboundRequest, Request,
 };
 pub use response::{Outgoing, OutgoingResponse, Parsed, ParsedResponse, Response, StatusCode};
 pub use server::{

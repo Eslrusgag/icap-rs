@@ -61,7 +61,6 @@ use http::{HeaderMap, HeaderName, HeaderValue, Request as HttpRequest, Response 
 use memchr::memmem;
 use std::fmt;
 use std::future::Future;
-use std::marker::PhantomData;
 use std::str::FromStr;
 use tracing::trace;
 
@@ -80,12 +79,16 @@ use tokio::io::AsyncRead;
 /// via [`Request::embedded_mut`] or consume it via [`Request::into_embedded`],
 /// but they cannot mutate the ICAP request line, ICAP headers, preview flags,
 /// or advertised `Allow` values through public API.
+///
+/// Server-only fields (`ISTag`, chunk trailers) are carried in
+/// [`DirectionMeta::Meta`] and are only accessible on [`IncomingRequest`].
+/// [`OutboundRequest`] pays zero overhead for those fields.
 #[derive(Debug)]
 #[must_use]
-pub struct Request<R = Vec<u8>, D = Outbound> {
+pub struct Request<R = Vec<u8>, D: DirectionMeta = Outbound> {
     /// ICAP method: `"OPTIONS" | "REQMOD" | "RESPMOD"`.
     pub(crate) method: Method,
-    /// Service path like `"icap/test"` or `"respmod"`. Leading slash is allowed.
+    /// Full normalized service path (RFC 3507 §6.4), e.g. `"/v1/scan"`.
     pub(crate) service: String,
     /// ICAP headers (case-insensitive).
     pub(crate) icap_headers: HeaderMap,
@@ -99,21 +102,21 @@ pub struct Request<R = Vec<u8>, D = Outbound> {
     pub(crate) allow_206: bool,
     /// If `true` and `preview_size == Some(0)`, send `0; ieof` (fast 204 hint).
     pub(crate) preview_ieof: bool,
-    // TODO: `istag` is server-only metadata injected before handler dispatch, but lives on the
-    // shared `Request<R, D>` struct, so it also exists (always `None`) on `Outbound` requests.
-    // Consider moving it to a dedicated server-side envelope or a separate `IncomingMeta` type
-    // so that `Request` stays a pure protocol type.
-    pub(crate) istag: Option<String>,
-    /// Chunk trailer headers parsed from the embedded HTTP body (RFC 7230 §4.1.2).
-    /// Only populated on server-received requests; always empty on outbound requests.
-    pub(crate) chunk_trailers: HeaderMap,
-    pub(crate) direction: PhantomData<D>,
+    /// Direction-specific metadata.
+    ///
+    /// [`OutboundMeta`] for client-side requests (zero-sized, zero overhead).
+    /// [`IncomingMeta`] for server-side requests (ISTag + chunk trailers).
+    pub(crate) meta: D::Meta,
 }
 
-/// Request shape accepted by client send/build APIs.
+/// ICAP request used by client send / build APIs.
 pub type OutboundRequest<R = Vec<u8>> = Request<R, Outbound>;
 
-/// Request shape received by server route handlers.
+/// ICAP request received by server route handlers.
+///
+/// Carries server-injected metadata (ISTag, chunk trailers) that is absent on
+/// the client-side [`OutboundRequest`]. Access it via [`Request::istag`] and
+/// [`Request::chunk_trailers`].
 pub type IncomingRequest<R = Vec<u8>> = Request<R, Incoming>;
 
 /// Client-side request marker.
@@ -123,6 +126,65 @@ pub enum Outbound {}
 /// Server-side request marker.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum Incoming {}
+
+// ---------------------------------------------------------------------------
+// Direction metadata — sealed trait + per-direction metadata types
+// ---------------------------------------------------------------------------
+
+mod private {
+    pub trait Sealed {}
+    impl Sealed for super::Outbound {}
+    impl Sealed for super::Incoming {}
+}
+
+/// Associates each direction marker with the metadata type it carries inside
+/// [`Request<R, D>`].
+///
+/// This trait is **sealed**: only [`Outbound`] and [`Incoming`] implement it.
+/// Users cannot add new implementations.
+///
+/// The associated type [`DirectionMeta::Meta`] is an implementation detail and
+/// should not be used directly. Access server-injected metadata through the
+/// dedicated accessors on [`IncomingRequest`] instead:
+///
+/// - [`Request::istag`] — the `ISTag` resolved from `ServiceOptions` before
+///   the handler was called.
+/// - [`Request::chunk_trailers`] — HTTP chunk trailer headers (RFC 7230 §4.1.2).
+pub trait DirectionMeta: private::Sealed {
+    /// The metadata type stored inside `Request<R, D>` for this direction.
+    ///
+    /// `OutboundMeta` for [`Outbound`] (zero-sized, no overhead).
+    /// `IncomingMeta` for [`Incoming`] (server-injected fields).
+    #[doc(hidden)]
+    type Meta: Default + fmt::Debug + Clone;
+}
+
+/// Zero-sized metadata placeholder for [`Outbound`] requests.
+///
+/// Carries no data. The compiler optimises away any storage for this type.
+#[doc(hidden)]
+#[derive(Debug, Clone, Default)]
+pub struct OutboundMeta;
+
+/// Server-injected metadata available on [`IncomingRequest`].
+///
+/// Populated by the server connection loop before the route handler is called.
+/// Access it via [`Request::istag`] and [`Request::chunk_trailers`] rather than
+/// constructing or inspecting this type directly.
+#[doc(hidden)]
+#[derive(Debug, Clone, Default)]
+pub struct IncomingMeta {
+    pub(crate) istag: Option<String>,
+    pub(crate) chunk_trailers: HeaderMap,
+}
+
+impl DirectionMeta for Outbound {
+    type Meta = OutboundMeta;
+}
+
+impl DirectionMeta for Incoming {
+    type Meta = IncomingMeta;
+}
 
 /// ICAP protocol methods recognized by the server/router.
 ///
@@ -547,7 +609,7 @@ pub(crate) struct IncomingRequestParts<R> {
     preview_ieof: bool,
 }
 
-impl<R, D> Request<R, D> {
+impl<R, D: DirectionMeta> Request<R, D> {
     /// Return the ICAP method.
     #[inline]
     pub const fn method(&self) -> Method {
@@ -621,9 +683,7 @@ impl<R> Request<R, Outbound> {
             allow_204: false,
             allow_206: false,
             preview_ieof: false,
-            istag: None,
-            chunk_trailers: HeaderMap::new(),
-            direction: PhantomData,
+            meta: OutboundMeta,
         }
     }
 
@@ -763,9 +823,7 @@ impl<R> Request<R, Incoming> {
             allow_204: parts.allow_204,
             allow_206: parts.allow_206,
             preview_ieof: parts.preview_ieof,
-            istag: None,
-            chunk_trailers: HeaderMap::new(),
-            direction: PhantomData,
+            meta: IncomingMeta::default(),
         }
     }
 
@@ -776,19 +834,25 @@ impl<R> Request<R, Incoming> {
     /// This method returns those headers as parsed from the wire.
     ///
     /// The map is empty when no trailers were present.
+    ///
+    /// This accessor is only available on [`IncomingRequest`]; outbound client
+    /// requests never carry chunk trailers.
     #[inline]
-    pub const fn chunk_trailers(&self) -> &HeaderMap {
-        &self.chunk_trailers
+    pub fn chunk_trailers(&self) -> &HeaderMap {
+        &self.meta.chunk_trailers
     }
 
-    /// Return the `ISTag` that the server resolved from `ServiceOptions` for
+    /// Return the `ISTag` that the server resolved from [`ServiceOptions`] for
     /// this request, or `None` if no `ServiceOptions` were configured.
     ///
     /// This is the same value that will appear in the ICAP response's `ISTag`
     /// header when using [`Response::no_content_with_istag`] or similar.
+    ///
+    /// This accessor is only available on [`IncomingRequest`]; outbound client
+    /// requests do not carry an ISTag.
     #[inline]
     pub fn istag(&self) -> Option<&str> {
-        self.istag.as_deref()
+        self.meta.istag.as_deref()
     }
 }
 
