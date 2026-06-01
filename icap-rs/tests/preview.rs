@@ -1,6 +1,9 @@
+mod common;
+
+use common::{find_free_port, wait_port_ready};
 use http::{HeaderValue, Request as HttpRequest, header};
 use icap_rs::{
-    Body, EmbeddedHttp, Method, Request, Response, StatusCode,
+    Body, EmbeddedHttp, IncomingRequest, Method, PreviewDecision, Response, StatusCode,
     server::{Server, options::ServiceOptions},
 };
 use std::{str, time::Duration};
@@ -31,15 +34,8 @@ fn icap_status_code(buf: &[u8]) -> Option<u16> {
 fn http_content_length(http_head: &[u8]) -> Option<usize> {
     let mut len: Option<usize> = None;
     for line in http_head.split(|&b| b == b'\n') {
-        let line = if let Some(b) = line.strip_suffix(b"\r") {
-            b
-        } else {
-            line
-        };
-        let lower = line
-            .iter()
-            .map(|c| c.to_ascii_lowercase())
-            .collect::<Vec<_>>();
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let lower = line.iter().map(u8::to_ascii_lowercase).collect::<Vec<_>>();
         if lower.starts_with(b"content-length:") {
             let v = &line[b"Content-Length:".len()..].trim_ascii();
             len = std::str::from_utf8(v).ok()?.trim().parse::<usize>().ok();
@@ -49,15 +45,49 @@ fn http_content_length(http_head: &[u8]) -> Option<usize> {
     len
 }
 
-async fn start_server(addr: &str) {
+fn dechunk_icap_entity(mut data: &[u8]) -> Result<Vec<u8>, String> {
+    let mut out = Vec::with_capacity(data.len());
+    loop {
+        let crlf_pos = data
+            .windows(2)
+            .position(|w| w == b"\r\n")
+            .ok_or_else(|| "chunk size line without CRLF".to_string())?;
+        let size_line = &data[..crlf_pos];
+        data = &data[crlf_pos + 2..];
+
+        let size_hex = size_line.split(|&b| b == b';').next().unwrap_or(size_line);
+        let size_str = std::str::from_utf8(size_hex).map_err(|_| "chunk size not utf8")?;
+        let size = usize::from_str_radix(size_str.trim(), 16).map_err(|_| "chunk size not hex")?;
+
+        if size == 0 {
+            if data.starts_with(b"\r\n") {
+                return Ok(out);
+            }
+            return Err("missing final CRLF after zero chunk".into());
+        }
+
+        if data.len() < size + 2 {
+            return Err("incomplete chunk data".into());
+        }
+        out.extend_from_slice(&data[..size]);
+        if &data[size..size + 2] != b"\r\n" {
+            return Err("missing CRLF after chunk".into());
+        }
+        data = &data[size + 2..];
+    }
+}
+
+async fn start_server() -> String {
+    let port = find_free_port();
+    let addr = format!("127.0.0.1:{port}");
     let server = Server::builder()
-        .bind(addr)
+        .bind(&addr)
         .route(
             "scan",
             [Method::ReqMod],
-            |req: Request| async move {
+            |req: IncomingRequest| async move {
                 let mut maybe_len = None::<usize>;
-                if let Some(EmbeddedHttp::Req { head: _, body }) = &req.embedded {
+                if let Some(EmbeddedHttp::Req { head: _, body }) = req.embedded() {
                     match body {
                         Body::Full { reader } => {
                             maybe_len = Some(reader.len());
@@ -67,14 +97,14 @@ async fn start_server(addr: &str) {
                     }
                 }
 
-                let preview_n = req.preview_size.unwrap_or(0);
+                let preview_n = req.preview_size().unwrap_or(0);
                 if let Some(total_len) = maybe_len
                     && total_len <= preview_n
                 {
-                    return Response::no_content().try_set_istag(ISTAG);
+                    return Ok(Response::no_content().try_set_istag(ISTAG)?);
                 }
 
-                if let Some(EmbeddedHttp::Req { head, body }) = req.embedded
+                if let Some(EmbeddedHttp::Req { head, body }) = req.into_embedded()
                     && let Body::Full { reader } = body
                 {
                     let mut headers = head.headers().clone();
@@ -94,9 +124,9 @@ async fn start_server(addr: &str) {
                         *h = headers;
                     }
 
-                    let http_req = builder
-                        .body(reader)
-                        .map_err(|e| format!("build echo http::Request: {e}"))?;
+                    let http_req = builder.body(reader).map_err(|e| {
+                        icap_rs::HandlerError::internal(format!("build echo http::Request: {e}"))
+                    })?;
 
                     let resp = Response::new(StatusCode::OK, "OK")
                         .try_set_istag(ISTAG)?
@@ -104,7 +134,7 @@ async fn start_server(addr: &str) {
                     return Ok(resp);
                 }
 
-                Response::no_content().try_set_istag(ISTAG)
+                Ok(Response::no_content().try_set_istag(ISTAG)?)
             },
             Some(
                 ServiceOptions::new()
@@ -122,7 +152,8 @@ async fn start_server(addr: &str) {
         server.run().await.expect("server run");
     });
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    wait_port_ready(&addr).await;
+    addr
 }
 
 async fn icap_reqmod_with_preview(
@@ -139,13 +170,14 @@ async fn icap_reqmod_with_preview(
     let http_head_bytes = http_head.as_bytes();
     let req_body_off = http_head_bytes.len();
 
+    // RFC 3507 §4.6: Allow:204 must be present for the server to return 204.
     let icap = format!(
-        "REQMOD icap://{}/{} ICAP/1.0\r\n\
-         Host: {}\r\n\
-         Encapsulated: req-hdr=0, req-body={}\r\n\
-         Preview: {}\r\n\
+        "REQMOD icap://{host_port}/{service} ICAP/1.0\r\n\
+         Host: {host_port}\r\n\
+         Allow: 204\r\n\
+         Encapsulated: req-hdr=0, req-body={req_body_off}\r\n\
+         Preview: {preview_n}\r\n\
          \r\n",
-        host_port, service, host_port, req_body_off, preview_n
     );
 
     stream
@@ -184,7 +216,7 @@ async fn icap_reqmod_with_preview(
         let mut tmp = [0u8; 8192];
         loop {
             match stream.read(&mut tmp).await {
-                Ok(0) => break,
+                Ok(0) | Err(_) => break,
                 Ok(n) => {
                     resp.extend_from_slice(&tmp[..n]);
                     if let Some(h_end) = find_double_crlf(&resp)
@@ -204,7 +236,6 @@ async fn icap_reqmod_with_preview(
                         }
                     }
                 }
-                Err(_) => break,
             }
         }
     })
@@ -214,8 +245,8 @@ async fn icap_reqmod_with_preview(
     if code == 100
         && let Some(h1) = find_double_crlf(&resp)
     {
-        let rest = &resp[h1 + 4..];
-        if let Some(c2) = icap_status_code(rest) {
+        let after_first_response = &resp[h1 + 4..];
+        if let Some(c2) = icap_status_code(after_first_response) {
             code = c2;
         }
     }
@@ -224,8 +255,7 @@ async fn icap_reqmod_with_preview(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn preview_ieof_fast204() {
-    let addr = "127.0.0.1:13440";
-    start_server(addr).await;
+    let addr = start_server().await;
 
     let body = b"ping";
     let http_head = format!(
@@ -234,7 +264,7 @@ async fn preview_ieof_fast204() {
     );
 
     let (code, _resp) =
-        icap_reqmod_with_preview(addr, "scan", body.len(), &http_head, body, None, true).await;
+        icap_reqmod_with_preview(&addr, "scan", body.len(), &http_head, body, None, true).await;
 
     assert_eq!(
         code, 204,
@@ -244,10 +274,9 @@ async fn preview_ieof_fast204() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn preview_non_ieof_full_body_roundtrip() {
-    let addr = "127.0.0.1:13441";
-    start_server(addr).await;
+    let addr = start_server().await;
 
-    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    let mut stream = TcpStream::connect(&addr).await.expect("connect");
 
     let preview = b"abcd";
     let tail = b"efghij";
@@ -260,14 +289,11 @@ async fn preview_non_ieof_full_body_roundtrip() {
 
     let req_body_off = http_head.len();
     let icap = format!(
-        "REQMOD icap://{}/scan ICAP/1.0\r\n\
-         Host: {}\r\n\
-         Encapsulated: req-hdr=0, req-body={}\r\n\
+        "REQMOD icap://{addr}/scan ICAP/1.0\r\n\
+         Host: {addr}\r\n\
+         Encapsulated: req-hdr=0, req-body={req_body_off}\r\n\
          Preview: {}\r\n\
          \r\n",
-        addr,
-        addr,
-        req_body_off,
         preview.len()
     );
 
@@ -322,7 +348,7 @@ async fn preview_non_ieof_full_body_roundtrip() {
         let mut tmp = [0u8; 8192];
         loop {
             match stream.read(&mut tmp).await {
-                Ok(0) => break,
+                Ok(0) | Err(_) => break,
                 Ok(n) => {
                     resp.extend_from_slice(&tmp[..n]);
                     if let Some(h_end) = find_double_crlf(&resp)
@@ -342,7 +368,6 @@ async fn preview_non_ieof_full_body_roundtrip() {
                         }
                     }
                 }
-                Err(_) => break,
             }
         }
     })
@@ -354,7 +379,7 @@ async fn preview_non_ieof_full_body_roundtrip() {
     let resp_after_icap = &resp[h1 + 4..];
     let h2 = find_double_crlf(resp_after_icap).expect("http hdr end");
     let http_head_bytes = &resp_after_icap[..h2];
-    let http_body = &resp_after_icap[h2 + 4..];
+    let http_body = dechunk_icap_entity(&resp_after_icap[h2 + 4..]).expect("dechunk HTTP body");
 
     let cl = http_content_length(http_head_bytes).expect("content-length");
     assert!(
@@ -372,29 +397,24 @@ async fn preview_non_ieof_full_body_roundtrip() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn preview_non_ieof_requires_100_continue_before_remainder() {
-    let addr = "127.0.0.1:13442";
-    start_server(addr).await;
+    let addr = start_server().await;
 
-    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    let mut stream = TcpStream::connect(&addr).await.expect("connect");
 
     let preview = b"abcd";
     let tail = b"efghij";
     let total_len = preview.len() + tail.len();
     let http_head = format!(
-        "POST /upload HTTP/1.1\r\nHost: example.com\r\nContent-Length: {}\r\n\r\n",
-        total_len
+        "POST /upload HTTP/1.1\r\nHost: example.com\r\nContent-Length: {total_len}\r\n\r\n"
     );
     let req_body_off = http_head.len();
 
     let icap = format!(
-        "REQMOD icap://{}/scan ICAP/1.0\r\n\
-         Host: {}\r\n\
-         Encapsulated: req-hdr=0, req-body={}\r\n\
+        "REQMOD icap://{addr}/scan ICAP/1.0\r\n\
+         Host: {addr}\r\n\
+         Encapsulated: req-hdr=0, req-body={req_body_off}\r\n\
          Preview: {}\r\n\
          \r\n",
-        addr,
-        addr,
-        req_body_off,
         preview.len()
     );
 
@@ -446,7 +466,7 @@ async fn preview_non_ieof_requires_100_continue_before_remainder() {
     stream.write_all(&tail_wire).await.expect("write tail");
 
     let mut final_resp = Vec::new();
-    tokio::time::timeout(Duration::from_millis(1000), async {
+    tokio::time::timeout(Duration::from_secs(1), async {
         let mut tmp = [0u8; 8192];
         loop {
             let n = stream.read(&mut tmp).await.expect("read final response");
@@ -464,4 +484,218 @@ async fn preview_non_ieof_requires_100_continue_before_remainder() {
 
     let final_code = icap_status_code(&final_resp).expect("no final ICAP status");
     assert_eq!(final_code, 200, "expected final 200 after remainder upload");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn preview_handler_can_send_final_response_before_100_continue() {
+    let port = find_free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let server = Server::builder()
+        .bind(&addr)
+        .route_reqmod(
+            "scan",
+            |req: IncomingRequest| async move {
+                let Some(EmbeddedHttp::Req { body, .. }) = req.into_embedded() else {
+                    panic!("request must carry embedded HTTP bytes");
+                };
+                match body {
+                    Body::Preview { bytes, .. } => {
+                        assert_eq!(bytes.as_slice(), b"abcd");
+                        Ok(PreviewDecision::Respond(
+                            Response::no_content().try_set_istag(ISTAG)?,
+                        ))
+                    }
+                    Body::Full { .. } => {
+                        panic!("full handler path must not run when preview handler responds")
+                    }
+                    Body::Empty => panic!("preview request must not have empty body"),
+                }
+            },
+            Some(
+                ServiceOptions::new()
+                    .with_static_istag(ISTAG)
+                    .with_preview(2048)
+                    .add_allow("204"),
+            ),
+        )
+        .build()
+        .await
+        .expect("server build");
+
+    tokio::spawn(async move {
+        server.run().await.expect("server run");
+    });
+    wait_port_ready(&addr).await;
+
+    let mut stream = TcpStream::connect(&addr).await.expect("connect");
+    let http_head = "POST /upload HTTP/1.1\r\nHost: example.com\r\nContent-Length: 10\r\n\r\n";
+    let req_body_off = http_head.len();
+    let icap = format!(
+        "REQMOD icap://{addr}/scan ICAP/1.0\r\n\
+         Host: {addr}\r\n\
+         Allow: 204\r\n\
+         Encapsulated: req-hdr=0, req-body={req_body_off}\r\n\
+         Preview: 4\r\n\
+         \r\n"
+    );
+
+    stream
+        .write_all(icap.as_bytes())
+        .await
+        .expect("write icap head");
+    stream
+        .write_all(http_head.as_bytes())
+        .await
+        .expect("write http head");
+    stream
+        .write_all(b"4\r\nabcd\r\n0\r\n\r\n")
+        .await
+        .expect("write preview");
+    stream.flush().await.expect("flush preview");
+
+    let mut resp = Vec::new();
+    tokio::time::timeout(Duration::from_millis(700), async {
+        let mut tmp = [0u8; 4096];
+        loop {
+            let n = stream.read(&mut tmp).await.expect("read response");
+            if n == 0 {
+                break;
+            }
+            resp.extend_from_slice(&tmp[..n]);
+            if find_double_crlf(&resp).is_some() {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("timeout waiting for preview final response");
+
+    assert_eq!(
+        icap_status_code(&resp).expect("no preview response code"),
+        204
+    );
+    assert!(
+        !resp.starts_with(b"ICAP/1.0 100"),
+        "preview handler final response must be sent before 100 Continue"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn preview_handler_continue_reads_remainder_and_calls_full_route() {
+    let port = find_free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let server = Server::builder()
+        .bind(&addr)
+        .route_reqmod(
+            "scan",
+            |req: IncomingRequest| async move {
+                let Some(EmbeddedHttp::Req { body, .. }) = req.into_embedded() else {
+                    panic!("request must carry embedded HTTP bytes");
+                };
+                match body {
+                    Body::Preview { bytes, .. } => {
+                        assert_eq!(bytes.as_slice(), b"abcd");
+                        Ok(PreviewDecision::Continue)
+                    }
+                    Body::Full { reader } => {
+                        assert_eq!(reader, b"abcdefghij");
+                        Ok(PreviewDecision::Respond(
+                            Response::no_content().try_set_istag(ISTAG)?,
+                        ))
+                    }
+                    Body::Empty => panic!("preview request must not have empty body"),
+                }
+            },
+            Some(
+                ServiceOptions::new()
+                    .with_static_istag(ISTAG)
+                    .with_preview(2048)
+                    .add_allow("204"),
+            ),
+        )
+        .build()
+        .await
+        .expect("server build");
+
+    tokio::spawn(async move {
+        server.run().await.expect("server run");
+    });
+    wait_port_ready(&addr).await;
+
+    let mut stream = TcpStream::connect(&addr).await.expect("connect");
+    let http_head = "POST /upload HTTP/1.1\r\nHost: example.com\r\nContent-Length: 10\r\n\r\n";
+    let req_body_off = http_head.len();
+    let icap = format!(
+        "REQMOD icap://{addr}/scan ICAP/1.0\r\n\
+         Host: {addr}\r\n\
+         Allow: 204\r\n\
+         Encapsulated: req-hdr=0, req-body={req_body_off}\r\n\
+         Preview: 4\r\n\
+         \r\n"
+    );
+
+    stream
+        .write_all(icap.as_bytes())
+        .await
+        .expect("write icap head");
+    stream
+        .write_all(http_head.as_bytes())
+        .await
+        .expect("write http head");
+    stream
+        .write_all(b"4\r\nabcd\r\n0\r\n\r\n")
+        .await
+        .expect("write preview");
+    stream.flush().await.expect("flush preview");
+
+    let mut interim = Vec::new();
+    tokio::time::timeout(Duration::from_millis(700), async {
+        let mut tmp = [0u8; 4096];
+        loop {
+            let n = stream.read(&mut tmp).await.expect("read interim response");
+            if n == 0 {
+                break;
+            }
+            interim.extend_from_slice(&tmp[..n]);
+            if find_double_crlf(&interim).is_some() {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("timeout waiting for 100 Continue");
+
+    assert_eq!(
+        icap_status_code(&interim).expect("no interim response code"),
+        100,
+        "server must send 100 Continue after preview handler continues"
+    );
+
+    stream
+        .write_all(b"6\r\nefghij\r\n0\r\n\r\n")
+        .await
+        .expect("write remainder");
+    stream.flush().await.expect("flush remainder");
+
+    let mut final_resp = Vec::new();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        let mut tmp = [0u8; 4096];
+        loop {
+            let n = stream.read(&mut tmp).await.expect("read final response");
+            if n == 0 {
+                break;
+            }
+            final_resp.extend_from_slice(&tmp[..n]);
+            if find_double_crlf(&final_resp).is_some() {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("timeout waiting for final response");
+
+    assert_eq!(
+        icap_status_code(&final_resp).expect("no final response code"),
+        204
+    );
 }

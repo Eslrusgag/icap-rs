@@ -1,18 +1,19 @@
 [package]
 name = "icap-rs"
-version = "0.2.0"
-edition = "2024"
+version = "0.3.0"
+edition.workspace = true
 description = "ICAP client and server crate"
-repository = "https://github.com/Eslrusgag/icap-rs"
-license = "MIT"
-readme = "README.md"
+repository.workspace = true
+license.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [features]
 default = []
 
 # Top-level flag to compile TLS support using Rustls.
 # Pulls in tokio-rustls for async I/O, rustls core, system trust store loading,
-# and PEM parsing for custom roots.
+# PEM parsing, and the `ring` crypto provider as the default.
 tls-rustls = [
     "dep:tokio-rustls",
     "dep:rustls",
@@ -21,28 +22,41 @@ tls-rustls = [
     "rustls/ring",
 ]
 
+# Additive opt-in: compile the `aws-lc-rs` crypto provider alongside `ring`.
+# When this feature is enabled, the runtime installer prefers aws-lc-rs.
+# Implies `tls-rustls`, so user code that gates on `feature = "tls-rustls"`
+# keeps working unchanged.
+tls-rustls-aws-lc-rs = ["tls-rustls", "rustls/aws-lc-rs"]
+
 
 [dependencies]
-tokio = { version = "1.49", features = ["full"] }
-thiserror = "2.0"
-tracing = "0.1"
-http = "1.4.0"
-smallvec = "2.0.0-alpha.12"
-memchr = "2.7.6"
-pin-project-lite = "0.2"
-async-trait = "0.1"
-bytes = "1.11.1"
+# Async runtime and I/O
+tokio = { workspace = true, features = ["full"] }
 
+# Protocol/data types
+http = { workspace = true }
 
-tokio-rustls = { version = "0.26", optional = true }
-rustls = { version = "0.23", default-features = false, features = ["std"], optional = true }
-rustls-native-certs = { version = "0.8.3", optional = true }
-rustls-pemfile = { version = "2", optional = true }
+# Parsing and async helpers
+async-trait = { workspace = true }
+memchr = { workspace = true }
+pin-project-lite = { workspace = true }
+tokio-util = { workspace = true, features = ["rt"] }
+
+# TLS
+rustls = { workspace = true, features = ["std"], optional = true }
+rustls-native-certs = { workspace = true, optional = true }
+rustls-pemfile = { workspace = true, optional = true }
+tokio-rustls = { workspace = true, optional = true }
+
+# Diagnostics and errors
+thiserror = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
-rstest = "0.26.1"
-criterion = { version = "0.8.2", features = ["html_reports"] }
-tracing-subscriber = "0.3"
+criterion = { workspace = true, features = ["html_reports"] }
+rcgen = { workspace = true }
+rstest = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 
 [[example]]
@@ -54,8 +68,40 @@ name = "client"
 path = "examples/client.rs"
 
 [[example]]
+name = "streaming_client"
+path = "examples/streaming_client.rs"
+
+[[example]]
 name = "tls_client"
 path = "examples/tls_client.rs"
+required-features = ["tls-rustls"]
+
+[[example]]
+name = "tls_server"
+path = "examples/tls_server.rs"
+required-features = ["tls-rustls"]
+
+[[example]]
+name = "tls_mtls_client"
+path = "examples/tls_mtls_client.rs"
+required-features = ["tls-rustls"]
+
+
+[[example]]
+name = "preview_decision_server"
+path = "examples/preview_decision_server.rs"
+
+[[example]]
+name = "squid_interop_server"
+path = "examples/squid_interop_server.rs"
+
+[[example]]
+name = "transfer_policy_client"
+path = "examples/transfer_policy_client.rs"
+
+[[example]]
+name = "proxy_auth_client"
+path = "examples/proxy_auth_client.rs"
 
 [[bench]]
 name = "protocol_bench"
@@ -64,3 +110,11 @@ harness = false
 [[bench]]
 name = "rps_bench"
 harness = false
+
+[[bench]]
+name = "tls_overhead_bench"
+harness = false
+required-features = ["tls-rustls"]
+
+[lints]
+workspace = true

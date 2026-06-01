@@ -4,17 +4,27 @@
 //! - [`Body`]: a generic HTTP body container used for embedded HTTP messages.
 //! - [`EmbeddedHttp`]: an enum for embedded HTTP messages (request/response) that
 //!   always carries `head` and `body` together.
-//! - [`Request<R>`]: a single, public ICAP request type used by both **client** and
-//!   **server**, parameterized by the body carrier `R`.
+//! - [`Request<R, D>`]: a single ICAP request type parameterized by the body
+//!   carrier `R` and direction marker `D`.
+//! - [`OutboundRequest`]: the client-side request builder shape.
+//! - [`IncomingRequest`]: the server-side handler shape with read-only ICAP
+//!   metadata and mutable/consumable embedded HTTP access.
 //! ## Preview (server-side)
-//! The server handles Preview (`Preview: N`) on the wire:
+//! By default, the server handles Preview (`Preview: N`) on the wire:
 //! - reads preview chunks first,
 //! - sends `ICAP/1.0 100 Continue` when preview is non-`ieof`,
 //! - then reads and de-chunks the remainder before invoking handlers.
 //!
-//! As a result, default server handlers receive embedded bodies as `Body::Full`.
+//! As a result, regular server handlers receive embedded bodies as `Body::Full`.
+//! Return `PreviewDecision` from a route handler when a service needs to make
+//! an early decision from preview bytes and return a final response before
+//! `100 Continue`.
 //! `Body::Preview` and `Body<BodyRead>::ensure_full()` remain available for custom
 //! integrations that build preview-aware pipelines explicitly.
+//!
+//! Request parsing requires `Encapsulated` on every ICAP request, including
+//! `OPTIONS`. Servers can opt into legacy compatibility parsing for old peers
+//! that omit `Encapsulated` on `OPTIONS`.
 //!
 //! ## Example (client: REQMOD with an embedded HTTP request)
 //! ```rust
@@ -31,31 +41,150 @@
 //! let icap_req: Request = Request::reqmod("icap/test")
 //!     .allow_204()
 //!     .preview(4)
-//!     .with_http_request(http_req);
+//!     .with_http_request(http_req)?;
 //!
-//! assert_eq!(icap_req.method, Method::ReqMod);
-//! assert!(icap_req.allow_204);
-//! assert_eq!(icap_req.preview_size, Some(4));
+//! assert_eq!(icap_req.method(), Method::ReqMod);
+//! assert!(icap_req.allows_204());
+//! assert_eq!(icap_req.preview_size(), Some(4));
+//! # Ok::<(), icap_rs::Error>(())
+//! ```
 
 use crate::ICAP_VERSION;
 use crate::error::{Error, IcapResult};
-use crate::parser::icap::find_double_crlf;
-use bytes::Bytes;
-use http::{
-    HeaderMap, HeaderName, HeaderValue, Request as HttpRequest, Response as HttpResponse,
-    StatusCode as HttpStatus, Version,
+#[cfg(test)]
+use crate::error::{ProtocolError, ProtocolField};
+use crate::protocol::{
+    find_double_crlf, parse_header_lines, parse_http_request_start_line,
+    parse_http_response_start_line,
 };
-use memchr::memchr;
+use http::{HeaderMap, HeaderName, HeaderValue, Request as HttpRequest, Response as HttpResponse};
 use memchr::memmem;
 use std::fmt;
 use std::future::Future;
 use std::str::FromStr;
 use tracing::trace;
 
-use std::io::Read as _;
 use std::io::Write as _;
 use std::pin::Pin;
 use tokio::io::AsyncRead;
+
+/// Single public ICAP request type used by both client and server.
+///
+/// The second type parameter is a direction marker:
+/// - [`Outbound`] is the default client-side builder shape.
+/// - [`Incoming`] is the server-side handler shape.
+///
+/// Server handlers receive [`IncomingRequest`], whose ICAP metadata is read-only
+/// through accessors. Services may inspect or modify the embedded HTTP message
+/// via [`Request::embedded_mut`] or consume it via [`Request::into_embedded`],
+/// but they cannot mutate the ICAP request line, ICAP headers, preview flags,
+/// or advertised `Allow` values through public API.
+///
+/// Server-only fields (`ISTag`, chunk trailers) are carried in
+/// [`DirectionMeta::Meta`] and are only accessible on [`IncomingRequest`].
+/// [`OutboundRequest`] pays zero overhead for those fields.
+#[derive(Debug)]
+#[must_use]
+pub struct Request<R = Vec<u8>, D: DirectionMeta = Outbound> {
+    /// ICAP method: `"OPTIONS" | "REQMOD" | "RESPMOD"`.
+    pub(crate) method: Method,
+    /// Full normalized service path (RFC 3507 §6.4), e.g. `"/v1/scan"`.
+    pub(crate) service: String,
+    /// ICAP headers (case-insensitive).
+    pub(crate) icap_headers: HeaderMap,
+    /// Optional embedded HTTP message (request/response).
+    pub(crate) embedded: Option<EmbeddedHttp<R>>,
+    /// `Preview: n` (if set).
+    pub(crate) preview_size: Option<usize>,
+    /// Whether `Allow: 204` should be advertised.
+    pub(crate) allow_204: bool,
+    /// Whether `Allow: 206` should be advertised.
+    pub(crate) allow_206: bool,
+    /// If `true` and `preview_size == Some(0)`, send `0; ieof` (fast 204 hint).
+    pub(crate) preview_ieof: bool,
+    /// Direction-specific metadata.
+    ///
+    /// [`OutboundMeta`] for client-side requests (zero-sized, zero overhead).
+    /// [`IncomingMeta`] for server-side requests (`ISTag` + chunk trailers).
+    pub(crate) meta: D::Meta,
+}
+
+/// ICAP request used by client send / build APIs.
+pub type OutboundRequest<R = Vec<u8>> = Request<R, Outbound>;
+
+/// ICAP request received by server route handlers.
+///
+/// Carries server-injected metadata (`ISTag`, chunk trailers) that is absent on
+/// the client-side [`OutboundRequest`]. Access it via [`Request::istag`] and
+/// [`Request::chunk_trailers`].
+pub type IncomingRequest<R = Vec<u8>> = Request<R, Incoming>;
+
+/// Client-side request marker.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum Outbound {}
+
+/// Server-side request marker.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum Incoming {}
+
+// ---------------------------------------------------------------------------
+// Direction metadata — sealed trait + per-direction metadata types
+// ---------------------------------------------------------------------------
+
+mod private {
+    pub trait Sealed {}
+    impl Sealed for super::Outbound {}
+    impl Sealed for super::Incoming {}
+}
+
+/// Associates each direction marker with the metadata type it carries inside
+/// [`Request<R, D>`].
+///
+/// This trait is **sealed**: only [`Outbound`] and [`Incoming`] implement it.
+/// Users cannot add new implementations.
+///
+/// The associated type [`DirectionMeta::Meta`] is an implementation detail and
+/// should not be used directly. Access server-injected metadata through the
+/// dedicated accessors on [`IncomingRequest`] instead:
+///
+/// - [`Request::istag`] — the `ISTag` resolved from `ServiceOptions` before
+///   the handler was called.
+/// - [`Request::chunk_trailers`] — HTTP chunk trailer headers (RFC 7230 §4.1.2).
+pub trait DirectionMeta: private::Sealed {
+    /// The metadata type stored inside `Request<R, D>` for this direction.
+    ///
+    /// `OutboundMeta` for [`Outbound`] (zero-sized, no overhead).
+    /// `IncomingMeta` for [`Incoming`] (server-injected fields).
+    #[doc(hidden)]
+    type Meta: Default + fmt::Debug + Clone;
+}
+
+/// Zero-sized metadata placeholder for [`Outbound`] requests.
+///
+/// Carries no data. The compiler optimises away any storage for this type.
+#[doc(hidden)]
+#[derive(Debug, Clone, Default)]
+pub struct OutboundMeta;
+
+/// Server-injected metadata available on [`IncomingRequest`].
+///
+/// Populated by the server connection loop before the route handler is called.
+/// Access it via [`Request::istag`] and [`Request::chunk_trailers`] rather than
+/// constructing or inspecting this type directly.
+#[doc(hidden)]
+#[derive(Debug, Clone, Default)]
+pub struct IncomingMeta {
+    pub(crate) istag: Option<String>,
+    pub(crate) chunk_trailers: HeaderMap,
+}
+
+impl DirectionMeta for Outbound {
+    type Meta = OutboundMeta;
+}
+
+impl DirectionMeta for Incoming {
+    type Meta = IncomingMeta;
+}
 
 /// ICAP protocol methods recognized by the server/router.
 ///
@@ -91,10 +220,19 @@ impl Method {
     #[inline]
     pub const fn as_str(&self) -> &'static str {
         match self {
-            Method::ReqMod => "REQMOD",
-            Method::RespMod => "RESPMOD",
-            Method::Options => "OPTIONS",
+            Self::ReqMod => "REQMOD",
+            Self::RespMod => "RESPMOD",
+            Self::Options => "OPTIONS",
         }
+    }
+
+    /// Parse an ICAP method token into a structured [`Method`].
+    ///
+    /// This is the non-panicking counterpart to `Method::from(&str)`.
+    pub fn parse_token(token: &str) -> IcapResult<Self> {
+        token.parse().map_err(|_| {
+            Error::invalid_method(format!("Unknown ICAP method string: {}", token.trim()))
+        })
     }
 }
 
@@ -112,11 +250,11 @@ impl FromStr for Method {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let t = s.trim();
         if t.eq_ignore_ascii_case("REQMOD") {
-            Ok(Method::ReqMod)
+            Ok(Self::ReqMod)
         } else if t.eq_ignore_ascii_case("RESPMOD") {
-            Ok(Method::RespMod)
+            Ok(Self::RespMod)
         } else if t.eq_ignore_ascii_case("OPTIONS") {
-            Ok(Method::Options)
+            Ok(Self::Options)
         } else {
             Err("Unknown ICAP method string")
         }
@@ -176,7 +314,7 @@ pub struct Remainder<R> {
 }
 
 impl<R> Remainder<R> {
-    pub fn new(reader: R, cont: Option<ContinueHandle>) -> Self {
+    pub const fn new(reader: R, cont: Option<ContinueHandle>) -> Self {
         Self { reader, cont }
     }
     pub async fn continue_if_needed(&mut self) -> IcapResult<()> {
@@ -195,21 +333,25 @@ impl<R> fmt::Debug for Remainder<R> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Remainder")
             .field("cont_present", &self.cont.is_some())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
-/// Generic HTTP body used inside `EmbeddedHttp<R>`.
+/// Generic HTTP body used inside [`EmbeddedHttp`].
 ///
 /// - `Empty` — no body (e.g., GET without payload, or OPTIONS).
 /// - `Preview` — the first `N` bytes are available in `bytes`, followed by the
 ///   `remainder` stream. `ieof=true` indicates the whole body already fits into
 ///   the preview and no `100 Continue` is needed.
 /// - `Full` — the complete body is available via `reader`.
+///
+/// Regular server routes normally receive `Full` bodies because the server owns
+/// the RFC Preview handshake. Preview-aware routes may see `Preview` before
+/// `100 Continue` is sent.
 pub enum Body<R> {
     Empty,
     Preview {
-        bytes: Bytes,
+        bytes: Vec<u8>,
         ieof: bool,
         remainder: Remainder<R>,
     },
@@ -221,9 +363,9 @@ pub enum Body<R> {
 impl<R> fmt::Debug for Body<R> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Body::Empty => f.write_str("Body::Empty"),
-            Body::Full { .. } => f.write_str("Body::Full"),
-            Body::Preview {
+            Self::Empty => f.write_str("Body::Empty"),
+            Self::Full { .. } => f.write_str("Body::Full"),
+            Self::Preview {
                 bytes,
                 ieof,
                 remainder,
@@ -240,7 +382,7 @@ impl<R> fmt::Debug for Body<R> {
 /// Trait-object body reader used by the server side for streaming.
 pub type BodyRead = Box<dyn AsyncRead + Unpin + Send>;
 
-/// An in-memory, non-blocking reader over bytes (used to feed preview bytes into AsyncRead).
+/// An in-memory, non-blocking reader over bytes (used to feed preview bytes into `AsyncRead`).
 struct CursorReader<T>(std::io::Cursor<T>);
 
 impl<T: AsRef<[u8]> + Unpin> AsyncRead for CursorReader<T> {
@@ -249,17 +391,17 @@ impl<T: AsRef<[u8]> + Unpin> AsyncRead for CursorReader<T> {
         _cx: &mut std::task::Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        let mut tmp = [0u8; 8192];
-        let want = buf.remaining().min(tmp.len());
-        match self.0.read(&mut tmp[..want]) {
-            Ok(n) => {
-                if n > 0 {
-                    buf.put_slice(&tmp[..n]);
-                }
-                std::task::Poll::Ready(Ok(()))
-            }
-            Err(e) => std::task::Poll::Ready(Err(e)),
+        // Read directly into the ReadBuf's unfilled portion; invalid cursor positions
+        // are treated as EOF because this reader only advances within the backing slice.
+        let src = self.0.get_ref().as_ref();
+        let pos = usize::try_from(self.0.position()).map_or(src.len(), |pos| pos.min(src.len()));
+        let remaining = src.len().saturating_sub(pos);
+        if remaining > 0 {
+            let to_copy = remaining.min(buf.remaining());
+            buf.put_slice(&src[pos..pos + to_copy]);
+            self.0.set_position((pos + to_copy) as u64);
         }
+        std::task::Poll::Ready(Ok(()))
     }
 }
 impl Body<BodyRead> {
@@ -302,7 +444,7 @@ impl Body<BodyRead> {
         }
 
         match self {
-            Body::Empty => Err(Error::Body("no body".into())),
+            Body::Empty => Err(Error::body("no body")),
             Body::Full { reader } => Ok(reader.as_mut()),
             Body::Preview {
                 bytes,
@@ -345,36 +487,95 @@ pub enum EmbeddedHttp<R> {
         body: Body<R>,
     },
     /// Embedded HTTP response (typical for `RESPMOD`).
+    ///
+    /// `req_head` carries the optional HTTP request context from the
+    /// `req-hdr` section of a RESPMOD request (RFC 3507 §4.4.1).
+    /// It is `Some` when the ICAP sender included the originating HTTP
+    /// request headers; `None` otherwise.
     Resp {
+        /// Original HTTP request that triggered the response, when provided
+        /// by the ICAP client via `req-hdr` in the `Encapsulated` header.
+        req_head: Option<HttpRequest<()>>,
         head: HttpResponse<()>,
         body: Body<R>,
     },
 }
 
+/// The type of embedded HTTP message carried by an ICAP request.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[must_use]
+pub enum EmbeddedHttpKind {
+    /// Embedded HTTP request (`req-hdr` / `req-body`).
+    Request,
+    /// Embedded HTTP response (`res-hdr` / `res-body`).
+    Response,
+}
+
+impl<R> EmbeddedHttp<R> {
+    /// Return whether this embedded message is an HTTP request or response.
+    pub const fn kind(&self) -> EmbeddedHttpKind {
+        match self {
+            Self::Req { .. } => EmbeddedHttpKind::Request,
+            Self::Resp { .. } => EmbeddedHttpKind::Response,
+        }
+    }
+
+    /// Return the optional HTTP request context from a RESPMOD embedded message.
+    ///
+    /// Present when the ICAP client included `req-hdr` in the `Encapsulated`
+    /// header of a RESPMOD request (RFC 3507 §4.4.1). Provides the HTTP request
+    /// that caused the response being modified.
+    ///
+    /// Always `None` for `Req` variants.
+    pub const fn respmod_request_head(&self) -> Option<&HttpRequest<()>> {
+        match self {
+            Self::Resp { req_head, .. } => req_head.as_ref(),
+            Self::Req { .. } => None,
+        }
+    }
+}
+
 /// Serialize embedded HTTP (client-side).
 ///
-/// Returns `(bytes_of_http_head, optional_http_body_bytes)`.
-pub(crate) fn serialize_embedded_http(e: &EmbeddedHttp<Vec<u8>>) -> (Vec<u8>, Option<Vec<u8>>) {
+/// Returns `(http_head_bytes, body_bytes_up_to_limit, original_body_len)`.
+///
+/// `body_limit` caps how many body bytes are copied into the returned `Vec`.
+/// Pass `None` to copy the full body (required for [`Client::send`](crate::Client::send)
+/// so the remainder is available after `100 Continue`).
+/// Pass `Some(preview_size)` for dry-run helpers like [`Client::get_request`](crate::Client::get_request)
+/// where only the preview bytes need to appear in the wire buffer; the caller
+/// must use `original_body_len` to decide the correct chunk terminator
+/// (`ieof` vs `0\r\n\r\n`) regardless of how many bytes were actually copied.
+pub(crate) fn serialize_embedded_http(
+    e: &EmbeddedHttp<Vec<u8>>,
+    body_limit: Option<usize>,
+) -> (Vec<u8>, Option<Vec<u8>>, usize) {
+    #[inline]
+    fn copy_body(reader: &[u8], limit: Option<usize>) -> (Option<Vec<u8>>, usize) {
+        if reader.is_empty() {
+            return (None, 0);
+        }
+        let original_len = reader.len();
+        let end = limit.map_or(original_len, |lim| original_len.min(lim));
+        (Some(reader[..end].to_vec()), original_len)
+    }
+
     match e {
         EmbeddedHttp::Req { head, body } => {
             let head_bytes = serialize_http_request_head(head);
-            let body_bytes = match body {
-                Body::Empty => None,
-                Body::Full { reader } if reader.is_empty() => None,
-                Body::Full { reader } => Some(reader.clone()),
-                Body::Preview { .. } => None, // client shouldn't serialize Preview
+            let (body_bytes, original_len) = match body {
+                Body::Full { reader } => copy_body(reader, body_limit),
+                Body::Empty | Body::Preview { .. } => (None, 0),
             };
-            (head_bytes, body_bytes)
+            (head_bytes, body_bytes, original_len)
         }
-        EmbeddedHttp::Resp { head, body } => {
+        EmbeddedHttp::Resp { head, body, .. } => {
             let head_bytes = serialize_http_response_head(head);
-            let body_bytes = match body {
-                Body::Empty => None,
-                Body::Full { reader } if reader.is_empty() => None,
-                Body::Full { reader } => Some(reader.clone()),
-                Body::Preview { .. } => None,
+            let (body_bytes, original_len) = match body {
+                Body::Full { reader } => copy_body(reader, body_limit),
+                Body::Empty | Body::Preview { .. } => (None, 0),
             };
-            (head_bytes, body_bytes)
+            (head_bytes, body_bytes, original_len)
         }
     }
 }
@@ -386,7 +587,7 @@ fn serialize_http_request_head(head: &HttpRequest<()>) -> Vec<u8> {
         "{} {} {}\r\n",
         head.method(),
         head.uri(),
-        crate::parser::http_version_str(head.version())
+        crate::protocol::http_version_str(head.version())
     )
     .expect("write request line");
     for (name, value) in head.headers() {
@@ -404,7 +605,7 @@ fn serialize_http_response_head(head: &HttpResponse<()>) -> Vec<u8> {
     write!(
         &mut out,
         "{} {} {}\r\n",
-        crate::parser::http_version_str(head.version()),
+        crate::protocol::http_version_str(head.version()),
         head.status().as_u16(),
         head.status().canonical_reason().unwrap_or("")
     )
@@ -419,35 +620,84 @@ fn serialize_http_response_head(head: &HttpResponse<()>) -> Vec<u8> {
     out
 }
 
-/// Single public ICAP request type used by both client and server.
-///
-/// This structure carries ICAP method/service and flags that influence how
-/// the request is serialized on the wire (Preview, Allow: 204/206, ieof).
-#[derive(Debug)]
-pub struct Request<R = Vec<u8>> {
-    /// ICAP method: `"OPTIONS" | "REQMOD" | "RESPMOD"`.
-    pub method: Method,
-    /// Service path like `"icap/test"` or `"respmod"`. Leading slash is allowed.
-    pub service: String,
-    /// ICAP headers (case-insensitive).
-    pub icap_headers: HeaderMap,
-    /// Optional embedded HTTP message (request/response).
-    pub embedded: Option<EmbeddedHttp<R>>,
-    /// `Preview: n` (if set).
-    pub preview_size: Option<usize>,
-    /// Whether `Allow: 204` should be advertised.
-    pub allow_204: bool,
-    /// Whether `Allow: 206` should be advertised.
-    pub allow_206: bool,
-    /// If `true` and `preview_size == Some(0)`, send `0; ieof` (fast 204 hint).
-    pub preview_ieof: bool,
+pub(crate) struct IncomingRequestParts<R> {
+    method: Method,
+    service: String,
+    icap_headers: HeaderMap,
+    embedded: Option<EmbeddedHttp<R>>,
+    preview_size: Option<usize>,
+    allow_204: bool,
+    allow_206: bool,
+    preview_ieof: bool,
 }
 
-impl<R> Request<R> {
-    /// Create a new ICAP request.
-    pub fn new<M: Into<Method>>(method: M, service: impl Into<String>) -> Self {
+impl<R, D: DirectionMeta> Request<R, D> {
+    /// Return the ICAP method.
+    #[inline]
+    pub const fn method(&self) -> Method {
+        self.method
+    }
+
+    /// Return the service path carried in the ICAP URI.
+    #[inline]
+    pub fn service(&self) -> &str {
+        &self.service
+    }
+
+    /// Return ICAP headers supplied on the request.
+    #[inline]
+    pub const fn icap_headers(&self) -> &HeaderMap {
+        &self.icap_headers
+    }
+
+    /// Return embedded HTTP, if this request carries one.
+    #[inline]
+    pub const fn embedded(&self) -> Option<&EmbeddedHttp<R>> {
+        self.embedded.as_ref()
+    }
+
+    /// Return mutable embedded HTTP, if this request carries one.
+    #[inline]
+    pub const fn embedded_mut(&mut self) -> Option<&mut EmbeddedHttp<R>> {
+        self.embedded.as_mut()
+    }
+
+    /// Consume the request and return the embedded HTTP message.
+    #[inline]
+    pub fn into_embedded(self) -> Option<EmbeddedHttp<R>> {
+        self.embedded
+    }
+
+    /// Return the requested preview size.
+    #[inline]
+    pub const fn preview_size(&self) -> Option<usize> {
+        self.preview_size
+    }
+
+    /// Return whether `Preview: 0` should be sent as `0; ieof`.
+    #[inline]
+    pub const fn is_preview_ieof(&self) -> bool {
+        self.preview_ieof
+    }
+
+    /// Return whether `Allow: 204` is advertised.
+    #[inline]
+    pub const fn allows_204(&self) -> bool {
+        self.allow_204
+    }
+
+    /// Return whether `Allow: 206` is advertised.
+    #[inline]
+    pub const fn allows_206(&self) -> bool {
+        self.allow_206
+    }
+}
+
+impl<R> Request<R, Outbound> {
+    /// Create a new outbound ICAP request.
+    pub fn new(method: Method, service: impl Into<String>) -> Self {
         Self {
-            method: method.into(),
+            method,
             service: service.into(),
             icap_headers: HeaderMap::new(),
             embedded: None,
@@ -455,106 +705,352 @@ impl<R> Request<R> {
             allow_204: false,
             allow_206: false,
             preview_ieof: false,
+            meta: OutboundMeta,
         }
+    }
+
+    /// Create a new outbound ICAP request from a method token without panicking.
+    pub fn try_new(method: &str, service: impl Into<String>) -> IcapResult<Self> {
+        Ok(Self::new(Method::parse_token(method)?, service))
     }
 
     /// Construct `OPTIONS` request.
     pub fn options(service: impl Into<String>) -> Self {
         Self::new(Method::Options, service)
     }
+
     /// Construct `REQMOD` request.
     pub fn reqmod(service: impl Into<String>) -> Self {
         Self::new(Method::ReqMod, service)
     }
+
     /// Construct `RESPMOD` request.
     pub fn respmod(service: impl Into<String>) -> Self {
         Self::new(Method::RespMod, service)
     }
 
-    /// Set/override an ICAP header.
-    pub fn icap_header(mut self, name: &str, value: &str) -> Self {
-        let n: HeaderName = name.parse().expect("invalid ICAP header name");
-        let v: HeaderValue = HeaderValue::from_str(value).expect("invalid ICAP header value");
+    /// Try to set or override an ICAP header.
+    pub fn try_icap_header(mut self, name: &str, value: &str) -> IcapResult<Self> {
+        let n: HeaderName = name.parse()?;
+        let v: HeaderValue = HeaderValue::from_str(value)?;
         self.icap_headers.insert(n, v);
-        self
+        Ok(self)
     }
 
-    /// Preview controls.
-    pub fn preview(mut self, n: usize) -> Self {
+    /// Set or override an ICAP header.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `name` or `value` is not a valid HTTP header field. Use
+    /// [`Request::try_icap_header`] for untrusted input.
+    pub fn icap_header(self, name: &str, value: &str) -> Self {
+        self.try_icap_header(name, value)
+            .expect("invalid ICAP header name or value")
+    }
+
+    /// Advertise `Preview: n`.
+    ///
+    /// `Preview: 0` means the client sends an immediate zero-size preview chunk
+    /// and waits for either a final response or `100 Continue`.
+    pub const fn preview(mut self, n: usize) -> Self {
         self.preview_size = Some(n);
         self
     }
-    pub fn preview_ieof(mut self) -> Self {
+
+    /// Mark a `Preview: 0` request as complete using the `ieof` chunk extension.
+    pub const fn preview_ieof(mut self) -> Self {
         self.preview_ieof = true;
         self
     }
 
-    /// Advertise `Allow: 204` / `Allow: 206`.
-    pub fn allow_204(mut self) -> Self {
+    /// Advertise `Allow: 204`.
+    pub const fn allow_204(mut self) -> Self {
         self.allow_204 = true;
         self
     }
-    pub fn allow_206(mut self) -> Self {
+
+    /// Advertise `Allow: 206`.
+    ///
+    /// The companion server can answer eligible no-modification flows with
+    /// `206 Partial Content` and `use-original-body`.
+    pub const fn allow_206(mut self) -> Self {
         self.allow_206 = true;
         self
     }
 
     /// True for `REQMOD`/`RESPMOD`.
     #[inline]
-    pub fn is_mod(&self) -> bool {
+    pub const fn is_mod(&self) -> bool {
         matches!(self.method, Method::ReqMod | Method::RespMod)
+    }
+
+    /// True for `OPTIONS`.
+    #[inline]
+    pub const fn is_options(&self) -> bool {
+        matches!(self.method, Method::Options)
+    }
+
+    /// Return the embedded HTTP message kind, if present.
+    #[inline]
+    pub const fn embedded_kind(&self) -> Option<EmbeddedHttpKind> {
+        match &self.embedded {
+            Some(embedded) => Some(embedded.kind()),
+            None => None,
+        }
+    }
+
+    /// Validate that this request can be serialized as a coherent ICAP request.
+    ///
+    /// This checks method-to-embedded-message compatibility but does not require
+    /// a buffered body, because streaming sends attach body bytes separately.
+    pub fn validate_for_send(&self) -> IcapResult<()> {
+        match (self.method, self.embedded_kind()) {
+            (Method::Options, Some(_)) => {
+                return Err(Error::serialization(
+                    "OPTIONS requests must not carry embedded HTTP",
+                ));
+            }
+            (Method::ReqMod, Some(EmbeddedHttpKind::Response)) => {
+                return Err(Error::serialization(
+                    "REQMOD requests must carry an embedded HTTP request",
+                ));
+            }
+            (Method::RespMod, Some(EmbeddedHttpKind::Request)) => {
+                return Err(Error::serialization(
+                    "RESPMOD requests must carry an embedded HTTP response",
+                ));
+            }
+            _ => {}
+        }
+
+        if self.preview_ieof && self.preview_size != Some(0) {
+            return Err(Error::serialization(
+                "preview_ieof is only valid together with Preview: 0",
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+impl<R> Request<R, Incoming> {
+    #[allow(clippy::missing_const_for_fn)]
+    pub(crate) fn incoming(parts: IncomingRequestParts<R>) -> Self {
+        Self {
+            method: parts.method,
+            service: parts.service,
+            icap_headers: parts.icap_headers,
+            embedded: parts.embedded,
+            preview_size: parts.preview_size,
+            allow_204: parts.allow_204,
+            allow_206: parts.allow_206,
+            preview_ieof: parts.preview_ieof,
+            meta: IncomingMeta::default(),
+        }
+    }
+
+    /// Return chunk trailer headers that accompanied the embedded HTTP body.
+    ///
+    /// RFC 7230 §4.1.2 (applied by RFC 3507 §6.3) allows an ICAP sender to
+    /// append HTTP-style `Name: Value` trailer headers after the zero chunk.
+    /// This method returns those headers as parsed from the wire.
+    ///
+    /// The map is empty when no trailers were present.
+    ///
+    /// This accessor is only available on [`IncomingRequest`]; outbound client
+    /// requests never carry chunk trailers.
+    #[inline]
+    pub const fn chunk_trailers(&self) -> &HeaderMap {
+        &self.meta.chunk_trailers
+    }
+
+    /// Return the `ISTag` that the server resolved from
+    /// [`ServiceOptions`](crate::ServiceOptions) for this request, or `None` if
+    /// no `ServiceOptions` were configured.
+    ///
+    /// This is the same value that will appear in the ICAP response's `ISTag`
+    /// header when using
+    /// [`Response::no_content_with_istag`](crate::Response::no_content_with_istag)
+    /// or similar.
+    ///
+    /// This accessor is only available on [`IncomingRequest`]; outbound client
+    /// requests do not carry an `ISTag`.
+    #[inline]
+    pub fn istag(&self) -> Option<&str> {
+        self.meta.istag.as_deref()
     }
 }
 
 /// Client-side convenience: attach embedded HTTP with **owned bytes**.
-impl Request<Vec<u8>> {
+impl Request<Vec<u8>, Outbound> {
     /// Attach only HTTP request head (no buffered body bytes).
     ///
     /// Useful with streaming client APIs such as `Client::send_streaming_reader`.
-    pub fn with_http_request_head(mut self, head: HttpRequest<()>) -> Self {
+    pub fn with_http_request_head(mut self, head: HttpRequest<()>) -> IcapResult<Self> {
+        if self.method != Method::ReqMod {
+            return Err(Error::serialization(
+                "HTTP request heads can only be attached to REQMOD requests",
+            ));
+        }
         self.embedded = Some(EmbeddedHttp::Req {
             head,
             body: Body::Empty,
         });
-        self
+        Ok(self)
     }
 
     /// Attach only HTTP response head (no buffered body bytes).
     ///
     /// Useful with streaming client APIs such as `Client::send_streaming_reader`.
-    pub fn with_http_response_head(mut self, head: HttpResponse<()>) -> Self {
+    pub fn with_http_response_head(mut self, head: HttpResponse<()>) -> IcapResult<Self> {
+        if self.method != Method::RespMod {
+            return Err(Error::serialization(
+                "HTTP response heads can only be attached to RESPMOD requests",
+            ));
+        }
         self.embedded = Some(EmbeddedHttp::Resp {
+            req_head: None,
             head,
             body: Body::Empty,
         });
-        self
+        Ok(self)
     }
 
-    pub fn with_http_request(mut self, req: HttpRequest<Vec<u8>>) -> Self {
+    /// Attach a complete embedded HTTP request.
+    ///
+    /// This is the usual client-side builder for `REQMOD` requests when the
+    /// HTTP entity body is already available in memory. For large bodies, use
+    /// [`Request::with_http_request_head`] together with a streaming client
+    pub fn with_http_request(mut self, req: HttpRequest<Vec<u8>>) -> IcapResult<Self> {
+        if self.method != Method::ReqMod {
+            return Err(Error::serialization(
+                "HTTP requests can only be attached to REQMOD requests",
+            ));
+        }
         let (parts, body) = req.into_parts();
         let head = HttpRequest::from_parts(parts, ());
         self.embedded = Some(EmbeddedHttp::Req {
             head,
             body: Body::Full { reader: body },
         });
-        self
+        Ok(self)
     }
-    pub fn with_http_response(mut self, resp: HttpResponse<Vec<u8>>) -> Self {
+
+    /// Attach a complete embedded HTTP response.
+    ///
+    /// This is the usual client-side builder for `RESPMOD` requests when the
+    /// HTTP entity body is already available in memory. For large bodies, use
+    /// [`Request::with_http_response_head`] together with a streaming client
+    pub fn with_http_response(mut self, resp: HttpResponse<Vec<u8>>) -> IcapResult<Self> {
+        if self.method != Method::RespMod {
+            return Err(Error::serialization(
+                "HTTP responses can only be attached to RESPMOD requests",
+            ));
+        }
         let (parts, body) = resp.into_parts();
         let head = HttpResponse::from_parts(parts, ());
         self.embedded = Some(EmbeddedHttp::Resp {
+            req_head: None,
             head,
             body: Body::Full { reader: body },
         });
-        self
+        Ok(self)
     }
+
+    /// Attach a complete embedded HTTP response **with the original HTTP request context**.
+    ///
+    /// Equivalent to [`with_http_response`](Self::with_http_response) but also
+    /// includes the HTTP request that triggered the response (`req-hdr` in the
+    /// `Encapsulated` section, RFC 3507 §4.4.1). The ICAP server receives the
+    /// original request head via [`EmbeddedHttp::respmod_request_head`].
+    pub fn with_http_response_and_request_context(
+        mut self,
+        resp: HttpResponse<Vec<u8>>,
+        orig_req: HttpRequest<()>,
+    ) -> IcapResult<Self> {
+        if self.method != Method::RespMod {
+            return Err(Error::serialization(
+                "HTTP responses can only be attached to RESPMOD requests",
+            ));
+        }
+        let (parts, body) = resp.into_parts();
+        let head = HttpResponse::from_parts(parts, ());
+        self.embedded = Some(EmbeddedHttp::Resp {
+            req_head: Some(orig_req),
+            head,
+            body: Body::Full { reader: body },
+        });
+        Ok(self)
+    }
+}
+
+/// Normalize an ICAP service identifier to a canonical request path.
+///
+/// Accepts a full ICAP request-URI (`icap://host:port/v1/scan`), an absolute
+/// path (`/v1/scan`), or a bare service name (`scan`) and returns the canonical
+/// path used for routing: exactly one leading slash, no trailing slash (except
+/// for the root), and `*`/empty mapped to the root `/`.
+///
+/// This is the single source of truth for service-path form. It is applied when
+/// parsing an incoming request line, when a client builds a request-URI, and
+/// when the server registers and resolves routes, so all three agree on the
+/// same key.
+#[must_use]
+pub(crate) fn normalize_service_path(raw: &str) -> String {
+    let s = raw.trim();
+
+    // `*` (server-wide OPTIONS) and the empty string map to the root.
+    if s.is_empty() || s == "*" {
+        return "/".to_string();
+    }
+
+    // Reduce an absolute ICAP URI to its path component.
+    let path = strip_icap_scheme(s).map_or(s, |authority_and_path| {
+        authority_and_path
+            .find('/')
+            .map_or("/", |idx| &authority_and_path[idx..])
+    });
+
+    let trimmed = path.trim_matches('/');
+    if trimmed.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{trimmed}")
+    }
+}
+
+/// Strip an `icap://` or `icaps://` scheme prefix (case-insensitive), returning
+/// the remaining `authority[/path]` portion when a scheme is present.
+fn strip_icap_scheme(s: &str) -> Option<&str> {
+    for scheme in ["icaps://", "icap://"] {
+        if let Some(prefix) = s.get(..scheme.len())
+            && prefix.eq_ignore_ascii_case(scheme)
+        {
+            return Some(&s[scheme.len()..]);
+        }
+    }
+    None
 }
 
 /// Parse ICAP request from bytes
 ///
-/// Note: this parser constructs `Request<Vec<u8>>`, i.e. a fully buffered
+/// Note: this parser constructs `IncomingRequest<Vec<u8>>`, i.e. a fully buffered
 /// embedded HTTP body when present.
-pub(crate) fn parse_icap_request(data: &[u8]) -> IcapResult<Request<Vec<u8>>> {
+pub(crate) fn parse_icap_request(data: &[u8]) -> IcapResult<IncomingRequest<Vec<u8>>> {
+    parse_icap_request_with_mode(data, RequestParserMode::Strict)
+}
+
+#[derive(Debug, Default, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum RequestParserMode {
+    Compatibility,
+    #[default]
+    Strict,
+}
+
+pub(crate) fn parse_icap_request_with_mode(
+    data: &[u8],
+    mode: RequestParserMode,
+) -> IcapResult<IncomingRequest<Vec<u8>>> {
     trace!("parse_icap_request: len={}", data.len());
 
     let hdr_end =
@@ -574,7 +1070,7 @@ pub(crate) fn parse_icap_request(data: &[u8]) -> IcapResult<Request<Vec<u8>>> {
         "RESPMOD" => Method::RespMod,
         "OPTIONS" => Method::Options,
         other => {
-            return Err(Error::InvalidMethod(format!(
+            return Err(Error::invalid_method(format!(
                 "Unknown ICAP method: {other}"
             )));
         }
@@ -588,54 +1084,54 @@ pub(crate) fn parse_icap_request(data: &[u8]) -> IcapResult<Request<Vec<u8>>> {
         .ok_or_else(|| Error::parse("Invalid request line"))?;
 
     if !version.eq_ignore_ascii_case(ICAP_VERSION) {
-        return Err(Error::InvalidVersion(version.to_string()));
+        return Err(Error::invalid_version(version.to_string()));
     }
 
-    let mut icap_headers = HeaderMap::new();
-    for line in lines {
-        if line.is_empty() {
-            break;
-        }
-        if let Some(colon) = memchr(b':', line.as_bytes()) {
-            let name = &line[..colon];
-            let value = line[colon + 1..].trim();
-            icap_headers.insert(
-                HeaderName::from_bytes(name.as_bytes())?,
-                HeaderValue::from_str(value)?,
-            );
-        }
-    }
+    let icap_headers = parse_header_lines(lines)?;
 
     if !icap_headers.contains_key("Host") {
-        return Err(Error::MissingHeader("Host"));
+        return Err(Error::missing_header("Host"));
     }
 
-    if matches!(method, Method::ReqMod | Method::RespMod)
+    if (matches!(method, Method::ReqMod | Method::RespMod)
+        || (mode == RequestParserMode::Strict && method == Method::Options))
         && !icap_headers.contains_key("Encapsulated")
     {
-        return Err(Error::MissingHeader("Encapsulated"));
+        return Err(Error::missing_header("Encapsulated"));
     }
 
-    let service = icap_uri.rsplit('/').next().unwrap_or("").to_string();
+    let service = normalize_service_path(icap_uri);
 
     let allow_204 = allow_contains_token(&icap_headers, "204");
     let allow_206 = allow_contains_token(&icap_headers, "206");
 
-    let preview_size = icap_headers
-        .get("Preview")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.trim().parse::<usize>().ok());
+    // RFC 3507 §4.5: `Preview` carries a non-negative integer count of body bytes
+    // included in the preview. Malformed values are a protocol error.
+    let preview_size = match icap_headers.get("Preview") {
+        None => None,
+        Some(v) => {
+            let s = v
+                .to_str()
+                .map_err(|_| Error::parse("Preview header has non-ASCII value"))?;
+            let trimmed = s.trim();
+            let n = trimmed.parse::<usize>().map_err(|_| {
+                Error::parse(format!("Preview header has invalid integer '{trimmed}'"))
+            })?;
+            Some(n)
+        }
+    };
 
-    // Encapsulated area: сразу после ICAP headers CRLFCRLF
+    // Encapsulated bytes start immediately after the ICAP header terminator.
     let enc_area = &data[hdr_end..];
 
     let enc = match icap_headers.get("Encapsulated") {
         Some(v) => {
             let raw = v.to_str()?;
-            crate::parser::icap::parse_encapsulated_value(raw)?
+            crate::protocol::parse_encapsulated_value(raw)?
         }
-        None => crate::parser::icap::Encapsulated::default(),
+        None => crate::protocol::Encapsulated::default(),
     };
+    validate_encapsulated_for_method(method, &enc)?;
 
     let http_hdr_off = match method {
         Method::ReqMod => enc.req_hdr,
@@ -646,9 +1142,8 @@ pub(crate) fn parse_icap_request(data: &[u8]) -> IcapResult<Request<Vec<u8>>> {
     let embedded = if let Some(hdr_off) = http_hdr_off {
         let hdr_end_off = next_offset_after(&enc, hdr_off);
         let http_region = slice_encapsulated(enc_area, hdr_off, hdr_end_off)?;
-
-        let Some(http_hdr_len) = find_double_crlf(http_region) else {
-            return Ok(Request {
+        if http_region.is_empty() {
+            return Ok(IncomingRequest::incoming(IncomingRequestParts {
                 method,
                 service,
                 icap_headers,
@@ -657,34 +1152,24 @@ pub(crate) fn parse_icap_request(data: &[u8]) -> IcapResult<Request<Vec<u8>>> {
                 allow_204,
                 allow_206,
                 preview_ieof: false,
-            });
-        };
+            }));
+        }
+
+        let http_hdr_len = find_double_crlf(http_region)
+            .ok_or_else(|| Error::http_parse("embedded HTTP headers not complete".to_string()))?;
         let http_head_bytes = &http_region[..http_hdr_len];
         let inline_body = &http_region[http_hdr_len..];
 
         let first_line_end =
             memmem::find(http_head_bytes, b"\r\n").unwrap_or(http_head_bytes.len());
         let start_bytes = &http_head_bytes[..first_line_end];
-        let is_response = start_bytes.starts_with(b"HTTP/");
+        let start = std::str::from_utf8(start_bytes)?;
 
         let http_head_str = std::str::from_utf8(http_head_bytes)?;
         let mut hlines = http_head_str.split("\r\n");
-        let start = hlines.next().unwrap_or_default();
+        let _ = hlines.next();
 
-        let mut http_headers = HeaderMap::new();
-        for line in hlines {
-            if line.is_empty() {
-                break;
-            }
-            if let Some(colon) = memchr(b':', line.as_bytes()) {
-                let name = &line[..colon];
-                let value = line[colon + 1..].trim();
-                http_headers.insert(
-                    HeaderName::from_bytes(name.as_bytes())?,
-                    HeaderValue::from_str(value)?,
-                );
-            }
-        }
+        let http_headers = parse_header_lines(hlines)?;
 
         let body_off = match method {
             Method::ReqMod => enc.req_body,
@@ -697,13 +1182,13 @@ pub(crate) fn parse_icap_request(data: &[u8]) -> IcapResult<Request<Vec<u8>>> {
         let body_bytes: Vec<u8> = if no_body {
             Vec::new()
         } else if let Some(boff) = body_off {
-            // Граница тела — следующий offset после boff, либо конец enc_area.
+            // The body boundary is the next Encapsulated offset or the end of the area.
             let bend = next_offset_after(&enc, boff);
             let body_slice = slice_encapsulated(enc_area, boff, bend)?;
 
             if boff < hdr_off {
-                return Err(Error::Header(
-                    "Encapsulated offsets invalid (body before headers)".into(),
+                return Err(Error::header(
+                    "Encapsulated offsets invalid (body before headers)",
                 ));
             }
 
@@ -712,15 +1197,10 @@ pub(crate) fn parse_icap_request(data: &[u8]) -> IcapResult<Request<Vec<u8>>> {
             inline_body.to_vec()
         };
 
-        if is_response {
-            // HTTP Response
-            let mut p = start.split_whitespace();
-            let _ver = p.next().unwrap_or("HTTP/1.1");
-            let code = p.next().unwrap_or("200").parse::<u16>().unwrap_or(200);
+        if method == Method::RespMod {
+            let (version, status) = parse_http_response_start_line(start)?;
 
-            let mut builder = HttpResponse::builder()
-                .status(HttpStatus::from_u16(code).unwrap_or(HttpStatus::OK))
-                .version(Version::HTTP_11);
+            let mut builder = HttpResponse::builder().status(status).version(version);
 
             {
                 let headers_mut = builder
@@ -731,22 +1211,30 @@ pub(crate) fn parse_icap_request(data: &[u8]) -> IcapResult<Request<Vec<u8>>> {
 
             let head = builder
                 .body(())
-                .map_err(|e| format!("build http::Response head: {e}"))?;
+                .map_err(|e| Error::http_parse(format!("build http::Response head: {e}")))?;
+
+            // RFC 3507 §4.4.1: RESPMOD request may carry optional req-hdr
+            // (the HTTP request that caused this response). Parse it when present.
+            let req_head = if let Some(req_hdr_off) = enc.req_hdr {
+                let req_end = next_offset_after(&enc, req_hdr_off);
+                let req_region = slice_encapsulated(enc_area, req_hdr_off, req_end)?;
+                parse_http_request_head_only(req_region)?
+            } else {
+                None
+            };
 
             Some(EmbeddedHttp::Resp {
+                req_head,
                 head,
                 body: Body::Full { reader: body_bytes },
             })
         } else {
-            // HTTP Request
-            let mut p = start.split_whitespace();
-            let m = p.next().unwrap_or("GET");
-            let u = p.next().unwrap_or("/");
+            let (http_method, uri, version) = parse_http_request_start_line(start)?;
 
             let mut builder = HttpRequest::builder()
-                .method(m)
-                .uri(u)
-                .version(Version::HTTP_11);
+                .method(http_method)
+                .uri(uri)
+                .version(version);
 
             {
                 let headers_mut = builder
@@ -757,7 +1245,7 @@ pub(crate) fn parse_icap_request(data: &[u8]) -> IcapResult<Request<Vec<u8>>> {
 
             let head = builder
                 .body(())
-                .map_err(|e| format!("build http::Request head: {e}"))?;
+                .map_err(|e| Error::http_parse(format!("build http::Request head: {e}")))?;
 
             Some(EmbeddedHttp::Req {
                 head,
@@ -768,7 +1256,7 @@ pub(crate) fn parse_icap_request(data: &[u8]) -> IcapResult<Request<Vec<u8>>> {
         None
     };
 
-    Ok(Request {
+    Ok(IncomingRequest::incoming(IncomingRequestParts {
         method,
         service,
         icap_headers,
@@ -777,20 +1265,104 @@ pub(crate) fn parse_icap_request(data: &[u8]) -> IcapResult<Request<Vec<u8>>> {
         allow_204,
         allow_206,
         preview_ieof: false,
-    })
+    }))
 }
 
-fn next_offset_after(enc: &crate::parser::icap::Encapsulated, start: usize) -> Option<usize> {
+/// Parse a region of bytes as an HTTP request head only (no body).
+///
+/// Used for the optional `req-hdr` section in RESPMOD requests (RFC 3507 §4.4.1).
+/// Returns `None` when `region` is empty (the ICAP sender omitted the section).
+fn parse_http_request_head_only(region: &[u8]) -> IcapResult<Option<HttpRequest<()>>> {
+    if region.is_empty() {
+        return Ok(None);
+    }
+
+    let hdr_len = find_double_crlf(region)
+        .ok_or_else(|| Error::http_parse("req-hdr section: HTTP request headers not complete"))?;
+    let head_bytes = &region[..hdr_len];
+
+    let first_line_end = memmem::find(head_bytes, b"\r\n").unwrap_or(head_bytes.len());
+    let start_str = std::str::from_utf8(&head_bytes[..first_line_end])?;
+
+    let head_str = std::str::from_utf8(head_bytes)?;
+    let http_headers = parse_header_lines(head_str.split("\r\n").skip(1))?;
+
+    let (http_method, uri, version) = parse_http_request_start_line(start_str)?;
+    let mut builder = HttpRequest::builder()
+        .method(http_method)
+        .uri(uri)
+        .version(version);
+    if let Some(h) = builder.headers_mut() {
+        h.extend(http_headers);
+    }
+    let head = builder
+        .body(())
+        .map_err(|e| Error::http_parse(format!("build req-hdr HTTP request head: {e}")))?;
+    Ok(Some(head))
+}
+
+fn validate_encapsulated_for_method(
+    method: Method,
+    enc: &crate::protocol::Encapsulated,
+) -> IcapResult<()> {
+    if enc.null_body.is_some()
+        && (enc.req_body.is_some() || enc.res_body.is_some() || enc.opt_body.is_some())
+    {
+        return Err(Error::header(
+            "Encapsulated null-body must not be combined with body tokens",
+        ));
+    }
+
+    match method {
+        Method::ReqMod => {
+            if enc.res_hdr.is_some() || enc.res_body.is_some() || enc.opt_body.is_some() {
+                return Err(Error::header(
+                    "REQMOD Encapsulated must not contain response or opt-body parts",
+                ));
+            }
+            if enc.req_body.is_some() && enc.req_hdr.is_none() {
+                return Err(Error::header(
+                    "REQMOD Encapsulated req-body requires req-hdr",
+                ));
+            }
+        }
+        Method::RespMod => {
+            if enc.req_body.is_some() || enc.opt_body.is_some() {
+                return Err(Error::header(
+                    "RESPMOD Encapsulated must not contain req-body or opt-body parts",
+                ));
+            }
+            if enc.res_body.is_some() && enc.res_hdr.is_none() {
+                return Err(Error::header(
+                    "RESPMOD Encapsulated res-body requires res-hdr",
+                ));
+            }
+        }
+        Method::Options => {
+            if enc.req_hdr.is_some()
+                || enc.res_hdr.is_some()
+                || enc.req_body.is_some()
+                || enc.res_body.is_some()
+                || enc.opt_body.is_some()
+            {
+                return Err(Error::header(
+                    "OPTIONS request Encapsulated must be absent or null-body",
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn next_offset_after(enc: &crate::protocol::Encapsulated, start: usize) -> Option<usize> {
     let mut min: Option<usize> = None;
 
     let mut consider = |v: Option<usize>| {
         if let Some(o) = v
             && o > start
         {
-            min = Some(match min {
-                Some(m) => m.min(o),
-                None => o,
-            });
+            min = Some(min.map_or(o, |m| m.min(o)));
         }
     };
 
@@ -806,18 +1378,14 @@ fn next_offset_after(enc: &crate::parser::icap::Encapsulated, start: usize) -> O
 
 fn slice_encapsulated(enc_area: &[u8], start: usize, end: Option<usize>) -> IcapResult<&[u8]> {
     if start > enc_area.len() {
-        return Err(Error::Header("Encapsulated offset out of bounds".into()));
+        return Err(Error::header("Encapsulated offset out of bounds"));
     }
     let end = end.unwrap_or(enc_area.len());
     if end > enc_area.len() {
-        return Err(Error::Header(
-            "Encapsulated end offset out of bounds".into(),
-        ));
+        return Err(Error::header("Encapsulated end offset out of bounds"));
     }
     if end < start {
-        return Err(Error::Header(
-            "Encapsulated offsets invalid (end < start)".into(),
-        ));
+        return Err(Error::header("Encapsulated offsets invalid (end < start)"));
     }
     Ok(&enc_area[start..end])
 }
@@ -827,8 +1395,7 @@ fn allow_contains_token(headers: &HeaderMap, token: &str) -> bool {
     headers
         .get("Allow")
         .and_then(|v| v.to_str().ok())
-        .map(|s| s.split(',').any(|p| p.trim().eq_ignore_ascii_case(token)))
-        .unwrap_or(false)
+        .is_some_and(|s| s.split(',').any(|p| p.trim().eq_ignore_ascii_case(token)))
 }
 
 #[cfg(test)]
@@ -890,6 +1457,17 @@ mod tests {
     }
 
     #[test]
+    fn preview_zero_does_not_imply_ieof() {
+        let req: Request = Request::reqmod("svc").preview(0);
+        assert_eq!(req.preview_size, Some(0));
+        assert!(!req.preview_ieof);
+
+        let req: Request = Request::reqmod("svc").preview(0).preview_ieof();
+        assert_eq!(req.preview_size, Some(0));
+        assert!(req.preview_ieof);
+    }
+
+    #[test]
     fn builder_sets_and_overrides_headers() {
         let req: Request = Request::options("icap/test")
             .icap_header("Host", "icap.example.org")
@@ -902,27 +1480,46 @@ mod tests {
     }
 
     #[test]
-    fn parse_reqmod_body_is_sliced_by_next_offset() {
+    fn try_icap_header_rejects_invalid_header_input() {
+        let err = Request::<Vec<u8>>::options("icap/test")
+            .try_icap_header("Bad Header", "value")
+            .expect_err("invalid header name should be rejected");
+
+        assert!(matches!(err, Error::Protocol(ProtocolError::HeaderName(_))));
+    }
+
+    #[test]
+    fn try_new_rejects_unknown_method_without_panic() {
+        let err = Request::<Vec<u8>>::try_new("PATCH", "svc")
+            .expect_err("unknown method should be rejected");
+
+        assert!(matches!(
+            err,
+            Error::Protocol(ProtocolError::InvalidField {
+                field: ProtocolField::Method,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn parse_reqmod_body_uses_req_body_offset() {
         let http = b"GET / HTTP/1.1\r\nHost: ex\r\n\r\n";
         let body = b"12345678";
-        let tail = b"ZZZZ"; // это будет идти после null-body boundary
 
-        let req_body_off = http.len(); // тело сразу после http headers
-        let null_body_off = req_body_off + body.len(); // конец тела
+        let req_body_off = http.len(); // body starts immediately after HTTP headers
 
         let raw = format!(
             "REQMOD icap://icap.example.org/icap/test ICAP/1.0\r\n\
 Host: icap.example.org\r\n\
-Encapsulated: req-hdr=0, req-body={}, null-body={}\r\n\
+Encapsulated: req-hdr=0, req-body={req_body_off}\r\n\
 \r\n",
-            req_body_off, null_body_off
         )
         .into_bytes();
 
         let mut bytes = raw;
         bytes.extend_from_slice(http);
         bytes.extend_from_slice(body);
-        bytes.extend_from_slice(tail);
 
         let r = parse_icap_request(&bytes).expect("parse");
         match r.embedded {
@@ -945,7 +1542,7 @@ Encapsulated: req-hdr=0, req-body={}, null-body={}\r\n\
             .body(Vec::<u8>::new())
             .unwrap();
 
-        let req: Request = Request::reqmod("svc").with_http_request(http_req);
+        let req: Request = Request::reqmod("svc").with_http_request(http_req).unwrap();
         assert!(matches!(req.embedded, Some(EmbeddedHttp::Req { .. })));
 
         let http_resp = HttpResponse::builder()
@@ -954,7 +1551,9 @@ Encapsulated: req-hdr=0, req-body={}, null-body={}\r\n\
             .body(Vec::<u8>::new())
             .unwrap();
 
-        let req2: Request = Request::respmod("svc").with_http_response(http_resp);
+        let req2: Request = Request::respmod("svc")
+            .with_http_response(http_resp)
+            .unwrap();
         assert!(matches!(req2.embedded, Some(EmbeddedHttp::Resp { .. })));
     }
 
@@ -966,7 +1565,9 @@ Encapsulated: req-hdr=0, req-body={}, null-body={}\r\n\
             .version(Version::HTTP_11)
             .body(())
             .unwrap();
-        let req: Request = Request::reqmod("svc").with_http_request_head(req_head);
+        let req: Request = Request::reqmod("svc")
+            .with_http_request_head(req_head)
+            .unwrap();
         assert!(matches!(
             req.embedded,
             Some(EmbeddedHttp::Req {
@@ -980,13 +1581,61 @@ Encapsulated: req-hdr=0, req-body={}, null-body={}\r\n\
             .version(Version::HTTP_11)
             .body(())
             .unwrap();
-        let req2: Request = Request::respmod("svc").with_http_response_head(resp_head);
+        let req2: Request = Request::respmod("svc")
+            .with_http_response_head(resp_head)
+            .unwrap();
         assert!(matches!(
             req2.embedded,
             Some(EmbeddedHttp::Resp {
                 body: Body::Empty,
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn validated_embedded_builders_reject_method_mismatch() {
+        let http_req = HttpRequest::builder()
+            .method("GET")
+            .uri("/x")
+            .version(Version::HTTP_11)
+            .body(Vec::<u8>::new())
+            .unwrap();
+
+        let err = Request::respmod("svc")
+            .with_http_request(http_req)
+            .expect_err("RESPMOD must reject embedded HTTP requests");
+
+        assert!(matches!(
+            err,
+            Error::Protocol(ProtocolError::Serialization(_))
+        ));
+
+        let http_resp = HttpResponse::builder()
+            .status(HttpStatus::OK)
+            .version(Version::HTTP_11)
+            .body(Vec::<u8>::new())
+            .unwrap();
+
+        let err = Request::reqmod("svc")
+            .with_http_response(http_resp)
+            .expect_err("REQMOD must reject embedded HTTP responses");
+
+        assert!(matches!(
+            err,
+            Error::Protocol(ProtocolError::Serialization(_))
+        ));
+    }
+
+    #[test]
+    fn validate_for_send_rejects_incoherent_request_shapes() {
+        let req: Request = Request::reqmod("svc").preview(16).preview_ieof();
+        let err = req
+            .validate_for_send()
+            .expect_err("ieof is only valid with Preview: 0");
+        assert!(matches!(
+            err,
+            Error::Protocol(ProtocolError::Serialization(_))
         ));
     }
 
@@ -999,24 +1648,48 @@ Encapsulated: req-hdr=0, req-body={}, null-body={}\r\n\
                     Encapsulated: req-hdr=0\r\n\
                     \r\n";
         let err = parse_icap_request(raw).unwrap_err();
-        assert!(matches!(err, Error::InvalidVersion(v) if v == "ICAP/2.0"));
+        assert!(
+            matches!(err, Error::Protocol(ProtocolError::InvalidField { field: ProtocolField::Version, value: v, .. }) if v == "ICAP/2.0")
+        );
     }
 
+    // RFC 3507 §6.4 — the service is identified by the full request-URI path,
+    // not by the final path segment.
     #[rstest]
     #[case(
         "REQMOD icap://icap.example.org/icap/test ICAP/1.0\r\nHost: icap.example.org\r\nEncapsulated: req-hdr=0\r\n\r\n",
-        "test"
+        "/icap/test"
     )]
     #[case(
         "RESPMOD icap://icap.example.org/respmod ICAP/1.0\r\nHost: icap.example.org\r\nEncapsulated: res-hdr=0\r\n\r\n",
-        "respmod"
+        "/respmod"
     )]
-    fn service_is_last_path_segment_of_icap_uri(
-        #[case] wire: &str,
-        #[case] expected_service: &str,
-    ) {
+    #[case(
+        "REQMOD icap://icap.example.org/v1/scan/ ICAP/1.0\r\nHost: icap.example.org\r\nEncapsulated: req-hdr=0\r\n\r\n",
+        "/v1/scan"
+    )]
+    fn service_is_full_path_of_icap_uri(#[case] wire: &str, #[case] expected_service: &str) {
         let r = parse_icap_request(&icap_bytes(wire)).expect("parse");
         assert_eq!(r.service, expected_service);
+    }
+
+    // RFC 3507 §6.4 — canonical service-path normalization.
+    #[rstest]
+    #[case("scan", "/scan")]
+    #[case("/scan", "/scan")]
+    #[case("/v1/scan", "/v1/scan")]
+    #[case("v1/scan", "/v1/scan")]
+    #[case("/v1/scan/", "/v1/scan")]
+    #[case("icap://host:1344/v1/scan", "/v1/scan")]
+    #[case("ICAP://host:1344/v1/scan", "/v1/scan")]
+    #[case("icaps://host:1344/secure/scan", "/secure/scan")]
+    #[case("icap://host:1344/", "/")]
+    #[case("icap://host:1344", "/")]
+    #[case("*", "/")]
+    #[case("", "/")]
+    #[case("/", "/")]
+    fn normalize_service_path_cases(#[case] raw: &str, #[case] expected: &str) {
+        assert_eq!(normalize_service_path(raw), expected);
     }
 
     #[test]
@@ -1043,6 +1716,7 @@ Encapsulated: req-hdr=0, req-body={}, null-body={}\r\n\
             "OPTIONS icap://icap.example.org/icap/test ICAP/1.0\r\n\
              Host: icap.example.org\r\n\
              ThisIsBadHeader\r\n\
+             Encapsulated: null-body=0\r\n\
              \r\n",
         );
         let r = parse_icap_request(&raw).expect("parse");
@@ -1069,7 +1743,7 @@ Encapsulated: req-hdr=0, req-body={}, null-body={}\r\n\
                         \r\n";
         let err1 = parse_icap_request(raw_req).unwrap_err();
         assert!(
-            matches!(err1, Error::MissingHeader(h) if h == "Encapsulated"),
+            matches!(err1, Error::Protocol(ProtocolError::MissingHeader(h)) if h == "Encapsulated"),
             "expected MissingHeader(Encapsulated); got: {err1}"
         );
 
@@ -1078,7 +1752,7 @@ Encapsulated: req-hdr=0, req-body={}, null-body={}\r\n\
                          \r\n";
         let err2 = parse_icap_request(raw_resp).unwrap_err();
         assert!(
-            matches!(err2, Error::MissingHeader(h) if h == "Encapsulated"),
+            matches!(err2, Error::Protocol(ProtocolError::MissingHeader(h)) if h == "Encapsulated"),
             "expected MissingHeader(Encapsulated); got: {err2}"
         );
     }
@@ -1116,6 +1790,118 @@ Encapsulated: req-hdr=0, req-body={}, null-body={}\r\n\
     }
 
     #[test]
+    fn reqmod_rejects_response_oriented_encapsulated_parts() {
+        let raw = icap_bytes(
+            "REQMOD icap://icap.example.org/icap/test ICAP/1.0\r\n\
+             Host: icap.example.org\r\n\
+             Encapsulated: res-hdr=0\r\n\
+             \r\n\
+             HTTP/1.1 200 OK\r\n\
+             Content-Length: 0\r\n\
+             \r\n",
+        );
+        let err = parse_icap_request(&raw).unwrap_err();
+        let m = err.to_string().to_lowercase();
+        assert!(
+            m.contains("reqmod") && m.contains("encapsulated"),
+            "expected REQMOD Encapsulated validation error, got: {m}"
+        );
+    }
+
+    #[test]
+    fn respmod_rejects_request_body_encapsulated_part() {
+        let raw = icap_bytes(
+            "RESPMOD icap://icap.example.org/icap/test ICAP/1.0\r\n\
+             Host: icap.example.org\r\n\
+             Encapsulated: req-hdr=0, req-body=30\r\n\
+             \r\n\
+             GET / HTTP/1.1\r\n\
+             Host: example.com\r\n\
+             \r\n",
+        );
+        let err = parse_icap_request(&raw).unwrap_err();
+        let m = err.to_string().to_lowercase();
+        assert!(
+            m.contains("respmod") && m.contains("encapsulated"),
+            "expected RESPMOD Encapsulated validation error, got: {m}"
+        );
+    }
+
+    #[test]
+    fn null_body_must_not_be_combined_with_body_tokens() {
+        let raw = icap_bytes(
+            "REQMOD icap://icap.example.org/icap/test ICAP/1.0\r\n\
+             Host: icap.example.org\r\n\
+             Encapsulated: req-hdr=0, req-body=30, null-body=34\r\n\
+             \r\n\
+             GET / HTTP/1.1\r\n\
+             Host: example.com\r\n\
+             \r\n\
+             body",
+        );
+        let err = parse_icap_request(&raw).unwrap_err();
+        let m = err.to_string().to_lowercase();
+        assert!(
+            m.contains("null-body") && m.contains("body"),
+            "expected null-body/body validation error, got: {m}"
+        );
+    }
+
+    #[test]
+    fn options_request_rejects_embedded_http_parts() {
+        let raw = icap_bytes(
+            "OPTIONS icap://icap.example.org/icap/test ICAP/1.0\r\n\
+             Host: icap.example.org\r\n\
+             Encapsulated: req-hdr=0\r\n\
+             \r\n",
+        );
+        let err = parse_icap_request(&raw).unwrap_err();
+        let m = err.to_string().to_lowercase();
+        assert!(
+            m.contains("options") && m.contains("encapsulated"),
+            "expected OPTIONS Encapsulated validation error, got: {m}"
+        );
+    }
+
+    #[test]
+    fn compatibility_mode_accepts_options_without_encapsulated() {
+        let raw = icap_bytes(
+            "OPTIONS icap://icap.example.org/icap/test ICAP/1.0\r\n\
+             Host: icap.example.org\r\n\
+             \r\n",
+        );
+        let r = parse_icap_request_with_mode(&raw, RequestParserMode::Compatibility)
+            .expect("compatibility mode keeps OPTIONS lenient");
+        assert_eq!(r.method, Method::Options);
+    }
+
+    #[test]
+    fn default_parser_requires_encapsulated_for_options() {
+        let raw = icap_bytes(
+            "OPTIONS icap://icap.example.org/icap/test ICAP/1.0\r\n\
+             Host: icap.example.org\r\n\
+             \r\n",
+        );
+        let err = parse_icap_request(&raw).unwrap_err();
+        assert!(
+            matches!(err, Error::Protocol(ProtocolError::MissingHeader(h)) if h == "Encapsulated"),
+            "expected strict MissingHeader(Encapsulated), got: {err}"
+        );
+    }
+
+    #[test]
+    fn default_parser_accepts_options_with_null_body() {
+        let raw = icap_bytes(
+            "OPTIONS icap://icap.example.org/icap/test ICAP/1.0\r\n\
+             Host: icap.example.org\r\n\
+             Encapsulated: null-body=0\r\n\
+             \r\n",
+        );
+        let r = parse_icap_request(&raw).expect("strict parse");
+        assert_eq!(r.method, Method::Options);
+    }
+
+    #[test]
     fn parse_reqmod_with_allow_and_preview() {
         let raw = icap_bytes(
             "REQMOD icap://icap.example.org/icap/test ICAP/1.0\r\n\
@@ -1133,7 +1919,9 @@ Encapsulated: req-hdr=0, req-body={}, null-body={}\r\n\
     }
 
     #[test]
-    fn parse_preview_not_a_number_is_ignored() {
+    fn parse_preview_not_a_number_is_rejected() {
+        // RFC 3507 §4.5: `Preview` value must be a non-negative integer; a
+        // malformed value is a protocol error rather than "no preview".
         let raw = icap_bytes(
             "REQMOD icap://icap.example.org/icap/test ICAP/1.0\r\n\
              Host: icap.example.org\r\n\
@@ -1141,8 +1929,12 @@ Encapsulated: req-hdr=0, req-body={}, null-body={}\r\n\
              Encapsulated: req-hdr=0\r\n\
              \r\n",
         );
-        let r = parse_icap_request(&raw).expect("parse");
-        assert_eq!(r.preview_size, None);
+        let err = parse_icap_request(&raw).expect_err("malformed Preview must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Preview"),
+            "error should mention Preview, got: {msg}"
+        );
     }
 
     // ---------- Embedded HTTP ----------
@@ -1178,15 +1970,72 @@ Encapsulated: req-hdr=0, req-body={}, null-body={}\r\n\
     }
 
     #[test]
-    fn parse_minimal_options_without_http() {
+    fn rejects_incomplete_embedded_http_headers() {
+        let raw = icap_bytes(
+            "REQMOD icap://icap.example.org/icap/test ICAP/1.0\r\n\
+             Host: icap.example.org\r\n\
+             Encapsulated: req-hdr=0\r\n\
+             \r\n\
+             GET / HTTP/1.1\r\n\
+             Host: example.com\r\n",
+        );
+
+        let err = parse_icap_request(&raw).unwrap_err();
+        assert!(
+            matches!(err, Error::Protocol(ProtocolError::HttpParse(_))),
+            "expected embedded HTTP parse error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_respmod_with_http_request_start_line() {
+        let raw = icap_bytes(
+            "RESPMOD icap://icap.example.org/icap/test ICAP/1.0\r\n\
+             Host: icap.example.org\r\n\
+             Encapsulated: res-hdr=0\r\n\
+             \r\n\
+             GET / HTTP/1.1\r\n\
+             Host: example.com\r\n\
+             \r\n",
+        );
+
+        let err = parse_icap_request(&raw).unwrap_err();
+        assert!(
+            matches!(err, Error::Protocol(ProtocolError::HttpParse(_))),
+            "expected embedded HTTP status-line parse error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_respmod_with_invalid_status_code() {
+        let raw = icap_bytes(
+            "RESPMOD icap://icap.example.org/icap/test ICAP/1.0\r\n\
+             Host: icap.example.org\r\n\
+             Encapsulated: res-hdr=0\r\n\
+             \r\n\
+             HTTP/1.1 nope OK\r\n\
+             Content-Length: 0\r\n\
+             \r\n",
+        );
+
+        let err = parse_icap_request(&raw).unwrap_err();
+        assert!(
+            matches!(err, Error::Protocol(ProtocolError::HttpParse(_))),
+            "expected embedded HTTP status code parse error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_minimal_options_with_null_body() {
         let raw = icap_bytes(
             "OPTIONS icap://icap.example.org/icap/test ICAP/1.0\r\n\
              Host: icap.example.org\r\n\
+             Encapsulated: null-body=0\r\n\
              \r\n",
         );
         let r = parse_icap_request(&raw).expect("parse");
         assert_eq!(r.method, Method::Options);
-        assert_eq!(r.service, "test");
+        assert_eq!(r.service, "/icap/test");
         assert_eq!(
             r.icap_headers.get("Host").unwrap(),
             &HeaderValue::from_static("icap.example.org")
@@ -1195,90 +2044,5 @@ Encapsulated: req-hdr=0, req-body={}, null-body={}\r\n\
         assert!(!r.allow_204);
         assert!(!r.allow_206);
         assert_eq!(r.preview_size, None);
-    }
-}
-
-#[cfg(test)]
-mod rfc_tests {
-    //! RFC 3507 conformance tests for ICAP **requests**.
-    //!
-    //! These tests check:
-    //! - Method parsing (case-insensitive, unknown → panic by design)
-    //! - Service extraction from ICAP URI (last path segment)
-    //! - `Allow: 204/206` & `Preview: n` parsing (with whitespace variants)
-    //! - Embedded HTTP request/response extraction
-    //! - Case-insensitive headers
-    //! - Request-line/headers framing errors
-    use super::*;
-    use http::StatusCode as HttpStatus;
-
-    fn icap_bytes(s: &str) -> Vec<u8> {
-        s.as_bytes().to_vec()
-    }
-
-    #[test]
-    fn preview_zero_does_not_imply_ieof() {
-        let r: Request = Request::reqmod("svc").preview(0);
-        assert_eq!(r.preview_size, Some(0));
-        assert!(!r.preview_ieof);
-
-        let r2: Request = Request::reqmod("svc").preview(0).preview_ieof();
-        assert_eq!(r2.preview_size, Some(0));
-        assert!(r2.preview_ieof);
-    }
-
-    #[test]
-    fn rejects_embedded_http_without_encapsulated() {
-        let raw = b"REQMOD icap://icap.example.org/icap/test ICAP/1.0\r\n\
-                Host: icap.example.org\r\n\
-                \r\n\
-                GET / HTTP/1.1\r\n\
-                Host: example.com\r\n\
-                \r\n";
-        let err = parse_icap_request(raw).unwrap_err();
-        assert!(matches!(err, Error::MissingHeader(h) if h == "Encapsulated"));
-    }
-
-    #[test]
-    fn parses_embedded_http_response_with_res_hdr_token() {
-        let raw = icap_bytes(
-            "RESPMOD icap://icap.example.org/icap/test ICAP/1.0\r\n\
-             Host: icap.example.org\r\n\
-             Encapsulated: res-hdr=0\r\n\
-             \r\n\
-             HTTP/1.1 200 OK\r\n\
-             Content-Length: 5\r\n\
-             \r\n\
-             hello",
-        );
-        let r = parse_icap_request(&raw).expect("parse");
-        match r.embedded {
-            Some(EmbeddedHttp::Resp { ref head, ref body }) => {
-                assert_eq!(head.status(), HttpStatus::OK);
-                assert_eq!(head.headers().get("Content-Length").unwrap(), "5");
-                match body {
-                    Body::Full { reader } => assert_eq!(reader, b"hello"),
-                    _ => panic!("expected Full body"),
-                }
-            }
-            _ => panic!("expected embedded HTTP response"),
-        }
-    }
-
-    #[test]
-    fn request_line_must_have_method_uri_and_version() {
-        let raw = icap_bytes("REQMOD icap://h/s\r\n\r\n");
-        let err = parse_icap_request(&raw).unwrap_err();
-        assert!(
-            err.to_string().contains("Invalid request line"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn error_on_incomplete_headers_request_side() {
-        let raw = icap_bytes("REQMOD icap://h/s ICAP/1.0\r\nHost: h\r\n");
-        let err = parse_icap_request(&raw).unwrap_err();
-        assert!(err.to_string().contains("not complete"), "err: {err}");
     }
 }

@@ -4,17 +4,21 @@
 // - blocker:   returns ICAP 200 with an encapsulated HTTP 403 "Blocked!" page (for REQMOD & RESPMOD)
 
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use http::{HeaderMap, Response as HttpResponse, StatusCode as HttpStatus, Version};
-use icap_rs::request::{EmbeddedHttp, Request};
-use icap_rs::response::{Response, StatusCode};
+use icap_rs::request::{EmbeddedHttp, IncomingRequest};
+use icap_rs::response::Response;
 use icap_rs::server::Server;
 use icap_rs::server::options::ServiceOptions;
-use icap_rs::{Body, Method};
-use tracing::{error, info, warn};
+use icap_rs::server::timeouts::ServerTimeouts;
+use icap_rs::{Body, Method, ShutdownEvent};
+use tokio_util::task::TaskTracker;
+use tracing::{info, warn};
 
 const ISTAG_REQMOD_INIT: &str = "reqmod-1.0";
-const ISTAG_RESPMOD_INIT: &str = "respmod-1.0";
+// Base64-like token with '+' and '/' demonstrates c-icap-compatible ISTag values.
+const ISTAG_RESPMOD_INIT: &str = "QUJD+/8=";
 const ISTAG_BLOCKER_INIT: &str = "blocker-1.0";
 
 #[tokio::main]
@@ -22,6 +26,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::TRACE)
         .init();
+
+    // Background task tracker: tracks tasks the application wants to finish before exit.
+    // Pass it to the server so run_until() waits for them after connections drain.
+    let tracker = TaskTracker::new();
+
+    // Example: a background task that keeps running until the tracker is closed.
+    tracker.spawn({
+        async move {
+            info!("background task started");
+            // In a real application this might be a queue consumer, metrics flusher, etc.
+            // TaskTracker::wait() returns only after close() is called AND all spawned
+            // tasks complete, so this task will be awaited during graceful shutdown.
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            info!("background task finished");
+        }
+    });
 
     // Shared, mutable ISTag sources per service
     let req_tag = Arc::new(RwLock::new(String::from(ISTAG_REQMOD_INIT)));
@@ -32,28 +52,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let reqmod_opts = ServiceOptions::new()
         .with_istag_provider({
             let t = Arc::clone(&req_tag);
-            move |_req: &Request| t.read().unwrap().clone()
+            move |_req: &IncomingRequest| t.read().unwrap().clone()
         })
         .with_service("Request Modifier")
         .with_options_ttl(3600)
-        .add_allow("204")
+        .allow_204()
         .with_preview(1024);
 
     let respmod_opts = ServiceOptions::new()
         .with_istag_provider({
             let t = Arc::clone(&resp_tag);
-            move |_req: &Request| t.read().unwrap().clone()
+            move |_req: &IncomingRequest| t.read().unwrap().clone()
         })
         .with_service("Response Modifier")
         .with_options_ttl(3600)
-        .add_allow("204")
+        .allow_204()
         .with_preview(2048);
 
-    // Blocker: announce BOTH methods in OPTIONS (methods будут проставлены роутером)
+    // Blocker: announce both methods in OPTIONS; the router injects them.
     let blocker_opts = ServiceOptions::new()
         .with_istag_provider({
             let t = Arc::clone(&block_tag);
-            move |_req: &Request| t.read().unwrap().clone()
+            move |_req: &IncomingRequest| t.read().unwrap().clone()
         })
         .with_service("Request/Response Blocker")
         .with_options_ttl(3600)
@@ -66,12 +86,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             "reqmod",
             {
                 let t = Arc::clone(&req_tag);
-                move |request: Request| {
+                move |request: IncomingRequest| {
                     let t = Arc::clone(&t);
                     async move {
-                        info!("REQMOD called: {}", request.service);
+                        info!("REQMOD called: {}", request.service());
 
-                        if let Some(EmbeddedHttp::Req { head, .. }) = &request.embedded {
+                        if let Some(EmbeddedHttp::Req { head, .. }) = request.embedded() {
                             info!("HTTP {} {}", head.method(), head.uri());
                         } else {
                             warn!("REQMOD without embedded HTTP request");
@@ -79,14 +99,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
                         let istag_now = t.read().unwrap().clone();
 
-                        if can_return_204(&request.icap_headers) {
-                            return Ok(Response::no_content()
-                                .try_set_istag(&istag_now)?
+                        if can_return_204(request.icap_headers()) {
+                            return Ok(Response::no_content_with_istag(&istag_now)?
                                 .add_header("Server", "icap-rs/0.1.0"));
                         }
 
-                        Ok(Response::no_content()
-                            .try_set_istag(&istag_now)?
+                        Ok(Response::no_content_with_istag(&istag_now)?
                             .add_header("Server", "icap-rs/0.1.0"))
                     }
                 }
@@ -98,12 +116,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             "respmod",
             {
                 let t = Arc::clone(&resp_tag);
-                move |request: Request| {
+                move |request: IncomingRequest| {
                     let t = Arc::clone(&t);
                     async move {
-                        info!("RESPMOD called: {}", request.service);
+                        info!("RESPMOD called: {}", request.service());
+                        // Artificial delay — useful for manually testing graceful shutdown.
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
-                        if let Some(EmbeddedHttp::Resp { head, .. }) = &request.embedded {
+                        if let Some(EmbeddedHttp::Resp { head, .. }) = request.embedded() {
                             info!("HTTP status: {}", head.status());
                         } else {
                             warn!("RESPMOD without embedded HTTP response");
@@ -111,16 +131,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
                         let istag_now = t.read().unwrap().clone();
 
-                        if request.preview_size.is_some() && can_return_204(&request.icap_headers) {
-                            return Ok(Response::no_content()
-                                .try_set_istag(&istag_now)?
+                        if request.preview_size().is_some()
+                            && can_return_204(request.icap_headers())
+                        {
+                            return Ok(Response::no_content_with_istag(&istag_now)?
                                 .add_header("Server", "icap-rs/0.1.0"));
                         }
 
                         if let Some(EmbeddedHttp::Resp {
                             head,
                             body: Body::Full { reader },
-                        }) = &request.embedded
+                            ..
+                        }) = request.embedded()
                         {
                             let mut builder = http::Response::builder()
                                 .status(head.status())
@@ -133,17 +155,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                     http::HeaderValue::from_str(&reader.len().to_string()).unwrap(),
                                 );
                             }
-                            let http_resp = builder
-                                .body(reader.clone())
-                                .map_err(|e| format!("build http::Response: {e}"))?;
+                            let http_resp = builder.body(reader.clone()).map_err(|e| {
+                                icap_rs::HandlerError::internal(format!(
+                                    "build http::Response: {e}"
+                                ))
+                            })?;
 
-                            return Ok(Response::new(StatusCode::OK, "OK")
-                                .try_set_istag(&istag_now)?
+                            return Ok(Response::ok_with_istag(&istag_now)?
                                 .with_http_response(&http_resp)?
                                 .add_header("Server", "icap-rs/0.1.0"));
                         }
-                        Ok(Response::no_content()
-                            .try_set_istag(&istag_now)?
+                        Ok(Response::no_content_with_istag(&istag_now)?
                             .add_header("Server", "icap-rs/0.1.0"))
                     }
                 }
@@ -156,17 +178,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             [Method::ReqMod, Method::RespMod],
             {
                 let t = Arc::clone(&block_tag);
-                move |request: Request| {
+                move |request: IncomingRequest| {
                     let t = Arc::clone(&t);
                     async move {
-                        if request.method == Method::ReqMod {
-                            if let Some(EmbeddedHttp::Req { head, .. }) = &request.embedded {
+                        if request.method() == Method::ReqMod {
+                            if let Some(EmbeddedHttp::Req { head, .. }) = request.embedded() {
                                 info!("BLOCKER REQMOD for {} {}", head.method(), head.uri());
                             } else {
                                 warn!("BLOCKER: REQMOD without embedded HTTP request");
                             }
-                        } else if request.method == Method::RespMod {
-                            if let Some(EmbeddedHttp::Resp { head, .. }) = &request.embedded {
+                        } else if request.method() == Method::RespMod {
+                            if let Some(EmbeddedHttp::Resp { head, .. }) = request.embedded() {
                                 info!("BLOCKER RESPMOD, upstream status {}", head.status());
                             } else {
                                 warn!("BLOCKER: RESPMOD without embedded HTTP response");
@@ -175,33 +197,59 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
                         let istag_now = t.read().unwrap().clone();
                         let http = build_block_403_http("Blocked!", &istag_now);
-                        Response::new(StatusCode::OK, "OK")
-                            .try_set_istag(&istag_now)?
-                            .with_http_response(&http)
+                        Ok(Response::ok_with_istag(&istag_now)?.with_http_response(&http)?)
                     }
                 }
             },
             Some(blocker_opts),
         )
+        .with_timeouts(ServerTimeouts::new().with_shutdown_drain(Duration::from_secs(30)))
+        .with_task_tracker(tracker)
+        .on_shutdown_event(|event| match event {
+            ShutdownEvent::Draining {
+                active_connections,
+                drain_timeout,
+            } => {
+                warn!(
+                    "server shutting down — {active_connections} connection(s) still active; \
+                     new connections will be refused"
+                );
+                if let Some(d) = drain_timeout {
+                    warn!("force-close in {d:.1?}");
+                } else {
+                    warn!("no drain timeout — waiting indefinitely");
+                }
+            }
+            ShutdownEvent::DrainTimedOut {
+                remaining_connections,
+            } => {
+                warn!(
+                    "drain timeout expired — cancelling {remaining_connections} \
+                     remaining connection(s)"
+                );
+            }
+            _ => {}
+        })
         .build()
         .await?;
 
     info!("ICAP server started on 127.0.0.1:1344 (services: reqmod, respmod, blocker)");
-    if let Err(e) = server.run().await {
-        error!("server error: {e}");
-        return Err(e.into());
-    }
+    info!("press Ctrl-C to shut down gracefully (30s drain timeout)");
+    server
+        .run_until(async {
+            tokio::signal::ctrl_c().await.ok();
+        })
+        .await?;
     Ok(())
 }
 
 fn can_return_204(h: &HeaderMap) -> bool {
     h.get("Allow")
         .and_then(|v| v.to_str().ok())
-        .map(|s| s.split(',').any(|p| p.trim().eq_ignore_ascii_case("204")))
-        .unwrap_or(false)
+        .is_some_and(|s| s.split(',').any(|p| p.trim().eq_ignore_ascii_case("204")))
 }
 
-/// Build a simple HTTP 403 page with a reason (as http::Response<Vec<u8>>).
+/// Build a simple HTTP 403 page with a reason (as `http::Response<Vec<u8>>`).
 fn build_block_403_http(reason: &str, istag: &str) -> HttpResponse<Vec<u8>> {
     let html = format!(
         r#"<!DOCTYPE html>
@@ -212,10 +260,9 @@ fn build_block_403_http(reason: &str, istag: &str) -> HttpResponse<Vec<u8>> {
 </head>
 <body>
   <h1>Blocked!</h1>
-  <p>{}</p>
+  <p>{reason}</p>
 </body>
 </html>"#,
-        reason
     );
 
     HttpResponse::builder()

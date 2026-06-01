@@ -3,11 +3,13 @@ use std::time::Duration;
 
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
-use tokio::time::{sleep, timeout};
+use tokio::time::{Instant, sleep, timeout};
 
 use icap_rs::client::Client;
-use icap_rs::request::Request;
-use icap_rs::response::{Response, StatusCode};
+use icap_rs::error::Error;
+use icap_rs::request::{IncomingRequest, Request};
+use icap_rs::response::{ParsedResponse, Response, StatusCode};
+use icap_rs::server::ServiceOptions;
 
 fn find_free_port() -> u16 {
     let sock = StdTcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
@@ -23,12 +25,12 @@ async fn spawn_server_with_limit(limit: usize) -> (String, JoinHandle<()>) {
         .with_max_connections(limit)
         .route_reqmod(
             "svc-options",
-            |_: Request| async move {
+            |_: IncomingRequest| async move {
                 Ok(Response::new(StatusCode::OK, "OK")
                     .try_set_istag("x")
                     .unwrap())
             },
-            None,
+            Some(ServiceOptions::new().with_static_istag("svc-options-1.0")),
         )
         .build()
         .await
@@ -65,19 +67,43 @@ async fn early_503_when_conn_limit_exceeded() {
     let (addr, _handle) = spawn_server_with_limit(1).await;
 
     let _hold = TcpStream::connect(&addr).await.expect("occupy permit");
-    sleep(Duration::from_millis(40)).await;
 
     let sa: SocketAddr = addr.parse().unwrap();
     let client = make_client("127.0.0.1", sa.port());
     let req = Request::options("svc-options");
 
-    let resp: Response = timeout(Duration::from_secs(1), client.send(&req))
-        .await
-        .expect("client.send timed out")
-        .expect("client.send failed");
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let resp: ParsedResponse = loop {
+        let result = timeout(Duration::from_millis(200), client.send(&req)).await;
+        match result {
+            Ok(Ok(resp)) if resp.status_code() == StatusCode::SERVICE_UNAVAILABLE => break resp,
+            Ok(Ok(resp)) if resp.status_code() == StatusCode::OK && Instant::now() < deadline => {
+                sleep(Duration::from_millis(10)).await;
+            }
+            Ok(Ok(resp)) => break resp,
+            Ok(Err(err)) if Instant::now() < deadline => {
+                if matches!(
+                    err,
+                    Error::Io(ref io_err)
+                        if matches!(
+                            io_err.kind(),
+                            std::io::ErrorKind::ConnectionAborted
+                                | std::io::ErrorKind::ConnectionReset
+                        )
+                ) {
+                    sleep(Duration::from_millis(10)).await;
+                    continue;
+                }
+                panic!("client.send failed: {err}");
+            }
+            Ok(Err(err)) => panic!("client.send failed: {err}"),
+            Err(_) if Instant::now() < deadline => {}
+            Err(elapsed) => panic!("client.send timed out after {elapsed:?}"),
+        }
+    };
 
     assert_eq!(
-        resp.status_code,
+        resp.status_code(),
         StatusCode::SERVICE_UNAVAILABLE,
         "expected early 503 produced by server accept loop"
     );
@@ -85,7 +111,7 @@ async fn early_503_when_conn_limit_exceeded() {
     let enc = resp
         .get_header("Encapsulated")
         .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_ascii_lowercase());
+        .map(str::to_ascii_lowercase);
     if let Some(v) = enc {
         assert_eq!(v, "null-body=0");
     }
@@ -98,17 +124,17 @@ async fn not_found_404_for_unknown_service() {
     let client = make_client("127.0.0.1", sa.port());
 
     let req = Request::reqmod("non-existent-service");
-    let resp: Response = timeout(Duration::from_secs(1), client.send(&req))
+    let resp: ParsedResponse = timeout(Duration::from_secs(1), client.send(&req))
         .await
         .expect("client.send timed out")
         .expect("client.send failed");
 
-    assert_eq!(resp.status_code, StatusCode::NOT_FOUND);
+    assert_eq!(resp.status_code(), StatusCode::NOT_FOUND);
 
     if let Some(v) = resp
         .get_header("Encapsulated")
         .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_ascii_lowercase())
+        .map(str::to_ascii_lowercase)
     {
         assert_eq!(v, "null-body=0");
     }

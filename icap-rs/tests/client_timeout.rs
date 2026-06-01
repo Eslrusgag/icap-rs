@@ -1,5 +1,5 @@
-use icap_rs::error::{Error, IcapResult};
-use icap_rs::response::StatusCode as IcapStatus;
+use icap_rs::error::{Error, IcapResult, TimeoutError, TimeoutKind};
+use icap_rs::response::{ParsedResponse, StatusCode as IcapStatus};
 use icap_rs::{Client, Request};
 use std::time::Duration;
 use tokio::{
@@ -8,7 +8,7 @@ use tokio::{
     task::JoinHandle,
 };
 
-pub fn options_200_wire() -> &'static [u8] {
+pub const fn options_200_wire() -> &'static [u8] {
     b"ICAP/1.0 200 OK\r\n\
       ISTag: x\r\n\
       Encapsulated: null-body=0\r\n\
@@ -60,13 +60,10 @@ pub async fn spawn_slow_icap_server(
     (addr, h)
 }
 
-async fn do_options_once(
-    uri: &str,
-    timeout_secs: Option<u64>,
-) -> IcapResult<icap_rs::response::Response> {
+async fn do_options_once(uri: &str, timeout_secs: Option<u64>) -> IcapResult<ParsedResponse> {
     let client = Client::builder()
         .with_uri(uri)?
-        .read_timeout(timeout_secs.map(Duration::from_secs))
+        .timeout(timeout_secs.map(Duration::from_secs))
         .build();
     let req = Request::options("/");
     client.send(&req).await
@@ -82,15 +79,17 @@ async fn timeout_fires_when_server_is_too_slow() {
     let elapsed = started.elapsed();
 
     match res {
-        Err(Error::ClientTimeout(d)) => {
+        Err(Error::Timeout(TimeoutError {
+            kind: TimeoutKind::ClientTotal,
+            duration: d,
+        })) => {
             assert_eq!(d.as_secs(), 1);
             assert!(
                 elapsed >= Duration::from_millis(900),
-                "returned too fast: {:?}",
-                elapsed
+                "returned too fast: {elapsed:?}"
             );
         }
-        other => panic!("expected timeout error, got: {:?}", other),
+        other => panic!("expected timeout error, got: {other:?}"),
     }
 }
 
@@ -106,7 +105,7 @@ async fn no_timeout_allows_fast_server() {
         res.err()
     );
     let resp = res.unwrap();
-    assert!(matches!(resp.status_code, IcapStatus::OK));
+    assert!(matches!(resp.status_code(), IcapStatus::OK));
 }
 
 #[tokio::test]
@@ -121,5 +120,5 @@ async fn small_timeout_but_server_responds_in_time() {
         res.err()
     );
     let resp = res.unwrap();
-    assert!(matches!(resp.status_code, IcapStatus::OK));
+    assert!(matches!(resp.status_code(), IcapStatus::OK));
 }
