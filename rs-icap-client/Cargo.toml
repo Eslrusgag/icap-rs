@@ -3,6 +3,7 @@ name = "rs-icap-client"
 version = "0.3.0"
 edition.workspace = true
 description = "ICAP client on Rust"
+publish = false
 repository.workspace = true
 license.workspace = true
 keywords.workspace = true
