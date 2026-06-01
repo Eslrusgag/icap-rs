@@ -339,7 +339,7 @@ mod tests {
     fn positive_ttl_is_parsed() {
         assert_eq!(
             parse_options_ttl(&response_with_ttl("60")),
-            Some(Duration::from_secs(60))
+            Some(Duration::from_mins(1))
         );
     }
 

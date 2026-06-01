@@ -764,7 +764,7 @@ impl CacheBenchEnv {
             .port(port)
             .keep_alive(true)
             .with_options_cache(
-                OptionsCacheConfig::new().with_default_ttl(Duration::from_secs(3600)),
+                OptionsCacheConfig::new().with_default_ttl(Duration::from_hours(1)),
             )
             .build();
 

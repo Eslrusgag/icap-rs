@@ -466,7 +466,7 @@ async fn preview_non_ieof_requires_100_continue_before_remainder() {
     stream.write_all(&tail_wire).await.expect("write tail");
 
     let mut final_resp = Vec::new();
-    tokio::time::timeout(Duration::from_millis(1000), async {
+    tokio::time::timeout(Duration::from_secs(1), async {
         let mut tmp = [0u8; 8192];
         loop {
             let n = stream.read(&mut tmp).await.expect("read final response");
@@ -678,7 +678,7 @@ async fn preview_handler_continue_reads_remainder_and_calls_full_route() {
     stream.flush().await.expect("flush remainder");
 
     let mut final_resp = Vec::new();
-    tokio::time::timeout(Duration::from_millis(1000), async {
+    tokio::time::timeout(Duration::from_secs(1), async {
         let mut tmp = [0u8; 4096];
         loop {
             let n = stream.read(&mut tmp).await.expect("read final response");
