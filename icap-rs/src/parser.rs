@@ -1,0 +1,11 @@
+pub mod http_embed;
+pub mod icap;
+pub mod wire;
+
+pub use icap::{
+    canon_icap_header, http_version_str, parse_encapsulated_header, serialize_icap_response,
+};
+
+pub use wire::{read_chunked_to_end, write_chunk, write_chunk_into};
+
+pub use http_embed::{serialize_http_request, serialize_http_response};

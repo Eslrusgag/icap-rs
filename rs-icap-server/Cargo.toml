@@ -1,15 +1,4 @@
 [package]
 name = "rs-icap-server"
-version = "0.3.0"
-edition.workspace = true
-description = "ICAP server on Rust"
-readme = "../README.md"
-repository.workspace = true
-license.workspace = true
-keywords.workspace = true
-categories.workspace = true
-# Not published to crates.io: placeholder binary, released only via the repo.
-publish = false
-
-[lints]
-workspace = true
+version = "0.1.0"
+edition = "2024"

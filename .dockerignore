@@ -1,6 +1,6 @@
 /target
 /test_data
 /deployment/builded
-/deployment/scripts
+/scripts
 Cargo.lock
 .idea

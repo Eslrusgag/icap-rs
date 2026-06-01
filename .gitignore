@@ -2,3 +2,4 @@
 /test_data
 deployment/
 .idea
+Cargo.lock

@@ -1,27 +1,55 @@
-mod common;
-
-use common::{find_free_port, wait_port_ready};
 use http::{Request as HttpRequest, Response as HttpResponse, Version};
 use icap_rs::error::IcapResult;
 use icap_rs::server::options::ServiceOptions;
-use icap_rs::{Client, IncomingRequest, Request, Response, Server, StatusCode};
+use icap_rs::{Client, Request, Response, Server, StatusCode};
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use tokio::io::AsyncWrite;
+use tokio::time::Duration;
 
 const ISTAG: &str = "stream-writer-1";
 const ECHO_BODY: &str = "streamed-body";
 
-async fn start_server() -> (String, u16) {
-    let port = find_free_port();
-    let addr = format!("127.0.0.1:{port}");
+#[derive(Default)]
+struct VecWriter {
+    buf: Vec<u8>,
+}
+
+impl VecWriter {
+    fn into_inner(self) -> Vec<u8> {
+        self.buf
+    }
+}
+
+impl AsyncWrite for VecWriter {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        self.buf.extend_from_slice(buf);
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+async fn start_server(port: u16) {
     let opts = ServiceOptions::new()
-        .with_static_istag(ISTAG)
         .with_service("Streaming Writer Test")
         .add_allow("204");
 
     let server = Server::builder()
-        .bind(&addr)
+        .bind(&format!("127.0.0.1:{port}"))
         .route_reqmod(
             "scan",
-            |_req: IncomingRequest| async move {
+            |_req: Request| async move {
                 let http_resp = HttpResponse::builder()
                     .status(200)
                     .version(Version::HTTP_11)
@@ -30,9 +58,9 @@ async fn start_server() -> (String, u16) {
                     .body(ECHO_BODY.as_bytes().to_vec())
                     .unwrap();
 
-                Ok(Response::new(StatusCode::OK, "OK")
+                Response::new(StatusCode::OK, "OK")
                     .try_set_istag(ISTAG)?
-                    .with_http_response(&http_resp)?)
+                    .with_http_response(&http_resp)
             },
             Some(opts),
         )
@@ -44,13 +72,14 @@ async fn start_server() -> (String, u16) {
         let _ = server.run().await;
     });
 
-    wait_port_ready(&addr).await;
-    (addr, port)
+    tokio::time::sleep(Duration::from_millis(60)).await;
 }
 
 #[tokio::test]
-async fn streaming_response_is_buffered_in_response_body() -> IcapResult<()> {
-    let (_addr, port) = start_server().await;
+async fn streaming_response_is_forwarded_to_writer_and_not_buffered_in_response() -> IcapResult<()>
+{
+    let port = 13531;
+    start_server(port).await;
 
     let client = Client::builder().host("127.0.0.1").port(port).build();
 
@@ -66,42 +95,28 @@ async fn streaming_response_is_buffered_in_response_body() -> IcapResult<()> {
     let req = Request::reqmod("scan")
         .preview(0)
         .preview_ieof()
-        .with_http_request_head(req_head)?;
+        .with_http_request_head(req_head);
 
+    let mut writer = VecWriter::default();
     let resp = client
-        .send_streaming_reader(&req, tokio::io::empty())
+        .send_streaming_reader_into_writer(&req, tokio::io::empty(), &mut writer)
         .await?;
 
-    assert_eq!(resp.status_code(), StatusCode::OK);
+    assert_eq!(resp.status_code, StatusCode::OK);
+    assert!(resp.body.is_empty(), "response body must stay unbuffered");
 
-    let text = String::from_utf8_lossy(resp.body());
-
+    let payload = writer.into_inner();
+    let s = String::from_utf8(payload).expect("utf8 payload");
+    let s_lc = s.to_ascii_lowercase();
     assert!(
-        text.starts_with("HTTP/1.1 200 OK\r\n"),
-        "expected encapsulated HTTP response head, got:\n{text}"
+        s.starts_with("HTTP/1.1 200 OK\r\n"),
+        "unexpected payload: {s}"
     );
-
     assert!(
-        text.to_ascii_lowercase()
-            .contains("content-type: text/plain"),
-        "expected Content-Type header, got:\n{text}"
+        s_lc.contains("content-length: 13\r\n"),
+        "missing content-length in payload: {s}"
     );
-
-    assert!(
-        text.to_ascii_lowercase().contains("content-length: 13"),
-        "expected Content-Length header, got:\n{text}"
-    );
-
-    let sep = b"\r\n\r\n";
-
-    let body_start = resp
-        .body()
-        .windows(sep.len())
-        .position(|w| w == sep)
-        .map(|pos| pos + sep.len())
-        .expect("encapsulated HTTP response must contain header/body separator");
-
-    assert_eq!(&resp.body()[body_start..], ECHO_BODY.as_bytes());
+    assert!(s.ends_with(ECHO_BODY), "payload tail mismatch: {s}");
 
     Ok(())
 }

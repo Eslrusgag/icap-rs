@@ -1,6 +1,0 @@
-services:
-  c-icap:
-    build:
-      context: .
-    ports:
-      - "1345:1344"
