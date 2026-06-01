@@ -205,19 +205,19 @@ impl ServerBuilder {
     ///   Returning `PreviewDecision::Continue` resumes the RFC preview flow; the
     ///   same handler is called again with `Body::Full` after the remainder is read.
     ///
-    /// ## When handlers are NOT called
+    /// ## Handler invocation and the `Allow: 204` header
+    ///
+    /// The handler is **always called** for every REQMOD/RESPMOD request.
     ///
     /// RFC 3507 §4.6 prohibits the server from returning `204 No Content` unless
-    /// the client explicitly advertised `Allow: 204`. When neither `Allow: 204`
-    /// nor a `Preview` header is present in the request, the server has no way to
-    /// signal "no modification needed" without sending back a full `200` response
-    /// with the encapsulated HTTP message. In that case **the handler is bypassed**
-    /// and the server echoes the original embedded HTTP message in a `200 OK`
-    /// response automatically.
+    /// the client explicitly advertised `Allow: 204`. When the handler returns
+    /// `204` but the client did not send `Allow: 204`, the server automatically
+    /// converts the response: it echoes the original embedded HTTP message in a
+    /// `200 OK` (or `206 Partial Content` if `Allow: 206` was sent).
     ///
-    /// To ensure your handler is always invoked, either:
-    /// - configure the ICAP client to send `Allow: 204`, or
-    /// - use `Preview` (the handler is always called in the preview path).
+    /// This means handlers can always return `Response::no_content()` to signal
+    /// "no modification needed" — the server takes care of the RFC-compliant
+    /// wrapping regardless of what the client advertised.
     pub fn route<MIt, MItem, F, Fut>(
         mut self,
         service: &str,

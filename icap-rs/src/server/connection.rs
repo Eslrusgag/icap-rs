@@ -19,7 +19,7 @@ use crate::request::{
     IncomingRequest, RequestParserMode, normalize_service_path, parse_icap_request,
     parse_icap_request_with_mode,
 };
-use crate::{Body, EmbeddedHttp, Method, Response, StatusCode};
+use crate::{Method, Response, StatusCode};
 
 use super::Server;
 use super::options::OptionsResponseBuilder;
@@ -589,88 +589,38 @@ impl Server {
                 } else {
                     let allow_204 = req.allow_204;
                     let allow_206 = req.allow_206;
-                    let has_preview = req.icap_headers.get("Preview").is_some();
 
-                    if !allow_204 && !has_preview {
-                        // RFC 3507 §4.6: the client did not advertise Allow:204
-                        // and sent no Preview, so the server cannot return 204.
-                        // The handler is skipped; the embedded HTTP message is
-                        // echoed back in a 200 response unchanged.
-                        trace!(
-                            client = %addr,
-                            service = %service_resolved,
-                            method = %method,
-                            "bypassing handler: client sent no Allow:204 and no Preview"
-                        );
-                        let Some(options) = entry.options.as_ref() else {
-                            return Err(Error::service(format!(
-                                "Service '{}' has no explicit OPTIONS configuration with ISTag",
-                                service_resolved.as_ref()
-                            )));
-                        };
-                        let istag_now = options.istag_for(&req)?;
-
-                        if allow_206
-                            && let Some(out) =
-                                Self::build_206_use_original_body(&req, method, &istag_now)?
-                        {
-                            out
-                        } else {
-                            let mut out = Response::ok_with_istag(&istag_now)?;
-
-                            match (&req.embedded, method) {
-                                (
-                                    Some(EmbeddedHttp::Resp {
-                                        head,
-                                        body: Body::Full { reader },
-                                        ..
-                                    }),
-                                    Method::RespMod,
-                                ) => {
-                                    let mut builder = http::Response::builder()
-                                        .status(head.status())
-                                        .version(head.version());
-                                    if let Some(h) = builder.headers_mut() {
-                                        h.extend(head.headers().clone());
+                    if let Some(handler_entry) = entry.handlers.get(&method) {
+                        // RFC 3507 §4.6: pre-compute the fallback response for the case
+                        // where the handler returns 204 but the client did not advertise
+                        // Allow:204. Must be built before `req` is consumed by the handler.
+                        let fallback_204 = if !allow_204 {
+                            if let Some(options) = entry.options.as_ref() {
+                                if let Ok(istag) = options.istag_for(&req) {
+                                    if allow_206 {
+                                        Self::build_206_use_original_body(&req, method, &istag)?
+                                            .or_else(|| {
+                                                Self::build_200_echo_response(&req, method, &istag)
+                                                    .ok()
+                                            })
+                                    } else {
+                                        Self::build_200_echo_response(&req, method, &istag).ok()
                                     }
-                                    let http_resp = builder.body(reader.clone()).map_err(|e| {
-                                        Error::body(format!(
-                                            "build http::Response from embedded: {e}"
-                                        ))
-                                    })?;
-                                    out = out.with_http_response(&http_resp)?;
+                                } else {
+                                    None
                                 }
-                                (
-                                    Some(EmbeddedHttp::Req {
-                                        head,
-                                        body: Body::Full { reader },
-                                    }),
-                                    Method::ReqMod,
-                                ) => {
-                                    let mut builder = http::Request::builder()
-                                        .method(head.method().clone())
-                                        .uri(head.uri().clone())
-                                        .version(head.version());
-                                    if let Some(h) = builder.headers_mut() {
-                                        h.extend(head.headers().clone());
-                                    }
-                                    let http_req = builder.body(reader.clone()).map_err(|e| {
-                                        Error::body(format!(
-                                            "build http::Request from embedded: {e}"
-                                        ))
-                                    })?;
-                                    out = out.with_http_request(&http_req)?;
-                                }
-                                _ => {}
+                            } else {
+                                None
                             }
+                        } else {
+                            None
+                        };
 
-                            out
-                        }
-                    } else if let Some(handler_entry) = entry.handlers.get(&method) {
                         let log_service = service_resolved.to_string();
                         req.meta.istag =
                             entry.options.as_ref().and_then(|o| o.istag_for(&req).ok());
-                        match (handler_entry.handler)(req).await {
+
+                        let raw = match (handler_entry.handler)(req).await {
                             Ok(PreviewDecision::Respond(resp)) => resp,
                             Ok(PreviewDecision::Continue) => {
                                 warn!(
@@ -692,6 +642,19 @@ impl Server {
                                 );
                                 err.into_response()
                             }
+                        };
+
+                        // RFC 3507 §4.6: convert 204 to echo when client didn't allow it.
+                        if raw.status_code == StatusCode::NO_CONTENT && !allow_204 {
+                            trace!(
+                                client = %addr,
+                                service = %log_service,
+                                method = %method,
+                                "converting handler 204 to echo (client did not send Allow:204)"
+                            );
+                            fallback_204.unwrap_or(raw)
+                        } else {
+                            raw
                         }
                     } else {
                         Response::new(StatusCode::METHOD_NOT_ALLOWED, "Method Not Allowed")
