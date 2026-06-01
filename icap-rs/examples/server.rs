@@ -141,6 +141,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         if let Some(EmbeddedHttp::Resp {
                             head,
                             body: Body::Full { reader },
+                            ..
                         }) = request.embedded()
                         {
                             let mut builder = http::Response::builder()

@@ -35,7 +35,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .route_respmod(
             "sanitize",
             move |req: IncomingRequest| async move {
-                let Some(EmbeddedHttp::Resp { head, body }) = req.embedded() else {
+                let Some(EmbeddedHttp::Resp { head, body, .. }) = req.embedded() else {
                     return Ok(Response::no_content_with_istag(ISTAG)?);
                 };
 

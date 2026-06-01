@@ -129,9 +129,14 @@ the preview handshake before invoking them. Preview-aware handlers (return type
 
 ```
 EmbeddedHttp<R>
-  Req  { head: HttpRequest<()>,  body: Body<R> }
-  Resp { head: HttpResponse<()>, body: Body<R> }
+  Req  { head: HttpRequest<()>,                           body: Body<R> }
+  Resp { req_head: Option<HttpRequest<()>>,  head: HttpResponse<()>, body: Body<R> }
 ```
+
+`Resp::req_head` carries the optional HTTP request context from the `req-hdr`
+Encapsulated section of a RESPMOD request (RFC 3507 §4.4.1).  It is `Some`
+when the ICAP sender included the originating HTTP request headers; `None`
+otherwise.  Accessible via `EmbeddedHttp::respmod_request_head()`.
 
 The HTTP head is always fully parsed and available. The body follows the
 `Body<R>` variants described above.

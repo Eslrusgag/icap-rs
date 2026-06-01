@@ -1860,3 +1860,187 @@ mod section_7_1_proxy_authentication {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// RFC 3507 §4.4.1 — RESPMOD optional req-hdr context
+// ---------------------------------------------------------------------------
+//
+// A RESPMOD request MAY carry the originating HTTP request headers in a
+// `req-hdr` section, in addition to `res-hdr` and `res-body`.  The grammar
+// (RFC 3507 §4.4.1) explicitly allows this:
+//
+//   RESPMOD request  encapsulated_list: [reqhdr] [reshdr] resbody
+//
+// The server MUST parse it and expose it to handlers via
+// `EmbeddedHttp::respmod_request_head()`.
+
+mod section_4_4_1_respmod_req_hdr {
+    use super::*;
+    use icap_rs::request::EmbeddedHttp;
+    use tokio::io::AsyncWriteExt;
+
+    async fn start_req_hdr_capture_server(
+        tx: tokio::sync::oneshot::Sender<Option<String>>,
+    ) -> u16 {
+        let port = unused_port();
+        let tx = std::sync::Mutex::new(Some(tx));
+        let handler = move |req: IncomingRequest| {
+            let captured = req
+                .embedded()
+                .and_then(EmbeddedHttp::respmod_request_head)
+                .and_then(|h| h.headers().get("x-original-req"))
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+            let sender = tx.lock().unwrap().take();
+            async move {
+                if let Some(s) = sender {
+                    let _ = s.send(captured);
+                }
+                Ok::<Response, icap_rs::HandlerError>(Response::no_content().try_set_istag(ISTAG)?)
+            }
+        };
+        let server = Server::builder()
+            .bind(&format!("127.0.0.1:{port}"))
+            .route_respmod(
+                "respmod",
+                handler,
+                Some(ServiceOptions::new().with_static_istag(ISTAG).add_allow("204")),
+            )
+            .build()
+            .await
+            .expect("build req-hdr server");
+        tokio::spawn(async move {
+            let _ = server.run().await;
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        port
+    }
+
+    /// RFC 3507 §4.4.1 — when a RESPMOD request includes `req-hdr`, the server
+    /// parses and exposes the HTTP request context to handlers.
+    #[tokio::test]
+    async fn rfc4_4_1_respmod_req_hdr_is_parsed_and_exposed_to_handler() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<Option<String>>();
+        let port = start_req_hdr_capture_server(tx).await;
+
+        // Build the req-hdr section: minimal HTTP request head.
+        let req_head = b"GET /resource HTTP/1.1\r\nHost: origin.example\r\nX-Original-Req: marker-123\r\n\r\n";
+        let req_head_len = req_head.len();
+
+        // Build the res-hdr section: HTTP response head.
+        let res_head = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 5\r\n\r\n";
+        let res_head_len = res_head.len();
+
+        // res-body: chunked body
+        let res_body = b"5\r\nhello\r\n0\r\n\r\n";
+
+        let res_hdr_offset = req_head_len;
+        let res_body_offset = req_head_len + res_head_len;
+
+        let icap_head = format!(
+            "RESPMOD icap://127.0.0.1:{port}/respmod ICAP/1.0\r\n\
+             Host: 127.0.0.1:{port}\r\n\
+             Allow: 204\r\n\
+             Encapsulated: req-hdr=0, res-hdr={res_hdr_offset}, res-body={res_body_offset}\r\n\
+             \r\n"
+        );
+
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
+            .expect("connect");
+        stream.write_all(icap_head.as_bytes()).await.expect("write icap head");
+        stream.write_all(req_head).await.expect("write req head");
+        stream.write_all(res_head).await.expect("write res head");
+        stream.write_all(res_body).await.expect("write res body");
+        stream.flush().await.expect("flush");
+
+        let mut buf = vec![0u8; 4096];
+        let _n = stream.read(&mut buf).await.expect("read response");
+
+        let captured = tokio::time::timeout(Duration::from_secs(2), rx)
+            .await
+            .expect("timeout")
+            .expect("recv");
+
+        assert_eq!(
+            captured.as_deref(),
+            Some("marker-123"),
+            "handler must see X-Original-Req from req-hdr context"
+        );
+    }
+
+    /// RFC 3507 §4.4.1 — RESPMOD without req-hdr: req_head is None, handler works normally.
+    #[tokio::test]
+    async fn rfc4_4_1_respmod_without_req_hdr_req_head_is_none() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<Option<String>>();
+        let port = start_req_hdr_capture_server(tx).await;
+
+        let res_head = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\n";
+        let res_head_len = res_head.len();
+        let res_body = b"5\r\nhello\r\n0\r\n\r\n";
+
+        let icap_head = format!(
+            "RESPMOD icap://127.0.0.1:{port}/respmod ICAP/1.0\r\n\
+             Host: 127.0.0.1:{port}\r\n\
+             Allow: 204\r\n\
+             Encapsulated: res-hdr=0, res-body={res_head_len}\r\n\
+             \r\n"
+        );
+
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
+            .expect("connect");
+        stream.write_all(icap_head.as_bytes()).await.expect("write icap head");
+        stream.write_all(res_head).await.expect("write res head");
+        stream.write_all(res_body).await.expect("write res body");
+        stream.flush().await.expect("flush");
+
+        let mut buf = vec![0u8; 4096];
+        let _n = stream.read(&mut buf).await.expect("read response");
+
+        let captured = tokio::time::timeout(Duration::from_secs(2), rx)
+            .await
+            .expect("timeout")
+            .expect("recv");
+
+        assert!(
+            captured.is_none(),
+            "req_head must be None when no req-hdr was sent"
+        );
+    }
+
+    /// RFC 3507 §4.4.1 — client can include req-hdr context when sending RESPMOD.
+    #[test]
+    fn rfc4_4_1_client_builder_with_request_context_sets_req_head() {
+        let orig_req = HttpRequest::builder()
+            .method("GET")
+            .uri("/resource")
+            .version(Version::HTTP_11)
+            .header("Host", "origin.example")
+            .body(())
+            .expect("http request");
+
+        let http_resp = HttpResponse::builder()
+            .status(HttpStatus::OK)
+            .version(Version::HTTP_11)
+            .header("Content-Type", "text/html")
+            .body(b"hello".to_vec())
+            .expect("http response");
+
+        let req = Request::respmod("respmod")
+            .with_http_response_and_request_context(http_resp, orig_req)
+            .expect("build respmod with req context");
+
+        match req.embedded() {
+            Some(EmbeddedHttp::Resp { req_head, .. }) => {
+                let head = req_head.as_ref().expect("req_head must be Some");
+                assert_eq!(head.uri(), "/resource");
+                assert_eq!(
+                    head.headers().get("Host").and_then(|v| v.to_str().ok()),
+                    Some("origin.example")
+                );
+            }
+            _ => panic!("expected EmbeddedHttp::Resp"),
+        }
+    }
+}

@@ -17,6 +17,7 @@ impl Server {
                 Some(EmbeddedHttp::Resp {
                     head,
                     body: Body::Full { .. },
+                    ..
                 }),
                 Method::RespMod,
             ) => out.with_http_response_head_and_original_body(head, 0)?,

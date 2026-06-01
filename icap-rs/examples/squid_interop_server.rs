@@ -88,7 +88,7 @@ fn handle_reqmod(request: IncomingRequest) -> HandlerResult<Response> {
 }
 
 fn handle_respmod(request: IncomingRequest) -> HandlerResult<Response> {
-    let Some(EmbeddedHttp::Resp { head, body }) = request.into_embedded() else {
+    let Some(EmbeddedHttp::Resp { head, body, .. }) = request.into_embedded() else {
         warn!("RESPMOD without embedded HTTP response");
         return Ok(Response::no_content_with_istag(RESPMOD_ISTAG)?);
     };

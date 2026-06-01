@@ -184,10 +184,29 @@ impl Client {
             return;
         }
         let options_req = Request::options(path.as_str());
-        let Ok(response) = Box::pin(self.send(&options_req)).await else {
-            return;
+        let response = match Box::pin(self.send(&options_req)).await {
+            Ok(r) => r,
+            Err(err) => {
+                // Non-fatal: Transfer-* policy won't be applied for this request.
+                // The modification request proceeds without cached OPTIONS.
+                tracing::warn!(
+                    host = %self.inner.host,
+                    port = self.inner.port,
+                    path = %path,
+                    error = %err,
+                    "OPTIONS fetch failed; Transfer-* policy will not apply for this request"
+                );
+                return;
+            }
         };
         if !response.is_success() {
+            tracing::warn!(
+                host = %self.inner.host,
+                port = self.inner.port,
+                path = %path,
+                status = %response.status_code(),
+                "OPTIONS returned non-2xx; Transfer-* policy will not apply for this request"
+            );
             return;
         }
         if let Some(entry) = CachedOptions::from_response(&response, cache.config()) {
@@ -1053,21 +1072,73 @@ where
 // §4.10.2 helpers
 // ---------------------------------------------------------------------------
 
-/// Extract the file extension (lowercase, no leading dot) from the embedded
-/// HTTP request URI in a REQMOD request.
+/// Extract the file extension (lowercase, no leading dot) for Transfer-* policy matching.
 ///
-/// Returns an empty string when there is no embedded HTTP request or the URI
-/// path has no recognisable extension (e.g. bare API paths).
+/// - **REQMOD**: extension is taken from the embedded HTTP request URI path
+///   (e.g. `/upload/report.pdf` → `"pdf"`).
+/// - **RESPMOD**: extension is derived from the `Content-Type` header of the
+///   embedded HTTP response. When `req-hdr` is present in the future (RFC 3507
+///   §4.4.1), the request URI should be preferred; for now Content-Type is the
+///   best available signal.
+/// - Returns an empty string when no extension can be determined; the caller
+///   falls through to the default Transfer-* behaviour (no policy override).
 fn file_ext_from_request(req: &Request) -> String {
-    let Some(crate::request::EmbeddedHttp::Req { head, .. }) = req.embedded() else {
-        return String::new();
-    };
-    let path = head.uri().path();
-    path.rsplit('.')
-        .next()
-        .filter(|e| !e.is_empty() && !e.contains('/'))
-        .map(str::to_lowercase)
-        .unwrap_or_default()
+    match req.embedded() {
+        Some(crate::request::EmbeddedHttp::Req { head, .. }) => {
+            let path = head.uri().path();
+            path.rsplit('.')
+                .next()
+                .filter(|e| !e.is_empty() && !e.contains('/'))
+                .map(str::to_lowercase)
+                .unwrap_or_default()
+        }
+        Some(crate::request::EmbeddedHttp::Resp { head, .. }) => {
+            let content_type = head
+                .headers()
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            ext_from_content_type(content_type).to_string()
+        }
+        None => String::new(),
+    }
+}
+
+/// Map a `Content-Type` header value to a common file extension for
+/// Transfer-* policy matching in RESPMOD flows.
+///
+/// Only the base media-type is considered (parameters such as `; charset=utf-8`
+/// are stripped). Returns an empty string for unrecognised types.
+fn ext_from_content_type(content_type: &str) -> &'static str {
+    let base = content_type.split(';').next().unwrap_or("").trim();
+    match base {
+        "text/html" => "html",
+        "text/plain" => "txt",
+        "text/css" => "css",
+        "text/javascript" | "application/javascript" => "js",
+        "application/json" => "json",
+        "application/xml" | "text/xml" => "xml",
+        "application/pdf" => "pdf",
+        "application/zip" | "application/x-zip-compressed" => "zip",
+        "application/gzip" | "application/x-gzip" => "gz",
+        "application/x-tar" => "tar",
+        "application/x-rar-compressed" | "application/vnd.rar" => "rar",
+        "application/x-7z-compressed" => "7z",
+        "application/vnd.ms-excel"
+        | "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" => "xlsx",
+        "application/msword"
+        | "application/vnd.openxmlformats-officedocument.wordprocessingml.document" => "docx",
+        "image/jpeg" => "jpg",
+        "image/png" => "png",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/svg+xml" => "svg",
+        "audio/mpeg" => "mp3",
+        "audio/ogg" => "ogg",
+        "video/mp4" => "mp4",
+        "video/webm" => "webm",
+        _ => "",
+    }
 }
 
 /// Return a synthetic `ICAP/1.0 204 No Content` response.
@@ -2358,5 +2429,30 @@ mod tests {
         )
         .await;
         assert!(res.is_err());
+    }
+
+    // ---------------------------------------------------------------------------
+    // ext_from_content_type
+    // ---------------------------------------------------------------------------
+
+    #[rstest]
+    #[case("text/html", "html")]
+    #[case("text/html; charset=utf-8", "html")]
+    #[case("application/pdf", "pdf")]
+    #[case("application/zip", "zip")]
+    #[case("application/x-zip-compressed", "zip")]
+    #[case("image/jpeg", "jpg")]
+    #[case("image/png", "png")]
+    #[case("image/gif", "gif")]
+    #[case("application/json", "json")]
+    #[case("application/xml", "xml")]
+    #[case("text/xml", "xml")]
+    #[case("application/gzip", "gz")]
+    #[case("video/mp4", "mp4")]
+    #[case("application/octet-stream", "")]
+    #[case("", "")]
+    #[case("totally/unknown", "")]
+    fn content_type_to_extension(#[case] ct: &str, #[case] expected: &str) {
+        assert_eq!(ext_from_content_type(ct), expected);
     }
 }

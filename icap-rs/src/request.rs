@@ -487,7 +487,15 @@ pub enum EmbeddedHttp<R> {
         body: Body<R>,
     },
     /// Embedded HTTP response (typical for `RESPMOD`).
+    ///
+    /// `req_head` carries the optional HTTP request context from the
+    /// `req-hdr` section of a RESPMOD request (RFC 3507 §4.4.1).
+    /// It is `Some` when the ICAP sender included the originating HTTP
+    /// request headers; `None` otherwise.
     Resp {
+        /// Original HTTP request that triggered the response, when provided
+        /// by the ICAP client via `req-hdr` in the `Encapsulated` header.
+        req_head: Option<HttpRequest<()>>,
         head: HttpResponse<()>,
         body: Body<R>,
     },
@@ -509,6 +517,20 @@ impl<R> EmbeddedHttp<R> {
         match self {
             Self::Req { .. } => EmbeddedHttpKind::Request,
             Self::Resp { .. } => EmbeddedHttpKind::Response,
+        }
+    }
+
+    /// Return the optional HTTP request context from a RESPMOD embedded message.
+    ///
+    /// Present when the ICAP client included `req-hdr` in the `Encapsulated`
+    /// header of a RESPMOD request (RFC 3507 §4.4.1). Provides the HTTP request
+    /// that caused the response being modified.
+    ///
+    /// Always `None` for `Req` variants.
+    pub fn respmod_request_head(&self) -> Option<&HttpRequest<()>> {
+        match self {
+            Self::Resp { req_head, .. } => req_head.as_ref(),
+            Self::Req { .. } => None,
         }
     }
 }
@@ -547,7 +569,7 @@ pub(crate) fn serialize_embedded_http(
             };
             (head_bytes, body_bytes, original_len)
         }
-        EmbeddedHttp::Resp { head, body } => {
+        EmbeddedHttp::Resp { head, body, .. } => {
             let head_bytes = serialize_http_response_head(head);
             let (body_bytes, original_len) = match body {
                 Body::Full { reader } => copy_body(reader, body_limit),
@@ -887,6 +909,7 @@ impl Request<Vec<u8>, Outbound> {
             ));
         }
         self.embedded = Some(EmbeddedHttp::Resp {
+            req_head: None,
             head,
             body: Body::Empty,
         });
@@ -927,6 +950,33 @@ impl Request<Vec<u8>, Outbound> {
         let (parts, body) = resp.into_parts();
         let head = HttpResponse::from_parts(parts, ());
         self.embedded = Some(EmbeddedHttp::Resp {
+            req_head: None,
+            head,
+            body: Body::Full { reader: body },
+        });
+        Ok(self)
+    }
+
+    /// Attach a complete embedded HTTP response **with the original HTTP request context**.
+    ///
+    /// Equivalent to [`with_http_response`](Self::with_http_response) but also
+    /// includes the HTTP request that triggered the response (`req-hdr` in the
+    /// `Encapsulated` section, RFC 3507 §4.4.1). The ICAP server receives the
+    /// original request head via [`EmbeddedHttp::respmod_request_head`].
+    pub fn with_http_response_and_request_context(
+        mut self,
+        resp: HttpResponse<Vec<u8>>,
+        orig_req: HttpRequest<()>,
+    ) -> IcapResult<Self> {
+        if self.method != Method::RespMod {
+            return Err(Error::serialization(
+                "HTTP responses can only be attached to RESPMOD requests",
+            ));
+        }
+        let (parts, body) = resp.into_parts();
+        let head = HttpResponse::from_parts(parts, ());
+        self.embedded = Some(EmbeddedHttp::Resp {
+            req_head: Some(orig_req),
             head,
             body: Body::Full { reader: body },
         });
@@ -1163,7 +1213,18 @@ pub(crate) fn parse_icap_request_with_mode(
                 .body(())
                 .map_err(|e| Error::http_parse(format!("build http::Response head: {e}")))?;
 
+            // RFC 3507 §4.4.1: RESPMOD request may carry optional req-hdr
+            // (the HTTP request that caused this response). Parse it when present.
+            let req_head = if let Some(req_hdr_off) = enc.req_hdr {
+                let req_end = next_offset_after(&enc, req_hdr_off);
+                let req_region = slice_encapsulated(enc_area, req_hdr_off, req_end)?;
+                parse_http_request_head_only(req_region)?
+            } else {
+                None
+            };
+
             Some(EmbeddedHttp::Resp {
+                req_head,
                 head,
                 body: Body::Full { reader: body_bytes },
             })
@@ -1205,6 +1266,39 @@ pub(crate) fn parse_icap_request_with_mode(
         allow_206,
         preview_ieof: false,
     }))
+}
+
+/// Parse a region of bytes as an HTTP request head only (no body).
+///
+/// Used for the optional `req-hdr` section in RESPMOD requests (RFC 3507 §4.4.1).
+/// Returns `None` when `region` is empty (the ICAP sender omitted the section).
+fn parse_http_request_head_only(region: &[u8]) -> IcapResult<Option<HttpRequest<()>>> {
+    if region.is_empty() {
+        return Ok(None);
+    }
+
+    let hdr_len = find_double_crlf(region)
+        .ok_or_else(|| Error::http_parse("req-hdr section: HTTP request headers not complete"))?;
+    let head_bytes = &region[..hdr_len];
+
+    let first_line_end = memmem::find(head_bytes, b"\r\n").unwrap_or(head_bytes.len());
+    let start_str = std::str::from_utf8(&head_bytes[..first_line_end])?;
+
+    let head_str = std::str::from_utf8(head_bytes)?;
+    let http_headers = parse_header_lines(head_str.split("\r\n").skip(1))?;
+
+    let (http_method, uri, version) = parse_http_request_start_line(start_str)?;
+    let mut builder = HttpRequest::builder()
+        .method(http_method)
+        .uri(uri)
+        .version(version);
+    if let Some(h) = builder.headers_mut() {
+        h.extend(http_headers);
+    }
+    let head = builder
+        .body(())
+        .map_err(|e| Error::http_parse(format!("build req-hdr HTTP request head: {e}")))?;
+    Ok(Some(head))
 }
 
 fn validate_encapsulated_for_method(

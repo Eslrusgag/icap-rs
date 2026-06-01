@@ -170,9 +170,19 @@ impl CachedOptions {
 // ---------------------------------------------------------------------------
 
 /// Parse the `Options-TTL` header (integer seconds) into a [`Duration`].
+///
+/// Returns `None` when the header is absent, non-numeric, or zero.
+/// `Options-TTL: 0` is treated as "do not cache" (analogous to HTTP
+/// `Cache-Control: max-age=0`), so the caller falls back to
+/// [`OptionsCacheConfig::default_ttl`] and, if that is also absent, skips
+/// caching entirely.
 fn parse_options_ttl(response: &ParsedResponse) -> Option<Duration> {
     let raw = response.get_header("Options-TTL")?.to_str().ok()?;
     let seconds: u64 = raw.trim().parse().ok()?;
+    // 0 means "immediately expired" — don't cache.
+    if seconds == 0 {
+        return None;
+    }
     Some(Duration::from_secs(seconds))
 }
 
@@ -304,5 +314,51 @@ impl OptionsCache {
     pub(crate) async fn clear(&self) {
         let mut entries = self.entries.write().await;
         entries.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::response::parse_icap_response;
+
+    fn parsed(raw: &[u8]) -> ParsedResponse {
+        parse_icap_response(raw).expect("test response must parse")
+    }
+
+    fn response_with_ttl(ttl: &str) -> ParsedResponse {
+        parsed(
+            format!(
+                "ICAP/1.0 200 OK\r\nISTag: \"x\"\r\nOptions-TTL: {ttl}\r\nEncapsulated: null-body=0\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+    }
+
+    #[test]
+    fn positive_ttl_is_parsed() {
+        assert_eq!(
+            parse_options_ttl(&response_with_ttl("60")),
+            Some(Duration::from_secs(60))
+        );
+    }
+
+    #[test]
+    fn zero_ttl_returns_none() {
+        // Options-TTL: 0 means "do not cache" — same as HTTP Cache-Control: max-age=0.
+        assert_eq!(parse_options_ttl(&response_with_ttl("0")), None);
+    }
+
+    #[test]
+    fn missing_options_ttl_header_returns_none() {
+        let resp = parsed(
+            b"ICAP/1.0 200 OK\r\nISTag: \"x\"\r\nEncapsulated: null-body=0\r\n\r\n",
+        );
+        assert_eq!(parse_options_ttl(&resp), None);
+    }
+
+    #[test]
+    fn non_numeric_ttl_returns_none() {
+        assert_eq!(parse_options_ttl(&response_with_ttl("abc")), None);
     }
 }

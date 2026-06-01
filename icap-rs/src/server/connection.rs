@@ -613,6 +613,7 @@ impl Server {
                                     Some(EmbeddedHttp::Resp {
                                         head,
                                         body: Body::Full { reader },
+                                        ..
                                     }),
                                     Method::RespMod,
                                 ) => {
