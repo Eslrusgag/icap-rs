@@ -351,9 +351,7 @@ mod tests {
 
     #[test]
     fn missing_options_ttl_header_returns_none() {
-        let resp = parsed(
-            b"ICAP/1.0 200 OK\r\nISTag: \"x\"\r\nEncapsulated: null-body=0\r\n\r\n",
-        );
+        let resp = parsed(b"ICAP/1.0 200 OK\r\nISTag: \"x\"\r\nEncapsulated: null-body=0\r\n\r\n");
         assert_eq!(parse_options_ttl(&resp), None);
     }
 

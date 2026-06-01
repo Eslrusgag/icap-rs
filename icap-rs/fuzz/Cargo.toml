@@ -1,0 +1,90 @@
+[package]
+name = "icap-rs-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Declare a standalone workspace so this crate is not picked up by the
+# parent workspace resolver.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+http = "1.4.0"
+arbitrary = { version = "1", features = ["derive"] }
+
+[dependencies.icap-rs]
+path = ".."
+features = ["fuzz"]
+
+# Inline the release profile here because cargo-fuzz builds in release mode.
+# `debug = true` preserves symbol names in crash reports.
+[profile.release]
+debug = true
+opt-level = 3
+
+[[bin]]
+name = "fuzz_encapsulated"
+path = "fuzz_targets/fuzz_encapsulated.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_icap_response"
+path = "fuzz_targets/fuzz_icap_response.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_chunked"
+path = "fuzz_targets/fuzz_chunked.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_istag"
+path = "fuzz_targets/fuzz_istag.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_http_embed"
+path = "fuzz_targets/fuzz_http_embed.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_icap_request_raw"
+path = "fuzz_targets/fuzz_icap_request_raw.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_icap_request_structured"
+path = "fuzz_targets/fuzz_icap_request_structured.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_preview_structured"
+path = "fuzz_targets/fuzz_preview_structured.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_icap_response_body"
+path = "fuzz_targets/fuzz_icap_response_body.rs"
+test = false
+doc = false
+bench = false

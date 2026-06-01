@@ -527,7 +527,7 @@ impl<R> EmbeddedHttp<R> {
     /// that caused the response being modified.
     ///
     /// Always `None` for `Req` variants.
-    pub fn respmod_request_head(&self) -> Option<&HttpRequest<()>> {
+    pub const fn respmod_request_head(&self) -> Option<&HttpRequest<()>> {
         match self {
             Self::Resp { req_head, .. } => req_head.as_ref(),
             Self::Req { .. } => None,

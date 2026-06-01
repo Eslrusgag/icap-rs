@@ -1879,9 +1879,7 @@ mod section_4_4_1_respmod_req_hdr {
     use icap_rs::request::EmbeddedHttp;
     use tokio::io::AsyncWriteExt;
 
-    async fn start_req_hdr_capture_server(
-        tx: tokio::sync::oneshot::Sender<Option<String>>,
-    ) -> u16 {
+    async fn start_req_hdr_capture_server(tx: tokio::sync::oneshot::Sender<Option<String>>) -> u16 {
         let port = unused_port();
         let tx = std::sync::Mutex::new(Some(tx));
         let handler = move |req: IncomingRequest| {
@@ -1904,7 +1902,11 @@ mod section_4_4_1_respmod_req_hdr {
             .route_respmod(
                 "respmod",
                 handler,
-                Some(ServiceOptions::new().with_static_istag(ISTAG).add_allow("204")),
+                Some(
+                    ServiceOptions::new()
+                        .with_static_istag(ISTAG)
+                        .add_allow("204"),
+                ),
             )
             .build()
             .await
@@ -1924,18 +1926,20 @@ mod section_4_4_1_respmod_req_hdr {
         let port = start_req_hdr_capture_server(tx).await;
 
         // Build the req-hdr section: minimal HTTP request head.
-        let req_head = b"GET /resource HTTP/1.1\r\nHost: origin.example\r\nX-Original-Req: marker-123\r\n\r\n";
-        let req_head_len = req_head.len();
+        let http_req_bytes =
+            b"GET /resource HTTP/1.1\r\nHost: origin.example\r\nX-Original-Req: marker-123\r\n\r\n";
+        let http_req_len = http_req_bytes.len();
 
         // Build the res-hdr section: HTTP response head.
-        let res_head = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 5\r\n\r\n";
-        let res_head_len = res_head.len();
+        let http_resp_bytes =
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 5\r\n\r\n";
+        let http_resp_len = http_resp_bytes.len();
 
         // res-body: chunked body
         let res_body = b"5\r\nhello\r\n0\r\n\r\n";
 
-        let res_hdr_offset = req_head_len;
-        let res_body_offset = req_head_len + res_head_len;
+        let res_hdr_offset = http_req_len;
+        let res_body_offset = http_req_len + http_resp_len;
 
         let icap_head = format!(
             "RESPMOD icap://127.0.0.1:{port}/respmod ICAP/1.0\r\n\
@@ -1948,9 +1952,18 @@ mod section_4_4_1_respmod_req_hdr {
         let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
             .await
             .expect("connect");
-        stream.write_all(icap_head.as_bytes()).await.expect("write icap head");
-        stream.write_all(req_head).await.expect("write req head");
-        stream.write_all(res_head).await.expect("write res head");
+        stream
+            .write_all(icap_head.as_bytes())
+            .await
+            .expect("write icap head");
+        stream
+            .write_all(http_req_bytes)
+            .await
+            .expect("write req head");
+        stream
+            .write_all(http_resp_bytes)
+            .await
+            .expect("write res head");
         stream.write_all(res_body).await.expect("write res body");
         stream.flush().await.expect("flush");
 
@@ -1969,7 +1982,7 @@ mod section_4_4_1_respmod_req_hdr {
         );
     }
 
-    /// RFC 3507 §4.4.1 — RESPMOD without req-hdr: req_head is None, handler works normally.
+    /// RFC 3507 §4.4.1 — RESPMOD without `req-hdr`: `req_head` is `None`, handler works normally.
     #[tokio::test]
     async fn rfc4_4_1_respmod_without_req_hdr_req_head_is_none() {
         let (tx, rx) = tokio::sync::oneshot::channel::<Option<String>>();
@@ -1990,7 +2003,10 @@ mod section_4_4_1_respmod_req_hdr {
         let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
             .await
             .expect("connect");
-        stream.write_all(icap_head.as_bytes()).await.expect("write icap head");
+        stream
+            .write_all(icap_head.as_bytes())
+            .await
+            .expect("write icap head");
         stream.write_all(res_head).await.expect("write res head");
         stream.write_all(res_body).await.expect("write res body");
         stream.flush().await.expect("flush");

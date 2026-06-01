@@ -594,23 +594,18 @@ impl Server {
                         // RFC 3507 §4.6: pre-compute the fallback response for the case
                         // where the handler returns 204 but the client did not advertise
                         // Allow:204. Must be built before `req` is consumed by the handler.
-                        let fallback_204 = if !allow_204 {
-                            if let Some(options) = entry.options.as_ref() {
-                                if let Ok(istag) = options.istag_for(&req) {
-                                    if allow_206 {
-                                        Self::build_206_use_original_body(&req, method, &istag)?
-                                            .or_else(|| {
-                                                Self::build_200_echo_response(&req, method, &istag)
-                                                    .ok()
-                                            })
-                                    } else {
+                        let fallback_204 = if allow_204 {
+                            None
+                        } else if let Some(options) = entry.options.as_ref()
+                            && let Ok(istag) = options.istag_for(&req)
+                        {
+                            if allow_206 {
+                                Self::build_206_use_original_body(&req, method, &istag)?
+                                    .or_else(|| {
                                         Self::build_200_echo_response(&req, method, &istag).ok()
-                                    }
-                                } else {
-                                    None
-                                }
+                                    })
                             } else {
-                                None
+                                Self::build_200_echo_response(&req, method, &istag).ok()
                             }
                         } else {
                             None

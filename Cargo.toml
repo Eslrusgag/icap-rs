@@ -23,11 +23,11 @@ tokio-rustls = "0.26.4"
 tokio-util = "0.7"
 
 # Protocol/data types
-http = "1.4.0"
+http = "1.4.1"
 
 # Parsing and async helpers
 async-trait = "0.1.89"
-memchr = "2.8.0"
+memchr = "2.8.1"
 pin-project-lite = "0.2.17"
 
 # TLS

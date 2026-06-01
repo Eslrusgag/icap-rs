@@ -170,9 +170,11 @@ async fn icap_reqmod_with_preview(
     let http_head_bytes = http_head.as_bytes();
     let req_body_off = http_head_bytes.len();
 
+    // RFC 3507 §4.6: Allow:204 must be present for the server to return 204.
     let icap = format!(
         "REQMOD icap://{host_port}/{service} ICAP/1.0\r\n\
          Host: {host_port}\r\n\
+         Allow: 204\r\n\
          Encapsulated: req-hdr=0, req-body={req_body_off}\r\n\
          Preview: {preview_n}\r\n\
          \r\n",
