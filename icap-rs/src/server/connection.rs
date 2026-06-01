@@ -600,10 +600,9 @@ impl Server {
                             && let Ok(istag) = options.istag_for(&req)
                         {
                             if allow_206 {
-                                Self::build_206_use_original_body(&req, method, &istag)?
-                                    .or_else(|| {
-                                        Self::build_200_echo_response(&req, method, &istag).ok()
-                                    })
+                                Self::build_206_use_original_body(&req, method, &istag)?.or_else(
+                                    || Self::build_200_echo_response(&req, method, &istag).ok(),
+                                )
                             } else {
                                 Self::build_200_echo_response(&req, method, &istag).ok()
                             }
