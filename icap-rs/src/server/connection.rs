@@ -592,6 +592,16 @@ impl Server {
                     let has_preview = req.icap_headers.get("Preview").is_some();
 
                     if !allow_204 && !has_preview {
+                        // RFC 3507 §4.6: the client did not advertise Allow:204
+                        // and sent no Preview, so the server cannot return 204.
+                        // The handler is skipped; the embedded HTTP message is
+                        // echoed back in a 200 response unchanged.
+                        trace!(
+                            client = %addr,
+                            service = %service_resolved,
+                            method = %method,
+                            "bypassing handler: client sent no Allow:204 and no Preview"
+                        );
                         let Some(options) = entry.options.as_ref() else {
                             return Err(Error::service(format!(
                                 "Service '{}' has no explicit OPTIONS configuration with ISTag",

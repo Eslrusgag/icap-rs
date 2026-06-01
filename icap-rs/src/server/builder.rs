@@ -204,6 +204,20 @@ impl ServerBuilder {
     ///   preview bytes arrive and before the server sends `100 Continue`.
     ///   Returning `PreviewDecision::Continue` resumes the RFC preview flow; the
     ///   same handler is called again with `Body::Full` after the remainder is read.
+    ///
+    /// ## When handlers are NOT called
+    ///
+    /// RFC 3507 §4.6 prohibits the server from returning `204 No Content` unless
+    /// the client explicitly advertised `Allow: 204`. When neither `Allow: 204`
+    /// nor a `Preview` header is present in the request, the server has no way to
+    /// signal "no modification needed" without sending back a full `200` response
+    /// with the encapsulated HTTP message. In that case **the handler is bypassed**
+    /// and the server echoes the original embedded HTTP message in a `200 OK`
+    /// response automatically.
+    ///
+    /// To ensure your handler is always invoked, either:
+    /// - configure the ICAP client to send `Allow: 204`, or
+    /// - use `Preview` (the handler is always called in the preview path).
     pub fn route<MIt, MItem, F, Fut>(
         mut self,
         service: &str,
