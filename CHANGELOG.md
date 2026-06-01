@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.3.0
+
 ### Added
 
 - Client-side OPTIONS response cache (RFC 3507 §4.10 / §5), opt-in via `ClientBuilder::with_options_cache(OptionsCacheConfig)`. Lifetime is taken from the response `Options-TTL` header, falling back to `OptionsCacheConfig::default_ttl`; with neither, the response is not cached. A changed `ISTag` observed on a later `REQMOD`/`RESPMOD` response invalidates the entry, and `Client::invalidate_options_cache()` clears every entry on demand (#15).
@@ -19,8 +21,6 @@
 ### Fixed
 
 - Client response framing on early/single-line error responses: a parsed 4xx/5xx status line no longer terminates the ICAP response while the connection stays open, so error responses whose headers arrive in a later TCP read are not truncated (#15).
-
-## 0.3
 
 ### Added
 
