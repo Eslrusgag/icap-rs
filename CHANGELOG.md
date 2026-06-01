@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Added
+
+- `EmbeddedHttp<Vec<u8>>::into_http_request()` and `into_http_response()` — consume and reassemble
+  a split `(head, body)` back into a whole `http::Request<Vec<u8>>` / `http::Response<Vec<u8>>` (#27).
+- `IncomingRequest::echo()` — echo the embedded HTTP message back as `200 OK` with the
+  server-resolved `ISTag`; the ergonomic base for inspect-and-forward handlers (#28).
+- `Response::with_http_request_reframed()` and `with_http_response_reframed()` — like the existing
+  `with_http_*` methods but reconcile `Content-Length` with the actual body length and drop
+  `Transfer-Encoding: chunked` from the embedded HTTP head (#29).
+
 ## 0.3.0
 
 ### Added

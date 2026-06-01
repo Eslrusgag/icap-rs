@@ -495,6 +495,71 @@ impl Response<Outgoing> {
         Ok(self)
     }
 
+    /// Like [`with_http_request`](Self::with_http_request) but reconciles HTTP
+    /// framing headers with the actual body length before attaching.
+    ///
+    /// Specifically:
+    /// - Sets `Content-Length` to the byte length of the provided body.
+    /// - Removes `Transfer-Encoding: chunked` from the embedded HTTP head
+    ///   (ICAP chunked framing provides the wire frame; downstream peers must
+    ///   not see a redundant chunked `Transfer-Encoding`).
+    ///
+    /// Use this method whenever the body was modified or replaced so that the
+    /// embedded `Content-Length` matches the actual bytes on the wire.  The
+    /// existing [`with_http_request`](Self::with_http_request) is left unchanged
+    /// for callers that already manage framing headers themselves.
+    ///
+    /// # Errors
+    ///
+    /// Propagates errors from [`with_http_request`](Self::with_http_request).
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use icap_rs::response::Response;
+    /// use icap_rs::error::IcapResult;
+    ///
+    /// fn attach(resp: Response, mut req: http::Request<Vec<u8>>) -> IcapResult<Response> {
+    ///     // Body was changed; use reframed variant so Content-Length stays correct.
+    ///     *req.body_mut() = b"modified body".to_vec();
+    ///     resp.with_http_request_reframed(&req)
+    /// }
+    /// ```
+    pub fn with_http_request_reframed(self, http: &http::Request<Vec<u8>>) -> IcapResult<Self> {
+        let reframed = reframe_http_request(http)?;
+        self.with_http_request(&reframed)
+    }
+
+    /// Like [`with_http_response`](Self::with_http_response) but reconciles HTTP
+    /// framing headers with the actual body length before attaching.
+    ///
+    /// Specifically:
+    /// - Sets `Content-Length` to the byte length of the provided body.
+    /// - Removes `Transfer-Encoding: chunked` from the embedded HTTP head.
+    ///
+    /// Use this method whenever the body was modified or replaced so that the
+    /// embedded `Content-Length` matches the actual bytes on the wire.
+    ///
+    /// # Errors
+    ///
+    /// Propagates errors from [`with_http_response`](Self::with_http_response).
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use icap_rs::response::Response;
+    /// use icap_rs::error::IcapResult;
+    ///
+    /// fn attach(resp: Response, mut http_resp: http::Response<Vec<u8>>) -> IcapResult<Response> {
+    ///     *http_resp.body_mut() = b"modified body".to_vec();
+    ///     resp.with_http_response_reframed(&http_resp)
+    /// }
+    /// ```
+    pub fn with_http_response_reframed(self, http: &http::Response<Vec<u8>>) -> IcapResult<Self> {
+        let reframed = reframe_http_response(http)?;
+        self.with_http_response(&reframed)
+    }
+
     /// Attach an embedded HTTP request head and emit a 206 `use-original-body` marker.
     ///
     /// The serialized response will contain the HTTP request head, no adapted
@@ -1075,6 +1140,169 @@ mod tests {
         assert_eq!(response.status_code, StatusCode::NO_CONTENT);
         assert!(response.body.is_empty());
     }
+}
+
+#[cfg(test)]
+mod reframe_tests {
+    use super::*;
+
+    fn sample_http_request(body: &[u8]) -> http::Request<Vec<u8>> {
+        http::Request::builder()
+            .method("POST")
+            .uri("/upload")
+            .version(http::Version::HTTP_11)
+            .header("transfer-encoding", "chunked")
+            .header("x-custom", "keep-me")
+            .body(body.to_vec())
+            .expect("build sample request")
+    }
+
+    fn sample_http_response(body: &[u8]) -> http::Response<Vec<u8>> {
+        http::Response::builder()
+            .status(200u16)
+            .version(http::Version::HTTP_11)
+            .header("transfer-encoding", "chunked")
+            .header("x-custom", "keep-me")
+            .body(body.to_vec())
+            .expect("build sample response")
+    }
+
+    /// RFC test (#29): with_http_request_reframed sets Content-Length and drops
+    /// Transfer-Encoding: chunked from the embedded HTTP head.
+    #[test]
+    fn reframed_request_sets_content_length_and_drops_transfer_encoding() {
+        let body = b"hello world";
+        let http_req = sample_http_request(body);
+
+        let reframed = reframe_http_request(&http_req).expect("reframe must succeed");
+
+        assert!(
+            reframed.headers().get("transfer-encoding").is_none(),
+            "transfer-encoding must be removed"
+        );
+        assert_eq!(
+            reframed.headers()["content-length"],
+            body.len().to_string().as_str(),
+            "content-length must equal actual body length"
+        );
+        assert_eq!(reframed.headers()["x-custom"], "keep-me");
+        assert_eq!(reframed.body(), body);
+    }
+
+    /// RFC test (#29): with_http_response_reframed sets Content-Length and drops
+    /// Transfer-Encoding: chunked.
+    #[test]
+    fn reframed_response_sets_content_length_and_drops_transfer_encoding() {
+        let body = b"response body";
+        let http_resp = sample_http_response(body);
+
+        let reframed = reframe_http_response(&http_resp).expect("reframe must succeed");
+
+        assert!(reframed.headers().get("transfer-encoding").is_none());
+        assert_eq!(
+            reframed.headers()["content-length"],
+            body.len().to_string().as_str()
+        );
+        assert_eq!(reframed.headers()["x-custom"], "keep-me");
+        assert_eq!(reframed.body(), body);
+    }
+
+    /// Existing with_http_request behavior is unchanged when called directly.
+    #[test]
+    fn existing_with_http_request_behavior_unchanged() {
+        let body = b"data";
+        let http_req = http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("content-length", "4")
+            .body(body.to_vec())
+            .expect("build");
+        // Existing method still serializes as-is.
+        let resp = Response::ok_with_istag("test")
+            .expect("ok")
+            .with_http_request(&http_req)
+            .expect("attach");
+        assert!(!resp.body.is_empty());
+    }
+
+    /// RFC test (#29): reframed round-trip via Response builder attaches correctly.
+    #[test]
+    fn with_http_request_reframed_attaches_to_response() {
+        let body = b"modified";
+        let http_req = sample_http_request(body);
+        let resp = Response::ok_with_istag("tag")
+            .expect("ok")
+            .with_http_request_reframed(&http_req)
+            .expect("reframed attach");
+        assert!(!resp.body.is_empty());
+    }
+
+    /// RFC test (#29): reframed response variant attaches correctly.
+    #[test]
+    fn with_http_response_reframed_attaches_to_response() {
+        let body = b"modified resp";
+        let http_resp = sample_http_response(body);
+        let resp = Response::ok_with_istag("tag")
+            .expect("ok")
+            .with_http_response_reframed(&http_resp)
+            .expect("reframed attach");
+        assert!(!resp.body.is_empty());
+    }
+}
+
+/// Rebuild an `http::Request` with corrected framing headers.
+///
+/// - Drops `transfer-encoding: chunked` (ICAP chunked coding replaces it).
+/// - Sets `content-length` to the actual body length.
+fn reframe_http_request(src: &http::Request<Vec<u8>>) -> IcapResult<http::Request<Vec<u8>>> {
+    let body_len = src.body().len();
+    let mut builder = http::Request::builder()
+        .method(src.method().clone())
+        .uri(src.uri().clone())
+        .version(src.version());
+    if let Some(hdrs) = builder.headers_mut() {
+        for (name, value) in src.headers() {
+            if name == http::header::TRANSFER_ENCODING {
+                continue;
+            }
+            hdrs.append(name, value.clone());
+        }
+        hdrs.insert(
+            http::header::CONTENT_LENGTH,
+            HeaderValue::from_str(&body_len.to_string())
+                .map_err(|e| Error::header(format!("content-length value: {e}")))?,
+        );
+    }
+    builder
+        .body(src.body().clone())
+        .map_err(|e| Error::body(format!("reframe_http_request: {e}")))
+}
+
+/// Rebuild an `http::Response` with corrected framing headers.
+///
+/// - Drops `transfer-encoding: chunked`.
+/// - Sets `content-length` to the actual body length.
+fn reframe_http_response(src: &http::Response<Vec<u8>>) -> IcapResult<http::Response<Vec<u8>>> {
+    let body_len = src.body().len();
+    let mut builder = http::Response::builder()
+        .status(src.status())
+        .version(src.version());
+    if let Some(hdrs) = builder.headers_mut() {
+        for (name, value) in src.headers() {
+            if name == http::header::TRANSFER_ENCODING {
+                continue;
+            }
+            hdrs.append(name, value.clone());
+        }
+        hdrs.insert(
+            http::header::CONTENT_LENGTH,
+            HeaderValue::from_str(&body_len.to_string())
+                .map_err(|e| Error::header(format!("content-length value: {e}")))?,
+        );
+    }
+    builder
+        .body(src.body().clone())
+        .map_err(|e| Error::body(format!("reframe_http_response: {e}")))
 }
 
 #[cfg(test)]

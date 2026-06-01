@@ -535,6 +535,91 @@ impl<R> EmbeddedHttp<R> {
     }
 }
 
+impl EmbeddedHttp<Vec<u8>> {
+    /// Consume and reassemble the embedded message into an [`http::Request<Vec<u8>>`].
+    ///
+    /// The head parts (method, URI, version, headers) and the buffered body are
+    /// joined back into a single owned value.
+    ///
+    /// # Errors
+    ///
+    /// - Returns [`Error::body`] if this is a [`EmbeddedHttp::Resp`] variant.
+    /// - Returns [`Error::body`] if the body is [`Body::Preview`] (partial — full
+    ///   body not yet buffered). Call
+    ///   [`Body::ensure_full`](Body::ensure_full) first in preview-aware routes.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use icap_rs::request::{EmbeddedHttp, Body};
+    /// use icap_rs::error::IcapResult;
+    ///
+    /// fn into_req(emb: EmbeddedHttp<Vec<u8>>) -> IcapResult<http::Request<Vec<u8>>> {
+    ///     emb.into_http_request()
+    /// }
+    /// ```
+    pub fn into_http_request(self) -> IcapResult<HttpRequest<Vec<u8>>> {
+        match self {
+            Self::Req { head, body } => {
+                let body_bytes = extract_buffered_body(body)?;
+                let (parts, ()) = head.into_parts();
+                Ok(HttpRequest::from_parts(parts, body_bytes))
+            }
+            Self::Resp { .. } => Err(Error::body(
+                "into_http_request called on a response variant",
+            )),
+        }
+    }
+
+    /// Consume and reassemble the embedded message into an [`http::Response<Vec<u8>>`].
+    ///
+    /// The head parts (status, version, headers) and the buffered body are
+    /// joined back into a single owned value.
+    ///
+    /// # Errors
+    ///
+    /// - Returns [`Error::body`] if this is a [`EmbeddedHttp::Req`] variant.
+    /// - Returns [`Error::body`] if the body is [`Body::Preview`] (partial — full
+    ///   body not yet buffered). Call
+    ///   [`Body::ensure_full`](Body::ensure_full) first in preview-aware routes.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use icap_rs::request::{EmbeddedHttp, Body};
+    /// use icap_rs::error::IcapResult;
+    ///
+    /// fn into_resp(emb: EmbeddedHttp<Vec<u8>>) -> IcapResult<http::Response<Vec<u8>>> {
+    ///     emb.into_http_response()
+    /// }
+    /// ```
+    pub fn into_http_response(self) -> IcapResult<HttpResponse<Vec<u8>>> {
+        match self {
+            Self::Resp { head, body, .. } => {
+                let body_bytes = extract_buffered_body(body)?;
+                let (parts, ()) = head.into_parts();
+                Ok(HttpResponse::from_parts(parts, body_bytes))
+            }
+            Self::Req { .. } => Err(Error::body(
+                "into_http_response called on a request variant",
+            )),
+        }
+    }
+}
+
+/// Extract fully-buffered bytes from a [`Body<Vec<u8>>`].
+///
+/// Returns `Err` for `Preview` bodies since the full content is not yet available.
+fn extract_buffered_body(body: Body<Vec<u8>>) -> IcapResult<Vec<u8>> {
+    match body {
+        Body::Empty => Ok(Vec::new()),
+        Body::Full { reader } => Ok(reader),
+        Body::Preview { .. } => Err(Error::body(
+            "body is still in Preview state; call ensure_full() before reassembling",
+        )),
+    }
+}
+
 /// Serialize embedded HTTP (client-side).
 ///
 /// Returns `(http_head_bytes, body_bytes_up_to_limit, original_body_len)`.
@@ -878,6 +963,69 @@ impl<R> Request<R, Incoming> {
     #[inline]
     pub fn istag(&self) -> Option<&str> {
         self.meta.istag.as_deref()
+    }
+}
+
+/// Echo helpers for buffered server-side requests.
+impl Request<Vec<u8>, Incoming> {
+    /// Echo the embedded HTTP message back as a `200 OK` ICAP response.
+    ///
+    /// This is the ergonomic base for *inspect-and-forward* handlers: call
+    /// [`embedded_mut`](Self::embedded_mut) to tweak headers or body, then call
+    /// `echo()` to produce the response without manually rebuilding the HTTP
+    /// message.
+    ///
+    /// The resolved `ISTag` from [`ServiceOptions`](crate::ServiceOptions) is
+    /// carried into the response automatically.  If no `ISTag` was configured
+    /// for the service the header is omitted.
+    ///
+    /// # Errors
+    ///
+    /// - Returns [`Error::body`] if the request carries no embedded HTTP message.
+    /// - Propagates any error from [`Response::ok_with_istag`](crate::Response::ok_with_istag)
+    ///   or the `with_http_*` attachment step.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use icap_rs::request::IncomingRequest;
+    /// use icap_rs::response::Response;
+    /// use icap_rs::HandlerResult;
+    ///
+    /// async fn handler(mut req: IncomingRequest) -> HandlerResult<Response> {
+    ///     // Append a custom header to the embedded HTTP request head before echoing.
+    ///     if let Some(EmbeddedHttp::Req { head, .. }) = req.embedded_mut() {
+    ///         head.headers_mut().insert(
+    ///             http::header::HeaderName::from_static("x-inspected"),
+    ///             http::header::HeaderValue::from_static("1"),
+    ///         );
+    ///     }
+    ///     Ok(req.echo()?)
+    /// }
+    /// ```
+    pub fn echo(self) -> IcapResult<crate::Response> {
+        let istag = self.istag().map(str::to_owned);
+        let istag_str = istag.as_deref().unwrap_or("");
+
+        let embedded = self
+            .embedded
+            .ok_or_else(|| Error::body("echo() called on a request with no embedded HTTP"))?;
+
+        let base = crate::Response::ok_with_istag(istag_str)?;
+        match embedded {
+            EmbeddedHttp::Req { head, body } => {
+                let body_bytes = extract_buffered_body(body)?;
+                let (parts, ()) = head.into_parts();
+                let http_req = HttpRequest::from_parts(parts, body_bytes);
+                base.with_http_request(&http_req)
+            }
+            EmbeddedHttp::Resp { head, body, .. } => {
+                let body_bytes = extract_buffered_body(body)?;
+                let (parts, ()) = head.into_parts();
+                let http_resp = HttpResponse::from_parts(parts, body_bytes);
+                base.with_http_response(&http_resp)
+            }
+        }
     }
 }
 
@@ -2044,5 +2192,123 @@ Encapsulated: req-hdr=0, req-body={req_body_off}\r\n\
         assert!(!r.allow_204);
         assert!(!r.allow_206);
         assert_eq!(r.preview_size, None);
+    }
+
+    // --- #27: EmbeddedHttp::into_http_request / into_http_response ---
+
+    /// RFC test: round-trip REQMOD — parse then reassemble into http::Request.
+    #[test]
+    fn into_http_request_round_trips_reqmod() {
+        let http_req = HttpRequest::builder()
+            .method("GET")
+            .uri("/resource")
+            .version(Version::HTTP_11)
+            .header("host", "example.com")
+            .body(b"hello".to_vec())
+            .expect("build http request");
+
+        let emb = EmbeddedHttp::Req {
+            head: {
+                let (parts, _) = http_req.into_parts();
+                HttpRequest::from_parts(parts, ())
+            },
+            body: Body::Full {
+                reader: b"hello".to_vec(),
+            },
+        };
+
+        let result = emb.into_http_request().expect("round-trip must succeed");
+        assert_eq!(result.method(), "GET");
+        assert_eq!(result.uri().to_string(), "/resource");
+        assert_eq!(result.headers()["host"], "example.com");
+        assert_eq!(result.body(), b"hello");
+    }
+
+    /// RFC test: round-trip RESPMOD — parse then reassemble into http::Response.
+    #[test]
+    fn into_http_response_round_trips_respmod() {
+        let http_resp = HttpResponse::builder()
+            .status(200u16)
+            .version(Version::HTTP_11)
+            .header("content-type", "text/plain")
+            .body(b"world".to_vec())
+            .expect("build http response");
+
+        let emb = EmbeddedHttp::Resp {
+            req_head: None,
+            head: {
+                let (parts, _) = http_resp.into_parts();
+                HttpResponse::from_parts(parts, ())
+            },
+            body: Body::Full {
+                reader: b"world".to_vec(),
+            },
+        };
+
+        let result = emb.into_http_response().expect("round-trip must succeed");
+        assert_eq!(result.status(), 200u16);
+        assert_eq!(result.headers()["content-type"], "text/plain");
+        assert_eq!(result.body(), b"world");
+    }
+
+    /// RFC test: into_http_request errors on empty body.
+    #[test]
+    fn into_http_request_empty_body() {
+        let emb = EmbeddedHttp::Req {
+            head: HttpRequest::builder()
+                .method("OPTIONS")
+                .uri("*")
+                .body(())
+                .expect("head"),
+            body: Body::Empty,
+        };
+        let result = emb.into_http_request().expect("empty body is valid");
+        assert!(result.body().is_empty());
+    }
+
+    /// into_http_request on a Resp variant must error.
+    #[test]
+    fn into_http_request_errors_on_resp_variant() {
+        let emb: EmbeddedHttp<Vec<u8>> = EmbeddedHttp::Resp {
+            req_head: None,
+            head: HttpResponse::builder()
+                .status(200u16)
+                .body(())
+                .expect("head"),
+            body: Body::Empty,
+        };
+        assert!(emb.into_http_request().is_err());
+    }
+
+    /// into_http_response on a Req variant must error.
+    #[test]
+    fn into_http_response_errors_on_req_variant() {
+        let emb: EmbeddedHttp<Vec<u8>> = EmbeddedHttp::Req {
+            head: HttpRequest::builder()
+                .method("GET")
+                .uri("/")
+                .body(())
+                .expect("head"),
+            body: Body::Empty,
+        };
+        assert!(emb.into_http_response().is_err());
+    }
+
+    /// into_http_request on a Preview body must error.
+    #[test]
+    fn into_http_request_errors_on_preview_body() {
+        let emb: EmbeddedHttp<Vec<u8>> = EmbeddedHttp::Req {
+            head: HttpRequest::builder()
+                .method("POST")
+                .uri("/upload")
+                .body(())
+                .expect("head"),
+            body: Body::Preview {
+                bytes: b"first 10".to_vec(),
+                ieof: false,
+                remainder: Remainder::new(Vec::new(), None),
+            },
+        };
+        assert!(emb.into_http_request().is_err());
     }
 }
