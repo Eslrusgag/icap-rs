@@ -680,6 +680,7 @@ cargo run -p icap-rs --example route_by_icap_header
 cargo run -p icap-rs --example options_cache_client
 cargo run -p icap-rs --example transfer_policy_client
 cargo run -p icap-rs --example proxy_auth_client
+cargo run -p icap-rs --example partial_content_respmod
 cargo run -p icap-rs --example tls_client --features tls-rustls
 cargo run -p icap-rs --example tls_server --features tls-rustls
 cargo run -p icap-rs --example tls_mtls_client --features tls-rustls

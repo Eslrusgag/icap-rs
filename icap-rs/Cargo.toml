@@ -103,6 +103,10 @@ path = "examples/transfer_policy_client.rs"
 name = "proxy_auth_client"
 path = "examples/proxy_auth_client.rs"
 
+[[example]]
+name = "partial_content_respmod"
+path = "examples/partial_content_respmod.rs"
+
 [[bench]]
 name = "protocol_bench"
 harness = false
