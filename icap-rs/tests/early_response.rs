@@ -40,18 +40,12 @@ async fn spawn_server_with_limit(limit: usize) -> (String, JoinHandle<()>) {
         let _ = server.run().await;
     });
 
-    wait_port_ready(&addr).await;
+    // The socket is already bound by build().  A plain TCP connect for readiness
+    // would itself occupy the sole connection permit, racing with the _hold
+    // connection the caller establishes next.  A brief sleep avoids that race
+    // without introducing an extra connection — mirrors max_connections.rs.
+    sleep(Duration::from_millis(50)).await;
     (addr, h)
-}
-
-async fn wait_port_ready(addr: &str) {
-    for _ in 0..50 {
-        if TcpStream::connect(addr).await.is_ok() {
-            return;
-        }
-        sleep(Duration::from_millis(20)).await;
-    }
-    panic!("server did not start listening on {addr}");
 }
 
 fn make_client(host: &str, port: u16) -> Client {
@@ -67,6 +61,9 @@ async fn early_503_when_conn_limit_exceeded() {
     let (addr, _handle) = spawn_server_with_limit(1).await;
 
     let _hold = TcpStream::connect(&addr).await.expect("occupy permit");
+    // Give the server time to accept _hold and mark the permit taken before
+    // the test client connects — mirrors the pattern in max_connections.rs.
+    sleep(Duration::from_millis(30)).await;
 
     let sa: SocketAddr = addr.parse().unwrap();
     let client = make_client("127.0.0.1", sa.port());
