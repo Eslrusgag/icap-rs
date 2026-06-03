@@ -774,6 +774,86 @@ mod sections_4_6_and_4_7_responses {
         assert!(!String::from_utf8_lossy(response.body()).contains("hello"));
     }
 
+    /// RFC 3507 §4.7 — a handler may return `206 Partial Content` with a
+    /// modified HTTP head and the `use-original-body` marker, instructing the
+    /// client to append the original body starting at the given offset.
+    /// This test exercises the explicit server-side path via
+    /// `Response::with_http_response_head_and_original_body`.
+    #[tokio::test]
+    async fn supported_206_explicit_handler_adds_header_and_keeps_original_body() {
+        use icap_rs::EmbeddedHttp;
+
+        let port = {
+            let p = unused_port();
+            let server = Server::builder()
+                .bind(&format!("127.0.0.1:{p}"))
+                .route_respmod(
+                    "respmod",
+                    |req: IncomingRequest| async move {
+                        let embedded = req
+                            .into_embedded()
+                            .expect("RESPMOD must have embedded HTTP");
+                        let EmbeddedHttp::Resp { head, .. } = embedded else {
+                            return Ok(Response::no_content_with_istag(ISTAG)?);
+                        };
+                        // Add a custom header to the HTTP response head and
+                        // instruct the client to reuse the original body.
+                        let (mut parts, ()) = head.into_parts();
+                        parts.headers.insert(
+                            http::HeaderName::from_static("x-icap-scanned"),
+                            http::HeaderValue::from_static("yes"),
+                        );
+                        let modified = HttpResponse::from_parts(parts, ());
+                        Ok(Response::partial_content_with_istag(ISTAG)?
+                            .with_http_response_head_and_original_body(&modified, 0)?)
+                    },
+                    Some(
+                        ServiceOptions::new()
+                            .with_static_istag(ISTAG)
+                            .with_service("RFC 3507 explicit 206")
+                            .add_allow("206"),
+                    ),
+                )
+                .build()
+                .await
+                .expect("build explicit-206 server");
+            tokio::spawn(async move {
+                let _ = server.run().await;
+            });
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            p
+        };
+
+        let client = Client::builder().host("127.0.0.1").port(port).build();
+        let response = client
+            .send(
+                &Request::respmod("respmod")
+                    .allow_206()
+                    .with_http_response(embedded_http_response("original body"))
+                    .expect("build respmod request"),
+            )
+            .await
+            .expect("send allow 206 explicit handler");
+
+        assert_eq!(response.status_code(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            response.use_original_body_offset(),
+            Some(0),
+            "use-original-body marker must be at offset 0"
+        );
+        // The modified HTTP head must be present in the ICAP response body.
+        let body_str = String::from_utf8_lossy(response.body()).to_ascii_lowercase();
+        assert!(
+            body_str.contains("x-icap-scanned: yes"),
+            "modified HTTP head must contain the injected header; got:\n{body_str}"
+        );
+        // The original entity body must NOT appear in the ICAP response.
+        assert!(
+            !body_str.contains("original body"),
+            "original HTTP body must not be echoed in a 206 response; got:\n{body_str}"
+        );
+    }
+
     #[test]
     fn supported_success_responses_require_istag() {
         let err = ParsedResponse::from_raw(b"ICAP/1.0 200 OK\r\nEncapsulated: null-body=0\r\n\r\n")

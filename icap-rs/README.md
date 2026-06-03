@@ -290,6 +290,44 @@ fn icap_response() -> IcapResult<Response> {
 }
 ```
 
+## RESPMOD with Originating Request Context
+
+`RESPMOD` requests may carry the originating HTTP request headers alongside the
+HTTP response in a `req-hdr` section (RFC 3507 §4.4.1). Use
+[`Request::with_http_response_and_request_context`] on the client to attach
+both:
+
+```rust,no_run
+use http::{Request as HttpRequest, Response as HttpResponse, Version};
+use icap_rs::{IcapResult, Request};
+
+fn respmod_with_context(
+    orig_req: HttpRequest<()>,
+    resp: HttpResponse<Vec<u8>>,
+) -> IcapResult<Request> {
+    Request::respmod("scan")
+        .with_http_response_and_request_context(resp, orig_req)
+}
+```
+
+Server handlers read the originating request head via
+[`EmbeddedHttp::respmod_request_head`] on the embedded value:
+
+```rust,no_run
+use icap_rs::{EmbeddedHttp, HandlerResult, IncomingRequest, Response};
+
+async fn respmod_handler(req: IncomingRequest) -> HandlerResult<Response> {
+    if let Some(embedded) = req.embedded() {
+        if let Some(orig_req) = embedded.respmod_request_head() {
+            // orig_req: &http::Request<()>  — the HTTP request that produced
+            // the response being inspected.
+            let _ = orig_req.uri();
+        }
+    }
+    Ok(Response::no_content_with_istag("policy-1")?)
+}
+```
+
 ## ICAP Header Values
 
 ICAP headers use `http::HeaderValue` validation. ASCII comma-separated values
@@ -360,6 +398,30 @@ fn comma_separated_header_example() -> IcapResult<()> {
   `Allow: 204` nor Preview, the server returns `200 OK` and echoes the embedded
   HTTP message instead.
 - `Allow: 206` no-modification responses use the `use-original-body` marker.
+  A handler that wants to return the original body unchanged but with modified
+  HTTP headers builds the response with
+  [`Response::with_http_response_head_and_original_body`] (for `RESPMOD`) or
+  [`Response::with_http_request_head_and_original_body`] (for `REQMOD`):
+
+  ```rust
+  use http::Response as HttpResponse;
+  use icap_rs::{IcapResult, Response};
+
+  fn add_header_keep_body(head: &HttpResponse<()>) -> IcapResult<Response> {
+      Response::partial_content_with_istag("policy-1")?
+          .with_http_response_head_and_original_body(head, 0)
+  }
+  ```
+
+  When the client advertises `Allow: 204` but not `Allow: 206`, the server
+  automatically converts a handler's `204 No Content` reply into a `200 OK`
+  echo. When the client advertises `Allow: 206`, a `204` reply from the
+  handler is instead converted to `206 Partial Content` with
+  `use-original-body=0`.
+- `ServerBuilder::with_max_connections(n)` limits concurrent connections.
+  New connections above the limit receive `503 Service Unavailable` before
+  any ICAP parsing. The value is also advertised as `Max-Connections` in
+  generated `OPTIONS` responses.
 - Keep-alive is supported without request pipelining.
 - Client-side OPTIONS caching, `Transfer-*` policy (§4.10.2), and
   `Proxy-Authorization` retry on `407` (§7.1) are opt-in on `ClientBuilder`
@@ -386,8 +448,9 @@ Most applications can import the main API directly from the crate root:
 use icap_rs::{
     Body, Client, ClientBuilder, ClientTimeouts, ConnectionPolicy, EmbeddedHttp, Error,
     HandlerError, HandlerResult, IcapResult, IncomingRequest, IsTagHandle, Method,
-    OptionsCacheConfig, PreviewDecision, ProxyAuth, Request, Response, Server, ServerBuilder,
-    ServerTimeouts, ServiceOptions, ShutdownEvent, StatusCode, TransferBehavior,
+    OptionsCacheConfig, OutgoingResponse, ParsedResponse, PreviewDecision, ProxyAuth,
+    Request, Response, Server, ServerBuilder, ServerTimeouts, ServiceOptions,
+    ShutdownEvent, StatusCode, TransferBehavior,
 };
 ```
 
@@ -397,7 +460,7 @@ use icap_rs::{
 | [`Request`], [`Method`] | Building outbound `OPTIONS`, `REQMOD`, and `RESPMOD` requests for client send/build APIs. |
 | [`IncomingRequest`] | Inspecting server-side ICAP requests in route handlers. ICAP metadata is read-only; services may mutate or consume only the embedded HTTP message. |
 | [`Response`], [`StatusCode`] | Building ICAP responses, parsing raw responses, validating `ISTag`, serializing RFC-compatible wire bytes, and attaching embedded HTTP messages. |
-| [`Server`], [`ServerBuilder`] | Running a Tokio ICAP service with per-service routes, aliases, default service routing, request header limits, connection limits, TLS/mTLS, and automatic `OPTIONS`. |
+| [`Server`], [`ServerBuilder`] | Running a Tokio ICAP service with per-service routes, aliases, default service routing, connection limits (`ServerBuilder::with_max_connections`), request header limits, TLS/mTLS, and automatic `OPTIONS`. |
 | [`ServiceOptions`], [`TransferBehavior`] | Describing per-service `OPTIONS` capabilities: `Methods`, `Service`, explicit `ISTag`, `Allow`, `Preview`, `Max-Object-Size`, `Transfer-*`, `Options-TTL`, and optional `opt-body`. |
 | [`Body`], [`EmbeddedHttp`] | Inspecting embedded HTTP request/response heads and bodies in server handlers. Regular handlers receive [`Body::Full`]; preview-aware handlers may receive [`Body::Preview`]. |
 | [`PreviewDecision`] | Returning an early final response from a preview-aware route, or continuing the RFC preview flow. |
@@ -406,6 +469,8 @@ use icap_rs::{
 | [`ClientTimeouts`], [`ServerTimeouts`] | Tuning client- and server-side network deadlines (connect, write, idle keep-alive, Preview continue, body/header read, shutdown drain). |
 | [`ShutdownEvent`], [`HandlerError`], [`HandlerResult`] | Observing graceful-shutdown drain progress (`ServerBuilder::on_shutdown_event`) and returning structured errors from route handlers. |
 | [`IsTagHandle`] | Rotating a dynamic `ISTag` from a background task while handlers read the current value. |
+| [`ParsedResponse`], [`OutgoingResponse`] | Direction-typed aliases for `Response<Parsed>` and `Response<Outgoing>`. Useful when a type annotation is required, for example in typed storage or explicit closure signatures. Most code can use [`Response`] directly. |
+| `RouteOutput` | Sealed trait; implemented for `HandlerResult<Response>` and `HandlerResult<PreviewDecision>`. Appears in compiler errors when a handler return type is wrong — not intended for direct use in application code. |
 
 Submodules are still public for discoverability and namespacing:
 `icap_rs::client`, `icap_rs::request`, `icap_rs::response`,

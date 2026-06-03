@@ -988,7 +988,7 @@ impl Request<Vec<u8>, Incoming> {
     /// # Examples
     ///
     /// ```no_run
-    /// use icap_rs::request::IncomingRequest;
+    /// use icap_rs::request::{EmbeddedHttp, IncomingRequest};
     /// use icap_rs::response::Response;
     /// use icap_rs::HandlerResult;
     ///

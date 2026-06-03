@@ -23,7 +23,10 @@ tested.
 - Required `Host` header validation.
 - Case-insensitive ICAP header lookup and canonical wire output.
 - Method-specific `Encapsulated` validation.
-- Embedded HTTP request and response heads/bodies.
+- Embedded HTTP request and response heads/bodies. `RESPMOD` requests may
+  include the originating HTTP request headers (`req-hdr`, RFC 3507 §4.4.1):
+  `Request::with_http_response_and_request_context` on the client path;
+  `EmbeddedHttp::respmod_request_head` on the server path.
 - RFC 3507 response framing: embedded HTTP heads are unchunked; encapsulated
   entity bodies use ICAP chunked framing.
 - Preview flows, including `Preview: 0`, `ieof`, and `100 Continue`.
