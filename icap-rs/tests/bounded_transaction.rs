@@ -1,6 +1,7 @@
 //! Independent wire fixtures: these tests do not use the convenience server,
 //! request serializer, response parser or chunk encoder as their oracle.
 use icap_rs::streaming::{Error, Method, PreviewOutcome, RequestHead, Transaction, Transport};
+use std::fmt::Write as _;
 use std::future::Future;
 use std::io;
 use std::pin::pin;
@@ -82,6 +83,289 @@ const fn options() -> RequestHead<'static> {
         preview: None,
         ..request(None)
     }
+}
+
+const fn method_request(method: Method, preview: Option<u64>) -> RequestHead<'static> {
+    match method {
+        Method::Options => options(),
+        Method::ReqMod => RequestHead {
+            method,
+            http_request: b"POST / HTTP/1.1\r\nHost: example.test\r\n\r\n",
+            http_response: b"",
+            ..request(preview)
+        },
+        Method::RespMod => request(preview),
+    }
+}
+
+async fn reject_wrong_respmod_body(body: &str) {
+    for fragment in [1, 7, usize::MAX] {
+        // Normal final, preview-zero early final, and final after Continue.
+        for path in 0..3 {
+            for bytes in [b"0\r\n\r\n".as_slice(), b"3\r\nabc\r\n0\r\n\r\n".as_slice()] {
+                let mut wire = Vec::new();
+                if path == 2 {
+                    wire.extend_from_slice(b"ICAP/1.0 100 Continue\r\n\r\n");
+                }
+                wire.extend_from_slice(&response_body(&format!("{body}=0"), bytes));
+                let mut peer = Peer::new(wire);
+                peer.fragment = fragment;
+                let mut head = [0; 1024];
+                let mut line = [0; 128];
+                let mut tx = Transaction::new(&mut peer, &mut head, &mut line).unwrap();
+                tx.start(request(if path == 0 { None } else { Some(0) }))
+                    .await
+                    .unwrap();
+                let result = if path == 1 {
+                    tx.finish_preview(false).await.map(|_| ())
+                } else {
+                    if path == 2 {
+                        assert_eq!(
+                            tx.finish_preview(false).await.unwrap(),
+                            PreviewOutcome::Continue
+                        );
+                    }
+                    tx.finish_body().await.unwrap();
+                    tx.read_response().await
+                };
+                if result.is_ok() {
+                    tx.discard_body(&mut [0; 3]).await.unwrap();
+                    panic!(
+                        "accepted and completely drained RESPMOD {body}, path={path}, fragment={fragment}"
+                    );
+                }
+                assert!(matches!(
+                    result,
+                    Err(Error::Protocol("encapsulated entity does not match method"))
+                ));
+                assert!(tx.response().is_none());
+                assert!(matches!(
+                    tx.read_body(&mut [0; 3]).await,
+                    Err(Error::InvalidState)
+                ));
+            }
+        }
+    }
+}
+
+#[test]
+fn respmod_rejects_request_body() {
+    run(reject_wrong_respmod_body("req-body"));
+}
+
+#[test]
+fn respmod_rejects_options_body() {
+    run(reject_wrong_respmod_body("opt-body"));
+}
+
+#[test]
+fn response_entity_method_matrix() {
+    run(async {
+        let req = b"GET / HTTP/1.1\r\nHost: example.test\r\n\r\n";
+        let res = b"HTTP/1.1 403 Forbidden\r\n\r\n";
+        // Each row lists the accepted terminals for: no HTTP head, request
+        // head, response head, both heads. This oracle is independent of the
+        // library's internal entity enum and matching implementation.
+        let cases: &[(Method, [&[&str]; 4])] = &[
+            (Method::Options, [&["opt-body", "null-body"], &[], &[], &[]]),
+            (
+                Method::ReqMod,
+                [
+                    &["req-body", "res-body", "null-body"],
+                    &["req-body", "null-body"],
+                    &["res-body", "null-body"],
+                    &[],
+                ],
+            ),
+            (
+                Method::RespMod,
+                [
+                    &["res-body", "null-body"],
+                    &[],
+                    &["res-body", "null-body"],
+                    &[],
+                ],
+            ),
+        ];
+        for &(method, allowed) in cases {
+            for (head_kind, terminals) in allowed.into_iter().enumerate() {
+                let mut prefix = Vec::new();
+                let mut parts = String::new();
+                if head_kind == 1 || head_kind == 3 {
+                    parts.push_str("req-hdr=0, ");
+                    prefix.extend_from_slice(req);
+                }
+                if head_kind == 2 || head_kind == 3 {
+                    write!(parts, "res-hdr={}, ", prefix.len()).unwrap();
+                    prefix.extend_from_slice(res);
+                }
+                for terminal in ["req-body", "res-body", "opt-body", "null-body"] {
+                    for fragment in [1, usize::MAX] {
+                        let mut bytes = prefix.clone();
+                        if terminal != "null-body" {
+                            bytes.extend_from_slice(b"3\r\nabc\r\n0\r\n\r\n");
+                        }
+                        let wire =
+                            response_body(&format!("{parts}{terminal}={}", prefix.len()), &bytes);
+                        let mut peer = Peer::new(wire);
+                        peer.fragment = fragment;
+                        let mut head = [0; 1024];
+                        let mut line = [0; 128];
+                        let mut tx = Transaction::new(&mut peer, &mut head, &mut line).unwrap();
+                        tx.start(method_request(method, None)).await.unwrap();
+                        if method != Method::Options {
+                            tx.finish_body().await.unwrap();
+                        }
+                        let result = tx.read_response().await;
+                        if !terminals.contains(&terminal) {
+                            assert!(
+                                matches!(result, Err(Error::Protocol(_))),
+                                "accepted {method:?}, head={head_kind}, {terminal}"
+                            );
+                            assert!(tx.response().is_none());
+                            assert!(matches!(
+                                tx.read_body(&mut [0; 2]).await,
+                                Err(Error::InvalidState)
+                            ));
+                            continue;
+                        }
+                        result.unwrap();
+                        let mut decoded = Vec::new();
+                        let mut out = [0; 2];
+                        loop {
+                            let n = tx.read_body(&mut out).await.unwrap();
+                            if n == 0 {
+                                break;
+                            }
+                            decoded.extend_from_slice(&out[..n]);
+                        }
+                        assert_eq!(
+                            decoded,
+                            if terminal == "null-body" {
+                                b"".as_slice()
+                            } else {
+                                b"abc".as_slice()
+                            }
+                        );
+                        assert_eq!(tx.response().unwrap().status_code(), 200);
+                        assert_eq!(tx.response().unwrap().header("ISTag"), Some("\"v1\""));
+                    }
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn respmod_request_preserves_both_http_heads() {
+    run(async {
+        let req = b"GET / HTTP/1.1\r\nHost: example.test\r\n\r\n";
+        let mut peer = Peer::new(NO_CONTENT);
+        let mut head = [0; 1024];
+        let mut line = [0; 128];
+        let mut tx = Transaction::new(&mut peer, &mut head, &mut line).unwrap();
+        tx.start(RequestHead {
+            http_request: req,
+            ..request(None)
+        })
+        .await
+        .unwrap();
+        tx.write_body(b"abc").await.unwrap();
+        tx.finish_body().await.unwrap();
+        tx.read_response().await.unwrap();
+        tx.discard_body(&mut [0; 2]).await.unwrap();
+        let expected = format!(
+            "Encapsulated: req-hdr=0, res-hdr={}, res-body={}\r\n\r\n",
+            req.len(),
+            req.len() + HTTP.len()
+        );
+        let wire = String::from_utf8(peer.output).unwrap();
+        assert!(wire.contains(&expected));
+        assert!(wire.ends_with("GET / HTTP/1.1\r\nHost: example.test\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\n3\r\nabc\r\n0\r\n\r\n"));
+    });
+}
+
+#[test]
+fn preview_preserves_method_for_early_and_continued_finals() {
+    run(async {
+        for (method, terminal) in [
+            (Method::ReqMod, "req-body"),
+            (Method::ReqMod, "res-body"),
+            (Method::RespMod, "res-body"),
+        ] {
+            for continued in [false, true] {
+                for fragment in [1, usize::MAX] {
+                    let mut wire = Vec::new();
+                    if continued {
+                        wire.extend_from_slice(
+                            b"ICAP/1.0 100 Continue\r\nEncapsulated: null-body=0\r\n\r\n",
+                        );
+                    }
+                    wire.extend_from_slice(&response_body(
+                        &format!("{terminal}=0"),
+                        b"3\r\nabc\r\n0\r\n\r\n",
+                    ));
+                    let mut peer = Peer::new(wire);
+                    peer.fragment = fragment;
+                    let mut head = [0; 1024];
+                    let mut line = [0; 128];
+                    let mut tx = Transaction::new(&mut peer, &mut head, &mut line).unwrap();
+                    tx.start(method_request(method, Some(0))).await.unwrap();
+                    let decision = tx.finish_preview(false).await.unwrap();
+                    if continued {
+                        assert_eq!(decision, PreviewOutcome::Continue);
+                        tx.write_body(b"original").await.unwrap();
+                        tx.finish_body().await.unwrap();
+                        tx.read_response().await.unwrap();
+                    } else {
+                        assert_eq!(decision, PreviewOutcome::Final);
+                    }
+                    let mut decoded = Vec::new();
+                    let mut out = [0; 2];
+                    loop {
+                        let n = tx.read_body(&mut out).await.unwrap();
+                        if n == 0 {
+                            break;
+                        }
+                        decoded.extend_from_slice(&out[..n]);
+                    }
+                    assert_eq!(decoded, b"abc");
+                    assert_eq!(tx.response().unwrap().status_code(), 200);
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn control_responses_reject_all_declared_entity_types() {
+    run(async {
+        for status in [100, 204] {
+            for enc in [
+                "req-body=0",
+                "res-body=0",
+                "opt-body=0",
+                "req-hdr=0, null-body=38",
+                "res-hdr=0, null-body=38",
+            ] {
+                for method in [Method::ReqMod, Method::RespMod] {
+                    let wire = format!(
+                        "ICAP/1.0 {status} Control\r\nISTag: v1\r\nEncapsulated: {enc}\r\n\r\n"
+                    );
+                    let mut peer = Peer::new(wire);
+                    let mut head = [0; 1024];
+                    let mut line = [0; 128];
+                    let mut tx = Transaction::new(&mut peer, &mut head, &mut line).unwrap();
+                    tx.start(method_request(method, Some(0))).await.unwrap();
+                    assert!(matches!(
+                        tx.finish_preview(false).await,
+                        Err(Error::Protocol("body on continue or no-content"))
+                    ));
+                    assert!(tx.response().is_none());
+                }
+            }
+        }
+    });
 }
 
 #[test]
@@ -206,20 +490,11 @@ fn response_body(enc: &str, body: &[u8]) -> Vec<u8> {
 #[test]
 fn streamed_embedded_heads_chunks_extensions_and_trailers() {
     run(async {
-        let req = b"GET / HTTP/1.1\r\nHost: example.test\r\n\r\n";
         let res = b"HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\n\r\n";
-        let mut body = req.to_vec();
-        body.extend_from_slice(res);
+        let mut body = res.to_vec();
         body.extend_from_slice(b"2; vendor=ok\r\nab\r\n1\r\nc\r\n0\r\nX-Trailer: ok\r\n\r\n");
         for fragment in [1, 3, 65536] {
-            let wire = response_body(
-                &format!(
-                    "req-hdr=0, res-hdr={}, res-body={}",
-                    req.len(),
-                    req.len() + res.len()
-                ),
-                &body,
-            );
+            let wire = response_body(&format!("res-hdr=0, res-body={}", res.len()), &body);
             let mut peer = Peer::new(wire);
             peer.fragment = fragment;
             let mut head = [0; 1024];
@@ -265,13 +540,37 @@ fn malformed_heads_and_encapsulation_fail_closed() {
             b"ICAP/2.0 204 No Content\r\n\r\n",
             b"ICAP/1.0 200 OK\r\n",
         ];
-        for &wire in fixtures {
+        let errors = [
+            "missing ISTag",
+            "duplicate protocol header",
+            "duplicate protocol header",
+            "ISTag quotes",
+            "header syntax",
+            "missing header colon",
+            "first encapsulated offset",
+            "encapsulated offsets not increasing",
+            "encapsulated header order",
+            "missing encapsulated body marker",
+            "part after encapsulated body",
+            "unknown encapsulated part",
+            "body on continue or no-content",
+            "unexpected informational response",
+            "ICAP version",
+            "EOF in ICAP head",
+        ];
+        assert_eq!(fixtures.len(), errors.len());
+        for (&wire, expected) in fixtures.iter().zip(errors) {
             let mut peer = Peer::new(wire);
             let mut head = [0; 1024];
             let mut line = [0; 128];
             let mut tx = Transaction::new(&mut peer, &mut head, &mut line).unwrap();
-            tx.start(options()).await.unwrap();
-            assert!(tx.read_response().await.is_err(), "accepted {wire:?}");
+            tx.start(request(None)).await.unwrap();
+            tx.finish_body().await.unwrap();
+            let result = tx.read_response().await;
+            assert!(
+                matches!(result, Err(Error::Protocol(message)) if message == expected),
+                "expected {expected}, got {result:?} for {wire:?}"
+            );
             assert!(tx.response().is_none());
             assert!(matches!(tx.read_response().await, Err(Error::InvalidState)));
         }
@@ -395,7 +694,8 @@ fn workspace_limits_and_input_validation() {
         }
         let mut peer = Peer::new(response_body("res-hdr=0, res-body=999999", b""));
         let mut tx = Transaction::new(&mut peer, &mut head, &mut line).unwrap();
-        tx.start(options()).await.unwrap();
+        tx.start(request(None)).await.unwrap();
+        tx.finish_body().await.unwrap();
         assert!(matches!(tx.read_response().await, Err(Error::Limit(_))));
     });
 }

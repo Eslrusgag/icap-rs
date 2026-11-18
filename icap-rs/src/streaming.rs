@@ -198,7 +198,13 @@ enum State {
 enum Part {
     Request,
     Response,
-    Body,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BodyKind {
+    Request,
+    Response,
+    Options,
     Null,
 }
 
@@ -207,7 +213,7 @@ struct Encapsulation {
     ends: [usize; 2],
     kinds: [Part; 2],
     headers: usize,
-    body: bool,
+    body: BodyKind,
 }
 
 /// A single transaction using caller-owned storage.
@@ -225,6 +231,7 @@ pub struct Transaction<'a, T: Transport + ?Sized> {
     head: &'a mut [u8],
     line: &'a mut [u8],
     state: State,
+    method: Method,
     preview: u64,
     sent: u64,
     head_len: usize,
@@ -254,6 +261,7 @@ impl<'a, T: Transport + ?Sized> Transaction<'a, T> {
             head,
             line,
             state: State::Fresh,
+            method: Method::Options,
             preview: 0,
             sent: 0,
             head_len: 0,
@@ -264,7 +272,7 @@ impl<'a, T: Transport + ?Sized> Transaction<'a, T> {
                 ends: [0; 2],
                 kinds: [Part::Request; 2],
                 headers: 0,
-                body: false,
+                body: BodyKind::Null,
             },
             embedded_done: false,
             remaining: 0,
@@ -290,6 +298,7 @@ impl<'a, T: Transport + ?Sized> Transaction<'a, T> {
         self.require(State::Fresh)?;
         self.state = State::Poisoned;
         let len = serialize_request(self.head, request)?;
+        self.method = request.method;
         write_all(self.transport, &self.head[..len]).await?;
         self.transport.flush().await?;
         self.preview = request.preview.unwrap_or(0);
@@ -348,7 +357,7 @@ impl<'a, T: Transport + ?Sized> Transaction<'a, T> {
         self.transport.flush().await?;
         self.receive_head().await?;
         if self.code == 100 {
-            if eof || self.encapsulation.body || self.encapsulation.headers != 0 {
+            if eof || self.encapsulation.body != BodyKind::Null || self.encapsulation.headers != 0 {
                 return Err(Error::Protocol("unexpected continue"));
             }
             self.state = State::Upload;
@@ -369,8 +378,9 @@ impl<'a, T: Transport + ?Sized> Transaction<'a, T> {
         Ok(())
     }
 
-    /// Read and validate a final response head. This does not establish that
-    /// the encapsulated response has arrived completely; drain its body too.
+    /// Read a final head and validate its method-specific encapsulation.
+    ///
+    /// The encapsulated response may still be incomplete; drain its body too.
     pub async fn read_response(&mut self) -> Result<(), Error> {
         self.require(State::AwaitFinal)?;
         self.state = State::Poisoned;
@@ -410,7 +420,7 @@ impl<'a, T: Transport + ?Sized> Transaction<'a, T> {
             self.skip_embedded().await?;
             self.embedded_done = true;
         }
-        if !self.encapsulation.body {
+        if self.encapsulation.body == BodyKind::Null {
             self.complete()?;
             return Ok(0);
         }
@@ -478,7 +488,7 @@ impl<'a, T: Transport + ?Sized> Transaction<'a, T> {
         };
         let response = validate_response(&self.head[..end], self.allow_obs_fold)?;
         self.code = response.code;
-        self.encapsulation = parse_encapsulation(response, self.head.len())?;
+        self.encapsulation = parse_encapsulation(response, self.head.len(), self.method)?;
         self.head_len = end;
         self.cursor = end;
         self.embedded_done = false;
@@ -884,12 +894,16 @@ fn validate_tag(value: &str) -> Result<(), Error> {
     Ok(())
 }
 
-fn parse_encapsulation(response: ResponseHead<'_>, max: usize) -> Result<Encapsulation, Error> {
+fn parse_encapsulation(
+    response: ResponseHead<'_>,
+    max: usize,
+    method: Method,
+) -> Result<Encapsulation, Error> {
     let mut enc = Encapsulation {
         ends: [0; 2],
         kinds: [Part::Request; 2],
         headers: 0,
-        body: false,
+        body: BodyKind::Null,
     };
     let Some(value) = response.header("Encapsulated") else {
         // Compatibility with peers that omit Encapsulated on bodyless 204.
@@ -921,21 +935,14 @@ fn parse_encapsulation(response: ResponseHead<'_>, max: usize) -> Result<Encapsu
             }
             enc.ends[enc.headers - 1] = offset;
         }
-        let kind = if name.eq_ignore_ascii_case("req-hdr") {
-            Part::Request
+        let header = if name.eq_ignore_ascii_case("req-hdr") {
+            Some(Part::Request)
         } else if name.eq_ignore_ascii_case("res-hdr") {
-            Part::Response
-        } else if ["req-body", "res-body", "opt-body"]
-            .iter()
-            .any(|v| name.eq_ignore_ascii_case(v))
-        {
-            Part::Body
-        } else if name.eq_ignore_ascii_case("null-body") {
-            Part::Null
+            Some(Part::Response)
         } else {
-            return Err(Error::Protocol("unknown encapsulated part"));
+            None
         };
-        if kind == Part::Request || kind == Part::Response {
+        if let Some(kind) = header {
             if enc.headers == 2
                 || enc.headers > 0 && (kind != Part::Response || enc.kinds[0] != Part::Request)
             {
@@ -945,7 +952,17 @@ fn parse_encapsulation(response: ResponseHead<'_>, max: usize) -> Result<Encapsu
             enc.headers += 1;
         } else {
             terminal = true;
-            enc.body = kind == Part::Body;
+            enc.body = if name.eq_ignore_ascii_case("req-body") {
+                BodyKind::Request
+            } else if name.eq_ignore_ascii_case("res-body") {
+                BodyKind::Response
+            } else if name.eq_ignore_ascii_case("opt-body") {
+                BodyKind::Options
+            } else if name.eq_ignore_ascii_case("null-body") {
+                BodyKind::Null
+            } else {
+                return Err(Error::Protocol("unknown encapsulated part"));
+            };
         }
         if offset > max {
             return Err(Error::Limit("encapsulated heads"));
@@ -955,10 +972,44 @@ fn parse_encapsulation(response: ResponseHead<'_>, max: usize) -> Result<Encapsu
     if !terminal {
         return Err(Error::Protocol("missing encapsulated body marker"));
     }
-    if (response.code == 100 || response.code == 204) && (enc.body || enc.headers != 0) {
-        return Err(Error::Protocol("body on continue or no-content"));
+    if response.code == 100 || response.code == 204 {
+        if enc.body != BodyKind::Null || enc.headers != 0 {
+            return Err(Error::Protocol("body on continue or no-content"));
+        }
+    } else if !response_entity_matches_method(&enc, method) {
+        return Err(Error::Protocol("encapsulated entity does not match method"));
     }
     Ok(enc)
+}
+
+const fn response_entity_matches_method(enc: &Encapsulation, method: Method) -> bool {
+    // RFC 3507 section 4.4.1: response headers are optional, but a response
+    // never contains both HTTP heads. REQMOD can return an HTTP response.
+    let head = match enc.headers {
+        0 => None,
+        1 => Some(enc.kinds[0]),
+        _ => return false,
+    };
+    matches!(
+        (method, head, enc.body),
+        (Method::Options, None, BodyKind::Options | BodyKind::Null)
+            | (
+                Method::ReqMod,
+                None,
+                BodyKind::Request | BodyKind::Response | BodyKind::Null
+            )
+            | (
+                Method::ReqMod,
+                Some(Part::Request),
+                BodyKind::Request | BodyKind::Null
+            )
+            | (
+                Method::ReqMod | Method::RespMod,
+                Some(Part::Response),
+                BodyKind::Response | BodyKind::Null
+            )
+            | (Method::RespMod, None, BodyKind::Response | BodyKind::Null)
+    )
 }
 
 fn decimal(value: &str) -> Result<usize, Error> {

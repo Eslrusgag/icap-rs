@@ -75,6 +75,16 @@ a compatibility exception to RFC 3507's requirement for the field on every
 message. `ISTag` remains required; a declared body or buffered bytes beyond the
 `204` head are rejected. A successful `200` still requires `Encapsulated`.
 
+Response encapsulation is checked against the originating method before a
+final head becomes available, including early preview responses. RESPMOD
+permits an optional HTTP response head followed by `res-body` or `null-body`.
+REQMOD also permits an optional HTTP request head followed by `req-body` or
+`null-body`, and can return an HTTP response to block a request. OPTIONS
+permits `opt-body` or `null-body` with no HTTP heads. Headerless bodies remain
+supported. A response containing both HTTP heads is rejected; both heads are
+valid in an outgoing RESPMOD request. These rules follow RFC 3507 section
+4.4.1; the bodyless `100`/`204` handling described above is preserved.
+
 Discard the transaction and transport after a failed or cancelled I/O operation.
 An interrupted future poisons the transaction before I/O, so resuming cannot
 silently repeat partial writes or accept a partial response. No work continues
