@@ -1,3 +1,5 @@
+#![cfg(feature = "full")]
+
 use icap_rs::{Client, Request, StatusCode};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;

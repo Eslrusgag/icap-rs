@@ -70,3 +70,11 @@ jobs:
 
       - name: Check core crate without default features
         run: cargo check -p icap-rs --no-default-features
+
+      - name: Test bounded streaming without default features
+        run: cargo test -p icap-rs --no-default-features
+
+      - name: Test Tokio compatibility baseline
+        run: |
+          cargo update -p tokio --precise 1.48.0
+          cargo test -p icap-rs --no-default-features --test bounded_transaction

@@ -1,6 +1,9 @@
+#![cfg(feature = "full")]
+
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
 use std::time::Duration;
 
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep, timeout};
@@ -66,7 +69,24 @@ fn make_client(host: &str, port: u16) -> Client {
 async fn early_503_when_conn_limit_exceeded() {
     let (addr, _handle) = spawn_server_with_limit(1).await;
 
-    let _hold = TcpStream::connect(&addr).await.expect("occupy permit");
+    // Connecting alone does not prove admission: the readiness probe can still
+    // own the sole permit and the held socket can receive 503. Keep a socket
+    // only after a successful round trip proves that it owns the permit.
+    let _hold = timeout(Duration::from_secs(2), async {
+        loop {
+            let mut stream = TcpStream::connect(&addr).await.expect("occupy permit");
+            stream.write_all(b"OPTIONS icap://localhost/svc-options ICAP/1.0\r\nHost: localhost\r\nEncapsulated: null-body=0\r\n\r\n").await.unwrap();
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).await.unwrap();
+                head.extend_from_slice(&byte);
+            }
+            if head.starts_with(b"ICAP/1.0 200 ") { break stream; }
+            assert!(head.starts_with(b"ICAP/1.0 503 "));
+            tokio::task::yield_now().await;
+        }
+    }).await.expect("admit held connection");
 
     let sa: SocketAddr = addr.parse().unwrap();
     let client = make_client("127.0.0.1", sa.port());

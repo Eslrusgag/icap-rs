@@ -1,3 +1,5 @@
+#![cfg(feature = "full")]
+
 mod common;
 
 use common::{find_free_port, wait_port_ready};

@@ -1,3 +1,5 @@
+#![cfg(feature = "full")]
+
 /// RFC 3507 §4.2 — Graceful shutdown via `Connection: close`.
 ///
 /// When a client does not intend to reuse the TCP connection it MUST include

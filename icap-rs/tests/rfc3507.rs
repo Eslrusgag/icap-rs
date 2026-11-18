@@ -1,3 +1,5 @@
+#![cfg(feature = "full")]
+
 //! RFC 3507 integration conformance matrix.
 //!
 //! The test names intentionally encode the support status and the supported

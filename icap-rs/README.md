@@ -13,10 +13,84 @@ exists.
 
 | Feature | Default | Purpose |
 | --- | --- | --- |
+| `full` | Yes | Existing convenience client, server and owned protocol types. |
 | `tls-rustls` | No | Enables direct ICAPS (`icaps://`) client connections and TLS/mTLS server listeners through Rustls. Bundles the `ring` crypto provider as the default backend. |
 | `tls-rustls-aws-lc-rs` | No | Additive opt-in: also compiles the `aws-lc-rs` crypto provider and prefers it at runtime. Implies `tls-rustls`, so code gated on `feature = "tls-rustls"` keeps working. |
 
-Without `tls-rustls`, plaintext `icap://` clients and servers are available.
+Without `tls-rustls`, plaintext `icap://` clients and servers are available with
+`full`. The `streaming` module is always available. For caller-owned transports
+and workspaces with only Tokio's `io-util` dependency, use:
+
+```toml
+icap-rs = { version = "0.3", default-features = false }
+```
+
+The bounded API supports Rust 1.92 and Tokio 1.48. It does not enable a TLS
+implementation or crypto provider. Supply your own plain or TLS transport.
+
+## Caller-owned streaming transaction
+
+`streaming::Transaction` borrows a `Transport`, a head workspace and a framing
+workspace. Async `Transport::read`, `write` and `flush` futures must be `Send`;
+Tokio `AsyncRead + AsyncWrite + Unpin + Send` transports implement it automatically.
+No socket, task, owned request/response buffer, retry, deadline or cancellation
+handler is created. The caller owns those policies and transport resources.
+
+1. `start(RequestHead { ... })` serializes the ICAP and embedded HTTP heads into
+   the supplied head workspace. Supply the complete service URI (including query),
+   Host, extra headers (including any pre-encoded authorization), and complete
+   embedded HTTP heads. `streaming::Method` offers OPTIONS, REQMOD and RESPMOD.
+2. Feed source slices with `write_body`. With a preview, send at most its
+   advertised size and call `finish_preview(eof)`. A non-EOF preview must fill
+   that size; EOF permits a short preview and emits `ieof`. Continue feeding
+   only after `PreviewOutcome::Continue`. `Final` exposes the final head.
+3. After a normal body or continued preview, call `finish_body` and
+   `read_response`. OPTIONS goes directly from `start` to `read_response`.
+4. Examine `response()` for status and borrowed header values, then repeatedly
+   `read_body` or call `discard_body` using caller scratch. A head alone does
+   **not** establish successful completion: truncation or invalid body framing
+   may still fail. Header views remain available after successful draining.
+
+The library's transaction and I/O futures contain fixed state and no heap
+allocations. File, preview, chunk and response sizes do not grow its storage.
+The head workspace bounds the combined outgoing ICAP/embedded heads, the
+incoming ICAP head, and total incoming embedded HTTP heads. The framing
+workspace bounds each chunk-size or embedded-header line, and the cumulative
+trailer block. Typical capacities are 16 KiB and 1 KiB respectively. A caller
+may supply larger funded bounds. Response entity bytes are streamed; embedded
+HTTP headers are validated and discarded. A read output must be nonempty.
+Application trailer fields are validated and discarded; identity/framing
+trailers are rejected. Partial-body `use-original-body` responses are unsupported.
+
+Strict parsing rejects obsolete folded ICAP fields by default. For peers that
+require this compatibility, call `allow_obs_fold(true)` before `start`.
+Continuation lines must follow a valid extension field and fit the same head
+workspace; framing and protocol fields (including `ISTag`, `Encapsulated` and
+`Preview`) cannot fold or occur twice. Borrowed field values include raw CRLF
+and indentation; the library does not allocate an unfolded copy.
+
+For compatibility with peers that return a bodyless `204` without an
+`Encapsulated` field, the bounded API accepts that form as no content. This is
+a compatibility exception to RFC 3507's requirement for the field on every
+message. `ISTag` remains required; a declared body or buffered bytes beyond the
+`204` head are rejected. A successful `200` still requires `Encapsulated`.
+
+Response encapsulation is checked against the originating method before a
+final head becomes available, including early preview responses. RESPMOD
+permits an optional HTTP response head followed by `res-body` or `null-body`.
+REQMOD also permits an optional HTTP request head followed by `req-body` or
+`null-body`, and can return an HTTP response to block a request. OPTIONS
+permits `opt-body` or `null-body` with no HTTP heads. Headerless bodies remain
+supported. A response containing both HTTP heads is rejected; both heads are
+valid in an outgoing RESPMOD request. These rules follow RFC 3507 section
+4.4.1; the bodyless `100`/`204` handling described above is preserved.
+
+Discard the transaction and transport after a failed or cancelled I/O operation.
+An interrupted future poisons the transaction before I/O, so resuming cannot
+silently repeat partial writes or accept a partial response. No work continues
+after the caller drops its future. Reuse a successfully drained transport only
+when the peer's connection policy permits it. Copy any retained result metadata
+into caller-owned bounded storage before releasing the head workspace.
 
 ## Quick Start: Client
 

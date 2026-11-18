@@ -1,3 +1,5 @@
+#![cfg(feature = "full")]
+
 /// Server graceful shutdown tests.
 ///
 /// Verifies that `Server::run_until(shutdown)`:
