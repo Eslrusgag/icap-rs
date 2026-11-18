@@ -1,3 +1,5 @@
+#![cfg(feature = "full")]
+
 //! TLS / ICAPS integration tests.
 //!
 //! RFC 3507 is silent on ICAPS — these tests pin the project's TLS

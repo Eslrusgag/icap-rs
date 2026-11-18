@@ -1,3 +1,5 @@
+#![cfg(feature = "full")]
+
 use icap_rs::error::{Error, IcapResult, TimeoutError, TimeoutKind};
 use icap_rs::response::{ParsedResponse, StatusCode as IcapStatus};
 use icap_rs::{Client, Request};

@@ -9,12 +9,26 @@ keywords.workspace = true
 categories.workspace = true
 
 [features]
-default = []
+default = ["full"]
+
+# The historical client/server API. Disable default features to use only the
+# caller-transport, caller-workspace streaming transaction.
+full = [
+    "tokio/full",
+    "dep:http",
+    "dep:async-trait",
+    "dep:memchr",
+    "dep:pin-project-lite",
+    "dep:tokio-util",
+    "dep:thiserror",
+    "dep:tracing",
+]
 
 # Top-level flag to compile TLS support using Rustls.
 # Pulls in tokio-rustls for async I/O, rustls core, system trust store loading,
 # PEM parsing, and the `ring` crypto provider as the default.
 tls-rustls = [
+    "full",
     "dep:tokio-rustls",
     "dep:rustls",
     "dep:rustls-native-certs",
@@ -31,16 +45,16 @@ tls-rustls-aws-lc-rs = ["tls-rustls", "rustls/aws-lc-rs"]
 
 [dependencies]
 # Async runtime and I/O
-tokio = { workspace = true, features = ["full"] }
+tokio = { workspace = true, features = ["io-util"] }
 
 # Protocol/data types
-http = { workspace = true }
+http = { workspace = true, optional = true }
 
 # Parsing and async helpers
-async-trait = { workspace = true }
-memchr = { workspace = true }
-pin-project-lite = { workspace = true }
-tokio-util = { workspace = true, features = ["rt"] }
+async-trait = { workspace = true, optional = true }
+memchr = { workspace = true, optional = true }
+pin-project-lite = { workspace = true, optional = true }
+tokio-util = { workspace = true, features = ["rt"], optional = true }
 
 # TLS
 rustls = { workspace = true, features = ["std"], optional = true }
@@ -49,8 +63,8 @@ rustls-pemfile = { workspace = true, optional = true }
 tokio-rustls = { workspace = true, optional = true }
 
 # Diagnostics and errors
-thiserror = { workspace = true }
-tracing = { workspace = true }
+thiserror = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
 
 [dev-dependencies]
 criterion = { workspace = true, features = ["html_reports"] }
@@ -58,18 +72,41 @@ rcgen = { workspace = true }
 rstest = { workspace = true }
 tracing-subscriber = { workspace = true }
 
+[[example]]
+name = "block_by_url"
+required-features = ["full"]
+
+[[example]]
+name = "dynamic_istag"
+required-features = ["full"]
+
+[[example]]
+name = "modify_http_headers"
+required-features = ["full"]
+
+[[example]]
+name = "options_cache_client"
+required-features = ["full"]
+
+[[example]]
+name = "route_by_icap_header"
+required-features = ["full"]
+
 
 [[example]]
 name = "server"
 path = "examples/server.rs"
+required-features = ["full"]
 
 [[example]]
 name = "client"
 path = "examples/client.rs"
+required-features = ["full"]
 
 [[example]]
 name = "streaming_client"
 path = "examples/streaming_client.rs"
+required-features = ["full"]
 
 [[example]]
 name = "tls_client"
@@ -90,25 +127,31 @@ required-features = ["tls-rustls"]
 [[example]]
 name = "preview_decision_server"
 path = "examples/preview_decision_server.rs"
+required-features = ["full"]
 
 [[example]]
 name = "squid_interop_server"
 path = "examples/squid_interop_server.rs"
+required-features = ["full"]
 
 [[example]]
 name = "transfer_policy_client"
 path = "examples/transfer_policy_client.rs"
+required-features = ["full"]
 
 [[example]]
 name = "proxy_auth_client"
 path = "examples/proxy_auth_client.rs"
+required-features = ["full"]
 
 [[bench]]
 name = "protocol_bench"
+required-features = ["full"]
 harness = false
 
 [[bench]]
 name = "rps_bench"
+required-features = ["full"]
 harness = false
 
 [[bench]]
