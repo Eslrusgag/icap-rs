@@ -59,6 +59,10 @@ const HTTP: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\n";
 const NO_CONTENT: &[u8] =
     b"ICAP/1.0 204 No Content\r\nISTag: \"v1\"\r\nEncapsulated: null-body=0\r\n\r\n";
 
+// A deployed peer's header shape, with a portable example identity. This is
+// a compatibility case: RFC 3507 requires Encapsulated on every message.
+const BARE_NO_CONTENT: &[u8] = b"ICAP/1.0 204 Unmodified\r\nServer: C-ICAP/0.5.10\r\nConnection: close\r\nISTag: \"example-signature\"\r\n\r\n";
+
 const fn request(preview: Option<u64>) -> RequestHead<'static> {
     RequestHead {
         method: Method::RespMod,
@@ -593,6 +597,64 @@ fn explicitly_enabled_folded_extension_headers_remain_borrowed() {
             tx.allow_obs_fold(true).unwrap();
             tx.start(options()).await.unwrap();
             assert!(tx.read_response().await.is_err(), "accepted {headers:?}");
+        }
+    });
+}
+
+#[test]
+fn bare_204_after_continue_is_bodyless_compatibility() {
+    run(async {
+        for fragment in [1, 7, usize::MAX] {
+            let mut wire = b"ICAP/1.0 100 Continue\r\n\r\n".to_vec();
+            wire.extend_from_slice(BARE_NO_CONTENT);
+            let mut peer = Peer::new(wire);
+            peer.fragment = fragment;
+            let mut head = [0; 1024];
+            let mut line = [0; 128];
+            let mut tx = Transaction::new(&mut peer, &mut head, &mut line).unwrap();
+            tx.start(request(Some(41))).await.unwrap();
+            tx.write_body(&[b'a'; 41]).await.unwrap();
+            assert_eq!(
+                tx.finish_preview(false).await.unwrap(),
+                PreviewOutcome::Continue
+            );
+            tx.finish_body().await.unwrap();
+            tx.read_response().await.unwrap();
+            tx.discard_body(&mut [0; 7]).await.unwrap();
+            let response = tx.response().unwrap();
+            assert_eq!(response.status_code(), 204);
+            assert_eq!(response.header("Encapsulated"), None);
+            assert_eq!(response.header("ISTag"), Some("\"example-signature\""));
+            assert_eq!(response.header("Connection"), Some("close"));
+        }
+    });
+}
+
+#[test]
+fn bare_204_does_not_relax_other_response_invariants() {
+    run(async {
+        let mut extra_body = BARE_NO_CONTENT.to_vec();
+        extra_body.extend_from_slice(b"0\r\n\r\n");
+        let mut extra_byte = BARE_NO_CONTENT.to_vec();
+        extra_byte.push(b'x');
+        for wire in [
+            extra_body,
+            extra_byte,
+            b"ICAP/1.0 204 Unmodified\r\nISTag: v1\r\nEncapsulated: res-body=0\r\n\r\n0\r\n\r\n"
+                .to_vec(),
+            b"ICAP/1.0 204 Unmodified\r\nConnection: close\r\n\r\n".to_vec(),
+            b"ICAP/1.0 200 OK\r\nISTag: v1\r\n\r\n".to_vec(),
+        ] {
+            let mut peer = Peer::new(wire);
+            let mut head = [0; 1024];
+            let mut line = [0; 128];
+            let mut tx = Transaction::new(&mut peer, &mut head, &mut line).unwrap();
+            tx.start(request(None)).await.unwrap();
+            tx.finish_body().await.unwrap();
+            if tx.read_response().await.is_ok() {
+                assert!(tx.discard_body(&mut [0; 7]).await.is_err());
+            }
+            assert!(tx.response().is_none());
         }
     });
 }

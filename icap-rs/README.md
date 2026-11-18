@@ -69,6 +69,12 @@ workspace; framing and protocol fields (including `ISTag`, `Encapsulated` and
 `Preview`) cannot fold or occur twice. Borrowed field values include raw CRLF
 and indentation; the library does not allocate an unfolded copy.
 
+For compatibility with peers that return a bodyless `204` without an
+`Encapsulated` field, the bounded API accepts that form as no content. This is
+a compatibility exception to RFC 3507's requirement for the field on every
+message. `ISTag` remains required; a declared body or buffered bytes beyond the
+`204` head are rejected. A successful `200` still requires `Encapsulated`.
+
 Discard the transaction and transport after a failed or cancelled I/O operation.
 An interrupted future poisons the transaction before I/O, so resuming cannot
 silently repeat partial writes or accept a partial response. No work continues

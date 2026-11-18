@@ -892,7 +892,11 @@ fn parse_encapsulation(response: ResponseHead<'_>, max: usize) -> Result<Encapsu
         body: false,
     };
     let Some(value) = response.header("Encapsulated") else {
-        if (200..300).contains(&response.code) {
+        // Compatibility with peers that omit Encapsulated on bodyless 204.
+        // RFC 3507 requires the field, but 204 cannot carry a body. Keep the
+        // same no-body state as explicit null-body=0; complete() still rejects
+        // buffered bytes beyond the header boundary.
+        if (200..300).contains(&response.code) && response.code != 204 {
             return Err(Error::Protocol("missing Encapsulated"));
         }
         return Ok(enc);
